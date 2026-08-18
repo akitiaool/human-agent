@@ -6,7 +6,18 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 仓库权威设计来源为 `docs/human-agent 架构设计与开发规范文档.txt`（v1.0.0）。
 
-已完成的骨架：Git 仓库（main 分支）、`package.json`、`tsconfig.json`（strict + NodeNext ESM，产物到 `dist/`）、`bin/cli.ts`（commander 最小入口）、依赖安装（`pnpm` 管理）。阶段一类型契约已完成：`src/types/organ.ts`（`ActionResult` + `ok`/`fail`、`RiskLevel`、`EnvSnapshot`、`AgentStatus`/`AgentPhase`、各器官 `*Contract` 接口）、`src/types/index.ts` 与 `src/index.ts` 出口。**尚未开始**：各器官模块（阶段二起，目录随实现创建）。
+已完成的骨架：Git 仓库（main 分支）、`package.json`、`tsconfig.json`（strict + NodeNext ESM，产物到 `dist/`）、`bin/cli.ts`（commander 最小入口）、依赖安装（`pnpm` 管理）。
+
+阶段一类型契约已完成：`src/types/organ.ts`（`ActionResult` + `ok`/`fail`、`RiskLevel`、`EnvSnapshot`、`AgentStatus`/`AgentPhase`、各器官 `*Contract` 接口）、`src/types/index.ts` 与 `src/index.ts` 出口。
+
+阶段二（双手/眼睛/鼻子）已完成（TDD，测试在 `tests/`，vitest 4）：
+- `src/nose/risk-checker.ts`：危险特征规则库（rm -rf、DROP TABLE、git push --force 等）→ SAFE/DANGEROUS
+- `src/nose/env-checker.ts`：环境快照（OS、CWD、git 分支），`getEnvSnapshot({ cwd })` 可指定目录
+- `src/eyes/file-reader.ts`：readFile/readDir/searchCode（searchCode 支持目录参数、跳过 node_modules/.git/dist、相对搜索根返回路径）
+- `src/hands/terminal.ts`：execa 10 执行命令，`{ shell: true, encoding: "utf8" }`，错误返回 `EXEC_ERROR` + shortMessage
+- `src/hands/file-writer.ts`：writeFile（自动建父目录）+ applyPatch（行级 `- 删除`/`+ 插入` patch 格式，文档见文件头注释）
+
+**尚未开始**：阶段三（嘴巴/耳朵）、阶段四（大脑/心脏）、`src/eyes/web-crawler.ts`（fetchPageAsMarkdown，契约已定义未实现）。
 
 `human-agent` 是一个拟人化智能体（Humanoid Agent）CLI 工具，技术栈为 TypeScript / Node.js (>= 20.0.0, ESM)。
 
@@ -62,6 +73,7 @@ export interface ActionResult<T = unknown> {
 pnpm dev      # tsx 直接运行 bin/cli.ts
 pnpm build    # tsc 编译到 dist/（含 bin/ 与 src/）
 pnpm start    # node dist/bin/cli.js
+pnpm test     # vitest 全量运行（tests/ 目录，TDD 流程：先写测试并看其失败再实现）
 ```
 
 已安装版本（均比设计文档 v1.0.0 中规划的版本新一个以上大版本，实现时注意 API 差异）：
