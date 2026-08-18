@@ -10,6 +10,7 @@ export type {
   HandsContract,
   MouthContract,
   NoseContract,
+  PortStatus,
   RiskLevel,
 } from "./organ.js";
 

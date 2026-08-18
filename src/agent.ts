@@ -91,6 +91,7 @@ function buildDefaultNose(): NoseContract {
   return {
     checkRisk: (command) => riskChecker.checkRisk(command),
     getEnvSnapshot: () => envChecker.getEnvSnapshot(),
+    checkPorts: (ports) => envChecker.checkPorts(ports),
   };
 }
 

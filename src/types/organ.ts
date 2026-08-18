@@ -37,6 +37,11 @@ export interface EnvSnapshot {
   gitBranch?: string;
 }
 
+export interface PortStatus {
+  port: number;
+  occupied: boolean;
+}
+
 // ---------- 心脏：生命周期 (§2、§6.2，中断时置为 INTERRUPTED) ----------
 
 export type AgentStatus = "IDLE" | "RUNNING" | "INTERRUPTED" | "ERROR";
@@ -83,4 +88,5 @@ export interface HandsContract {
 export interface NoseContract {
   checkRisk(command: string): RiskLevel;
   getEnvSnapshot(): EnvSnapshot;
+  checkPorts(ports: number[]): Promise<PortStatus[]>;
 }
