@@ -17,7 +17,12 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 - `src/hands/terminal.ts`：execa 10 执行命令，`{ shell: true, encoding: "utf8" }`，错误返回 `EXEC_ERROR` + shortMessage
 - `src/hands/file-writer.ts`：writeFile（自动建父目录）+ applyPatch（行级 `- 删除`/`+ 插入` patch 格式，文档见文件头注释）
 
-**尚未开始**：阶段三（嘴巴/耳朵）、阶段四（大脑/心脏）、`src/eyes/web-crawler.ts`（fetchPageAsMarkdown，契约已定义未实现）。
+阶段三（嘴巴/耳朵）已完成（TDD）：
+- `src/mouth/text-output.ts`：speak 打字机流式输出（首字符立即、可选 intervalMs）、info/success/warn/error 彩色日志、printDiff 的 +/- 行着色；构造可注入 stdout/chalk 实例（测试用 `new Chalk({ level: 3 })`）
+- `src/mouth/ask-user.ts`：confirm(message) 阻塞式 [Y/n] 确认，默认 Y，无效输入循环追问；构造可注入 input/output 流
+- `src/ears/text-input.ts`：prompt(question) 读入并 trim；可注入流（REPL 长驻监听留给阶段四心脏循环）
+
+**尚未开始**：阶段四（大脑/心脏 + 全链路）、`src/eyes/web-crawler.ts`（fetchPageAsMarkdown，契约已定义未实现）、voice/image/browser 等预留器官。
 
 `human-agent` 是一个拟人化智能体（Humanoid Agent）CLI 工具，技术栈为 TypeScript / Node.js (>= 20.0.0, ESM)。
 
