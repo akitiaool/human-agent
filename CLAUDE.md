@@ -20,9 +20,18 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 阶段三（嘴巴/耳朵）已完成（TDD）：
 - `src/mouth/text-output.ts`：speak 打字机流式输出（首字符立即、可选 intervalMs）、info/success/warn/error 彩色日志、printDiff 的 +/- 行着色；构造可注入 stdout/chalk 实例（测试用 `new Chalk({ level: 3 })`）
 - `src/mouth/ask-user.ts`：confirm(message) 阻塞式 [Y/n] 确认，默认 Y，无效输入循环追问；构造可注入 input/output 流
-- `src/ears/text-input.ts`：prompt(question) 读入并 trim；可注入流（REPL 长驻监听留给阶段四心脏循环）
+- `src/ears/text-input.ts`：prompt(question) 读入并 trim；**单实例只创建一个 readline 接口**，空闲期间到达的行进队列不丢失（多行管道输入 `printf "a\n/exit\n" | pnpm dev` 依赖此行为），输入流结束后队列仍可读取、清空后才报错结束会话；提供 `close()` 释放监听
 
-**尚未开始**：阶段四（大脑/心脏 + 全链路）、`src/eyes/web-crawler.ts`（fetchPageAsMarkdown，契约已定义未实现）、voice/image/browser 等预留器官。
+阶段四（大脑/心脏 + 全链路）已完成（TDD，79 tests）：
+- `src/brain/llm.ts`：`BrainInference` 统一推理接口（ToolCall/ToolInfo/BrainInferenceResult）
+- `src/brain/context.ts`：会话消息队列（system 永不移除，超预算裁剪最旧非 system 消息）
+- `src/brain/echo-brain.ts`：EchoBrain 回显最后一条 user 消息，真实 LLM 接入前作为默认大脑
+- `src/heart/interrupt.ts`：AbortController 封装（getSignal/abort/isAborted/reset）
+- `src/heart/loop.ts`：生命循环（LISTENING→THINKING→SNIFFING→ACTING→FEEDBACK）；6 个工具的 zod 参数校验（INVALID_ARGS）；terminal 危险命令经 mouth.confirm（USER_DENIED）；`#processTurn` 返回 boolean（true 表示中断/出错，规避 TS 对私有字段的收窄问题）；`onPhase` 回调；maxIterations 兜底
+- `src/agent.ts`：HumanAgent 组装器，默认组装 EchoBrain + 全部器官（鼻子组合 RiskChecker+EnvChecker，显式组合而非对象展开——spread 不复制原型方法）
+- `bin/cli.ts`：SIGINT/SIGTERM → `agent.interrupt.abort()`；结束后 `ears.close()` 防挂起；退出码 ERROR=1 / INTERRUPTED=130 / IDLE=0
+
+**尚未开始**：接入具体大模型替换 EchoBrain（BrainInference 接口已就绪）、`src/eyes/web-crawler.ts`（fetchPageAsMarkdown，契约已定义未实现，loop 未注册工具）、voice/image/browser 等预留器官。
 
 `human-agent` 是一个拟人化智能体（Humanoid Agent）CLI 工具，技术栈为 TypeScript / Node.js (>= 20.0.0, ESM)。
 
@@ -89,7 +98,7 @@ CLI 入口为 `bin/cli.ts`（处理 argv）。
 
 ## 开发路线（4 阶段递进）
 
-1. 骨架与类型（`package.json`/`tsconfig.json`、`src/types/` 与 `ActionResult` 契约）
-2. 双手与眼睛（file-reader、terminal、file-writer、risk-checker）
-3. 嘴巴与耳朵（text-output、ask-user、text-input）
-4. 大脑与心脏（loop 状态机、interrupt、接入具体大模型）
+1. 骨架与类型（`package.json`/`tsconfig.json`、`src/types/` 与 `ActionResult` 契约）✅
+2. 双手与眼睛（file-reader、terminal、file-writer、risk-checker）✅
+3. 嘴巴与耳朵（text-output、ask-user、text-input）✅
+4. 大脑与心脏（loop 状态机、interrupt、接入具体大模型）✅（LLM 接入待定：目前 EchoBrain 占位）

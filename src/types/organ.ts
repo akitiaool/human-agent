@@ -53,7 +53,7 @@ export type AgentPhase =
 export interface EyesContract {
   readFile(path: string): Promise<ActionResult<string>>;
   readDir(path: string): Promise<ActionResult<string[]>>;
-  searchCode(pattern: string): Promise<ActionResult<string[]>>;
+  searchCode(pattern: string, dir?: string): Promise<ActionResult<string[]>>;
   fetchPageAsMarkdown(url: string): Promise<ActionResult<string>>;
 }
 
@@ -63,6 +63,15 @@ export interface EarsContract {
 
 export interface MouthContract {
   confirm(message: string): Promise<boolean>;
+}
+
+/** 嘴巴输出契约（TextOutput 的结构化视图，便于测试注入）。 */
+export interface AgentOutput {
+  speak(text: string): Promise<void>;
+  info(message: string): void;
+  warn(message: string): void;
+  error(message: string): void;
+  printDiff(diff: string): void;
 }
 
 export interface HandsContract {
