@@ -82,7 +82,7 @@ export interface AgentOutput {
 export interface HandsContract {
   writeFile(path: string, content: string): Promise<ActionResult<void>>;
   applyPatch(path: string, patch: string): Promise<ActionResult<void>>;
-  executeCommand(command: string, signal?: AbortSignal): Promise<ActionResult<string>>;
+  executeCommand(command: string, signal?: AbortSignal, timeoutMs?: number): Promise<ActionResult<string>>;
 }
 
 export interface NoseContract {

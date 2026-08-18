@@ -20,7 +20,10 @@ const TOOL_SCHEMAS = {
   search_code: z.object({ pattern: z.string(), dir: z.string().optional() }),
   write_file: z.object({ path: z.string(), content: z.string() }),
   apply_patch: z.object({ path: z.string(), patch: z.string() }),
-  terminal: z.object({ command: z.string() }),
+  terminal: z.object({
+    command: z.string(),
+    timeoutMs: z.number().int().positive().optional(),
+  }),
   fetch_page: z.object({ url: z.string() }),
 } as const;
 
@@ -92,10 +95,13 @@ const TOOLS: readonly ToolInfo[] = [
   },
   {
     name: "terminal",
-    description: "执行 shell 命令",
+    description: "执行 shell 命令（可指定 timeoutMs 毫秒超时，超时自动终止）",
     parameters: {
       type: "object",
-      properties: { command: { type: "string" } },
+      properties: {
+        command: { type: "string" },
+        timeoutMs: { type: "number", description: "命令超时毫秒数（可选，默认由任务超时控制）" },
+      },
       required: ["command"],
     },
   },
@@ -327,7 +333,11 @@ export class AgentLoop {
       case "apply_patch":
         return this.#hands.applyPatch(args.path as string, args.patch as string);
       case "terminal":
-        return this.#hands.executeCommand(args.command as string, turnSignal);
+        return this.#hands.executeCommand(
+          args.command as string,
+          turnSignal,
+          args.timeoutMs as number | undefined,
+        );
       case "fetch_page":
         return this.#eyes.fetchPageAsMarkdown(args.url as string);
       default:

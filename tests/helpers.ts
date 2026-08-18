@@ -14,7 +14,8 @@ export function buildHands(): HandsContract {
   return {
     writeFile: (path, content) => writer.writeFile(path, content),
     applyPatch: (path, patch) => writer.applyPatch(path, patch),
-    executeCommand: (command, signal) => terminal.executeCommand(command, signal),
+    executeCommand: (command, signal, timeoutMs) =>
+      terminal.executeCommand(command, signal, timeoutMs),
   };
 }
 

@@ -26,4 +26,14 @@ describe("Terminal", () => {
     expect(result.success).toBe(true);
     expect(result.data).toBe("Command executed with no output.");
   });
+
+  it("超出 timeoutMs 的命令被终止并返回 EXEC_TIMEOUT", async () => {
+    const result = await terminal.executeCommand(
+      'node -e "setTimeout(() => {}, 3000)"',
+      undefined,
+      500,
+    );
+    expect(result.success).toBe(false);
+    expect(result.error?.code).toBe("EXEC_TIMEOUT");
+  });
 });

@@ -419,6 +419,34 @@ describe("AgentLoop", () => {
     ]);
   });
 
+  it("terminal 工具的 timeoutMs 参数透传给命令超时控制", async () => {
+    const brain = new ScriptedBrain([
+      {
+        result: {
+          text: "",
+          toolCalls: [
+            {
+              name: "terminal",
+              arguments: { command: 'node -e "setTimeout(() => {}, 3000)"', timeoutMs: 500 },
+            },
+          ],
+        },
+      },
+      { result: { text: "结束" } },
+    ]);
+    const signal = new AbortController().signal;
+    const loop = makeLoop({ brain, ears: new FakeEars(["任务", "/exit"]), signal });
+    await loop.run();
+    const toolMessage = brain.messagesOf(1).find((m) => m.role === "tool");
+    expect(toolMessage).toBeDefined();
+    const parsed = JSON.parse(toolMessage!.content) as {
+      success: boolean;
+      error?: { code: string };
+    };
+    expect(parsed.success).toBe(false);
+    expect(parsed.error?.code).toBe("EXEC_TIMEOUT");
+  });
+
   it("上下文在会话中持续累积", async () => {
     const brain = new ScriptedBrain([
       { result: { text: "第一轮回答" } },

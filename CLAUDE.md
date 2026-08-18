@@ -15,7 +15,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 - `src/nose/env-checker.ts`：环境快照（OS、CWD、git 分支），`getEnvSnapshot({ cwd })` 可指定目录；`checkPorts(ports)` 探测端口占用（net.connect：可连=占用、ECONNREFUSED=空闲、其余保守视为占用）
 - `src/eyes/file-reader.ts`：readFile/readDir/searchCode（searchCode 支持目录参数、跳过 node_modules/.git/dist、相对搜索根返回路径）
 - `src/eyes/web-crawler.ts`：WebCrawler（turndown 转 Clean Markdown，atx 标题 + fenced 代码块；可注入 fetchImpl；非 200/网络异常包装为 FETCH_ERROR 不抛错）
-- `src/hands/terminal.ts`：execa 10 执行命令，`{ shell: true, encoding: "utf8" }`，错误返回 `EXEC_ERROR` + shortMessage
+- `src/hands/terminal.ts`：execa 10 执行命令，`{ shell: true, encoding: "utf8" }`，错误返回 `EXEC_ERROR` + shortMessage；**单命令超时**：`executeCommand(command, signal?, timeoutMs?)` 第三参透传 execa 原生 `timeout`（conditional spread，`exactOptionalPropertyTypes`），`err.timedOut` → `EXEC_TIMEOUT`（区分于中断的 EXEC_ERROR）；注意 Windows + shell:true 下被杀的是 shell 进程，命令自身子进程可能残留
 - `src/hands/file-writer.ts`：writeFile（自动建父目录）+ applyPatch（行级 `- 删除`/`+ 插入` patch 格式，文档见文件头注释）
 
 阶段三（嘴巴/耳朵）已完成（TDD）：
@@ -23,12 +23,12 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 - `src/mouth/ask-user.ts`：confirm(message) 阻塞式 [Y/n] 确认，默认 Y，无效输入循环追问；构造可注入 input/output 流
 - `src/ears/text-input.ts`：prompt(question) 读入并 trim；**单实例只创建一个 readline 接口**，空闲期间到达的行进队列不丢失（多行管道输入 `printf "a\n/exit\n" | pnpm dev` 依赖此行为），输入流结束后队列仍可读取、清空后才报错结束会话；提供 `close()` 释放监听
 
-阶段四（大脑/心脏 + 全链路）已完成（TDD，79 tests）：
+阶段四（大脑/心脏 + 全链路）已完成（TDD，104 tests）：
 - `src/brain/llm.ts`：`BrainInference` 统一推理接口（ToolCall/ToolInfo/BrainInferenceResult）
 - `src/brain/context.ts`：会话消息队列（system 永不移除，超预算裁剪最旧非 system 消息）
 - `src/brain/ollama-brain.ts`：OllamaBrain，走本机 `/api/chat` 协议（`{ baseUrl?: string, model?: string, fetchImpl?: typeof fetch }`），支持工具调用；默认 `http://localhost:11434` + `qwen3:4b`；非 200 抛错（loop 捕获转 ERROR）；assistant 的 toolCalls 序列化为 `tool_calls`（snake_case），工具列表为空时不发 `tools`；`infer(context, tools, signal?)` 第三参为 AbortSignal（fetch 绑定，中断可取消请求）
 - `src/heart/interrupt.ts`：AbortController 封装（getSignal/abort/isAborted/reset）
-- `src/heart/loop.ts`：生命循环（LISTENING→THINKING→SNIFFING→ACTING→FEEDBACK）；7 个工具的 zod 参数校验（INVALID_ARGS）且 `TOOLS` 携带 JSON Schema `parameters`（ToolInfo 契约）；terminal 危险命令经 mouth.confirm（USER_DENIED）；assistant 消息（含 toolCalls）与 tool 结果都写回上下文（Ollama 续接的前提）；`#processTurn` 返回 boolean（true 表示中断/出错，规避 TS 对私有字段的收窄问题）；`onPhase` 回调；maxIterations 兜底；**任务超时**：`timeoutMs`（默认 5 分钟，0 禁用）每轮 per-turn AbortController + `AbortSignal.any` 组合 signal（推理请求可取消、子进程可被杀），超时终止本轮并继续监听；斜杠命令 `/timeout`（`parseTimeout` 导出：纯数字毫秒 / s/m/h 单位 / 0|off 禁用）会话中动态更新
+- `src/heart/loop.ts`：生命循环（LISTENING→THINKING→SNIFFING→ACTING→FEEDBACK）；7 个工具的 zod 参数校验（INVALID_ARGS）且 `TOOLS` 携带 JSON Schema `parameters`（ToolInfo 契约）；terminal 危险命令经 mouth.confirm（USER_DENIED）；assistant 消息（含 toolCalls）与 tool 结果都写回上下文（Ollama 续接的前提）；`#processTurn` 返回 boolean（true 表示中断/出错，规避 TS 对私有字段的收窄问题）；`onPhase` 回调；maxIterations 兜底；**任务超时**：`timeoutMs`（默认 5 分钟，0 禁用）每轮 per-turn AbortController + `AbortSignal.any` 组合 signal（推理请求可取消、子进程可被杀），超时终止本轮并继续监听；斜杠命令 `/timeout`（`parseTimeout` 导出：纯数字毫秒 / s/m/h 单位 / 0|off 禁用）会话中动态更新；`terminal` 工具参数含可选 `timeoutMs`（正整数字节，zod 校验），经 `#dispatch` 透传给 `executeCommand` 第三参——大脑可对单条命令声明独立超时；`HandsContract.executeCommand` 签名同步加 `timeoutMs?`
 - `src/agent.ts`：HumanAgent 组装器，默认组装 OllamaBrain + 全部器官（鼻子组合 RiskChecker+EnvChecker，显式组合而非对象展开——spread 不复制原型方法）；环境变量 `OLLAMA_BASE_URL`/`OLLAMA_MODEL` 覆盖默认大脑配置
 - `bin/cli.ts`：SIGINT/SIGTERM → `agent.interrupt.abort()`；结束后 `ears.close()` 防挂起；退出码 ERROR=1 / INTERRUPTED=130 / IDLE=0
 
