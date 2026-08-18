@@ -35,7 +35,21 @@ export interface AgentLoopOptions {
   signal: AbortSignal;
   context?: ConversationContext;
   maxIterations?: number;
+  /** 单轮任务超时（毫秒），0 表示禁用；超时后终止本轮并继续监听。 */
+  timeoutMs?: number;
   onPhase?: (phase: AgentPhase, detail?: string) => void;
+}
+
+/** 解析超时时长：纯数字按毫秒；s/m/h 后缀按秒/分/时；0 或 off 表示禁用；非法返回 null。 */
+export function parseTimeout(input: string): number | null {
+  const trimmed = input.trim().toLowerCase();
+  if (trimmed === "0" || trimmed === "off") return 0;
+  const match = /^(\d+)(h|m|s)?$/.exec(trimmed);
+  if (match === null) return null;
+  const value = Number(match[1]);
+  const factor =
+    match[2] === "h" ? 3_600_000 : match[2] === "m" ? 60_000 : match[2] === "s" ? 1_000 : 1;
+  return value * factor;
 }
 
 const TOOLS: readonly ToolInfo[] = [
@@ -108,9 +122,11 @@ export class AgentLoop {
   readonly #signal: AbortSignal;
   readonly #context: ConversationContext;
   readonly #maxIterations: number;
+  #timeoutMs: number;
   readonly #onPhase: ((phase: AgentPhase, detail?: string) => void) | undefined;
 
   #status: AgentStatus = "IDLE";
+  #turnTimedOut = false;
 
   constructor(options: AgentLoopOptions) {
     this.#brain = options.brain;
@@ -123,6 +139,7 @@ export class AgentLoop {
     this.#signal = options.signal;
     this.#context = options.context ?? new ConversationContext({ maxTokens: 8000 });
     this.#maxIterations = options.maxIterations ?? 10;
+    this.#timeoutMs = options.timeoutMs ?? 300_000;
     this.#onPhase = options.onPhase;
   }
 
@@ -145,6 +162,7 @@ export class AgentLoop {
           break;
         }
         if (input.trim() === "" || input.trim() === "/exit") break;
+        if (this.#handleSlashCommand(input)) continue;
         this.#context.add({ role: "user", content: input });
         const stopped = await this.#processTurn();
         if (stopped) break;
@@ -152,6 +170,29 @@ export class AgentLoop {
     } finally {
       if (this.#status === "RUNNING") this.#status = "IDLE";
     }
+  }
+
+  /** 处理斜杠命令；返回 true 表示已消费该输入。 */
+  #handleSlashCommand(input: string): boolean {
+    const match = /^\/timeout(?:\s+(.+))?$/.exec(input.trim());
+    if (match === null) return false;
+    const spec = match[1];
+    if (spec === undefined) {
+      this.#output.info(
+        `当前任务超时：${this.#timeoutMs === 0 ? "无限" : `${this.#timeoutMs}ms`}（/timeout 0 禁用）`,
+      );
+      return true;
+    }
+    const ms = parseTimeout(spec);
+    if (ms === null) {
+      this.#output.warn(
+        "无法解析超时时长，格式：/timeout 30s、/timeout 5m、/timeout 1h、/timeout 900（毫秒）或 /timeout 0 禁用",
+      );
+      return true;
+    }
+    this.#timeoutMs = ms;
+    this.#output.info(`任务超时已更新为 ${ms === 0 ? "无限" : `${ms}ms`}`);
+    return true;
   }
 
   async #listen(): Promise<string | null> {
@@ -172,43 +213,76 @@ export class AgentLoop {
     });
   }
 
-  /** 处理一轮指令；返回 true 表示循环应终止（中断或出错）。 */
+  /** 处理一轮指令；返回 true 表示循环应终止（中断或出错），false 表示继续监听。 */
   async #processTurn(): Promise<boolean> {
-    for (let iteration = 0; iteration < this.#maxIterations; iteration++) {
-      if (this.#signal.aborted) {
-        this.#status = "INTERRUPTED";
-        return true;
-      }
-      this.#emit("THINKING");
-      let result: BrainInferenceResult;
-      try {
-        result = await this.#brain.infer(this.#context, TOOLS);
-      } catch (err) {
-        this.#status = "ERROR";
-        this.#output.error(`大脑推理失败: ${err instanceof Error ? err.message : String(err)}`);
-        return true;
-      }
-      const calls = result.toolCalls ?? [];
-      if (calls.length === 0) {
-        this.#context.add({ role: "assistant", content: result.text });
-        await this.#output.speak(result.text);
-        return false;
-      }
-      this.#context.add({ role: "assistant", content: result.text, toolCalls: calls });
-      for (const call of calls) {
+    const turnController = new AbortController();
+    const turnSignal =
+      this.#timeoutMs > 0
+        ? AbortSignal.any([this.#signal, turnController.signal])
+        : this.#signal;
+    const timer =
+      this.#timeoutMs > 0
+        ? setTimeout(() => {
+            this.#turnTimedOut = true;
+            turnController.abort();
+          }, this.#timeoutMs)
+        : undefined;
+    try {
+      for (let iteration = 0; iteration < this.#maxIterations; iteration++) {
         if (this.#signal.aborted) {
           this.#status = "INTERRUPTED";
           return true;
         }
-        const actionResult = await this.#execute(call);
-        this.#context.add({ role: "tool", name: call.name, content: JSON.stringify(actionResult) });
+        if (this.#turnTimedOut) {
+          this.#output.warn("任务超时，已终止本轮。");
+          return false;
+        }
+        this.#emit("THINKING");
+        let result: BrainInferenceResult;
+        try {
+          result = await this.#brain.infer(this.#context, TOOLS, turnSignal);
+        } catch (err) {
+          if (this.#signal.aborted) {
+            this.#status = "INTERRUPTED";
+            return true;
+          }
+          if (this.#turnTimedOut) {
+            this.#output.warn("任务超时，已终止本轮。");
+            return false;
+          }
+          this.#status = "ERROR";
+          this.#output.error(`大脑推理失败: ${err instanceof Error ? err.message : String(err)}`);
+          return true;
+        }
+        const calls = result.toolCalls ?? [];
+        if (calls.length === 0) {
+          this.#context.add({ role: "assistant", content: result.text });
+          await this.#output.speak(result.text);
+          return false;
+        }
+        this.#context.add({ role: "assistant", content: result.text, toolCalls: calls });
+        for (const call of calls) {
+          if (this.#signal.aborted) {
+            this.#status = "INTERRUPTED";
+            return true;
+          }
+          if (this.#turnTimedOut) {
+            this.#output.warn("任务超时，已终止本轮。");
+            return false;
+          }
+          const actionResult = await this.#execute(call, turnSignal);
+          this.#context.add({ role: "tool", name: call.name, content: JSON.stringify(actionResult) });
+        }
       }
+      this.#output.warn("已达到最大迭代次数，停止本轮推演。");
+      return false;
+    } finally {
+      if (timer !== undefined) clearTimeout(timer);
+      this.#turnTimedOut = false;
     }
-    this.#output.warn("已达到最大迭代次数，停止本轮推演。");
-    return false;
   }
 
-  async #execute(call: ToolCall): Promise<ActionResult<unknown>> {
+  async #execute(call: ToolCall, turnSignal: AbortSignal): Promise<ActionResult<unknown>> {
     this.#emit("SNIFFING", call.name);
     const schema = TOOL_SCHEMAS[call.name as keyof typeof TOOL_SCHEMAS];
     if (schema === undefined) {
@@ -232,11 +306,15 @@ export class AgentLoop {
       }
     }
     this.#emit("ACTING", call.name);
-    const result = await this.#dispatch(call.name, parsed.data);
+    const result = await this.#dispatch(call.name, parsed.data, turnSignal);
     return this.#finish(call.name, result);
   }
 
-  async #dispatch(name: string, args: Record<string, unknown>): Promise<ActionResult<unknown>> {
+  async #dispatch(
+    name: string,
+    args: Record<string, unknown>,
+    turnSignal: AbortSignal,
+  ): Promise<ActionResult<unknown>> {
     switch (name) {
       case "read_file":
         return this.#eyes.readFile(args.path as string);
@@ -249,7 +327,7 @@ export class AgentLoop {
       case "apply_patch":
         return this.#hands.applyPatch(args.path as string, args.patch as string);
       case "terminal":
-        return this.#hands.executeCommand(args.command as string, this.#signal);
+        return this.#hands.executeCommand(args.command as string, turnSignal);
       case "fetch_page":
         return this.#eyes.fetchPageAsMarkdown(args.url as string);
       default:

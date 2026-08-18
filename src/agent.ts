@@ -32,6 +32,8 @@ export interface HumanAgentOptions {
   output?: AgentOutput;
   context?: ConversationContext;
   maxIterations?: number;
+  /** 单轮任务超时（毫秒），0 表示禁用；会话中可用 /timeout 动态调整。 */
+  timeoutMs?: number;
 }
 
 /** 人体合一组装类：构造注入各器官（设计文档 §5.3），默认提供完整默认组装。 */
@@ -46,6 +48,7 @@ export class HumanAgent {
   readonly output: AgentOutput;
   readonly context: ConversationContext;
   readonly maxIterations: number;
+  readonly timeoutMs: number | undefined;
 
   constructor(options: HumanAgentOptions = {}) {
     this.interrupt = new InterruptController();
@@ -58,6 +61,7 @@ export class HumanAgent {
     this.output = options.output ?? new TextOutput();
     this.context = options.context ?? new ConversationContext({ maxTokens: 8000 });
     this.maxIterations = options.maxIterations ?? 10;
+    this.timeoutMs = options.timeoutMs;
   }
 
   async run(): Promise<AgentStatus> {
@@ -72,6 +76,7 @@ export class HumanAgent {
       signal: this.interrupt.getSignal(),
       context: this.context,
       maxIterations: this.maxIterations,
+      ...(this.timeoutMs !== undefined ? { timeoutMs: this.timeoutMs } : {}),
     });
     await loop.run();
     return loop.getStatus();

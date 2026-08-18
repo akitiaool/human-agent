@@ -26,9 +26,9 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 阶段四（大脑/心脏 + 全链路）已完成（TDD，79 tests）：
 - `src/brain/llm.ts`：`BrainInference` 统一推理接口（ToolCall/ToolInfo/BrainInferenceResult）
 - `src/brain/context.ts`：会话消息队列（system 永不移除，超预算裁剪最旧非 system 消息）
-- `src/brain/ollama-brain.ts`：OllamaBrain，走本机 `/api/chat` 协议（`{ baseUrl?: string, model?: string, fetchImpl?: typeof fetch }`），支持工具调用；默认 `http://localhost:11434` + `qwen3:4b`；非 200 抛错（loop 捕获转 ERROR）；assistant 的 toolCalls 序列化为 `tool_calls`（snake_case），工具列表为空时不发 `tools`
+- `src/brain/ollama-brain.ts`：OllamaBrain，走本机 `/api/chat` 协议（`{ baseUrl?: string, model?: string, fetchImpl?: typeof fetch }`），支持工具调用；默认 `http://localhost:11434` + `qwen3:4b`；非 200 抛错（loop 捕获转 ERROR）；assistant 的 toolCalls 序列化为 `tool_calls`（snake_case），工具列表为空时不发 `tools`；`infer(context, tools, signal?)` 第三参为 AbortSignal（fetch 绑定，中断可取消请求）
 - `src/heart/interrupt.ts`：AbortController 封装（getSignal/abort/isAborted/reset）
-- `src/heart/loop.ts`：生命循环（LISTENING→THINKING→SNIFFING→ACTING→FEEDBACK）；6 个工具的 zod 参数校验（INVALID_ARGS）且 `TOOLS` 携带 JSON Schema `parameters`（ToolInfo 契约）；terminal 危险命令经 mouth.confirm（USER_DENIED）；assistant 消息（含 toolCalls）与 tool 结果都写回上下文（Ollama 续接的前提）；`#processTurn` 返回 boolean（true 表示中断/出错，规避 TS 对私有字段的收窄问题）；`onPhase` 回调；maxIterations 兜底
+- `src/heart/loop.ts`：生命循环（LISTENING→THINKING→SNIFFING→ACTING→FEEDBACK）；7 个工具的 zod 参数校验（INVALID_ARGS）且 `TOOLS` 携带 JSON Schema `parameters`（ToolInfo 契约）；terminal 危险命令经 mouth.confirm（USER_DENIED）；assistant 消息（含 toolCalls）与 tool 结果都写回上下文（Ollama 续接的前提）；`#processTurn` 返回 boolean（true 表示中断/出错，规避 TS 对私有字段的收窄问题）；`onPhase` 回调；maxIterations 兜底；**任务超时**：`timeoutMs`（默认 5 分钟，0 禁用）每轮 per-turn AbortController + `AbortSignal.any` 组合 signal（推理请求可取消、子进程可被杀），超时终止本轮并继续监听；斜杠命令 `/timeout`（`parseTimeout` 导出：纯数字毫秒 / s/m/h 单位 / 0|off 禁用）会话中动态更新
 - `src/agent.ts`：HumanAgent 组装器，默认组装 OllamaBrain + 全部器官（鼻子组合 RiskChecker+EnvChecker，显式组合而非对象展开——spread 不复制原型方法）；环境变量 `OLLAMA_BASE_URL`/`OLLAMA_MODEL` 覆盖默认大脑配置
 - `bin/cli.ts`：SIGINT/SIGTERM → `agent.interrupt.abort()`；结束后 `ears.close()` 防挂起；退出码 ERROR=1 / INTERRUPTED=130 / IDLE=0
 

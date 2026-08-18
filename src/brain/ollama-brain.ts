@@ -29,7 +29,11 @@ export class OllamaBrain implements BrainInference {
     this.#fetchImpl = options.fetchImpl ?? fetch;
   }
 
-  async infer(context: ConversationContext, tools: readonly ToolInfo[]): Promise<BrainInferenceResult> {
+  async infer(
+    context: ConversationContext,
+    tools: readonly ToolInfo[],
+    signal?: AbortSignal,
+  ): Promise<BrainInferenceResult> {
     const body: Record<string, unknown> = {
       model: this.#model,
       stream: false,
@@ -42,6 +46,7 @@ export class OllamaBrain implements BrainInference {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(body),
+      ...(signal !== undefined ? { signal } : {}),
     });
     if (!response.ok) {
       throw new Error(`Ollama API ${response.status}: ${await response.text()}`);

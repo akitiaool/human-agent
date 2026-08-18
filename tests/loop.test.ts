@@ -23,12 +23,56 @@ class HangingEars implements EarsContract {
   }
 }
 
+/** infer 挂起直到 signal 中断；abort 时以 AbortError 拒绝。 */
+class AbortableBrain implements BrainInference {
+  async infer(
+    _context: ConversationContext,
+    _tools: readonly ToolInfo[],
+    signal?: AbortSignal,
+  ): Promise<BrainInferenceResult> {
+    await new Promise((_resolve, reject) => {
+      if (signal !== undefined && signal.aborted) {
+        reject(new DOMException("aborted", "AbortError"));
+        return;
+      }
+      signal?.addEventListener(
+        "abort",
+        () => reject(new DOMException("aborted", "AbortError")),
+        { once: true },
+      );
+    });
+    return { text: "" };
+  }
+}
+
+/** 第一轮 infer 挂起（等待超时取消），之后正常回答。 */
+class TimeoutThenAnswerBrain implements BrainInference {
+  private calls = 0;
+  async infer(
+    _context: ConversationContext,
+    _tools: readonly ToolInfo[],
+    signal?: AbortSignal,
+  ): Promise<BrainInferenceResult> {
+    this.calls++;
+    if (this.calls > 1) return { text: "超时后的回答" };
+    await new Promise((_resolve, reject) => {
+      signal?.addEventListener(
+        "abort",
+        () => reject(new DOMException("aborted", "AbortError")),
+        { once: true },
+      );
+    });
+    return { text: "" };
+  }
+}
+
 function makeLoop(options: {
-  brain: ScriptedBrain;
+  brain: BrainInference;
   ears: EarsContract;
   signal: AbortSignal;
   mouth?: AskUser;
   maxIterations?: number;
+  timeoutMs?: number;
   onPhase?: (phase: AgentPhase, detail?: string) => void;
 }) {
   return new AgentLoop({
@@ -41,6 +85,7 @@ function makeLoop(options: {
     output: new TextOutput({ stdout: new FakeWritable(), intervalMs: 0 }),
     signal: options.signal,
     maxIterations: options.maxIterations,
+    timeoutMs: options.timeoutMs,
     onPhase: options.onPhase,
   });
 }
@@ -205,6 +250,97 @@ describe("AgentLoop", () => {
     const brain = new ScriptedBrain([]);
     const controller = new AbortController();
     const loop = makeLoop({ brain, ears: new HangingEars(), signal: controller.signal });
+    const runPromise = loop.run();
+    setTimeout(() => controller.abort(), 30);
+    await runPromise;
+    expect(loop.getStatus()).toBe("INTERRUPTED");
+  });
+
+  it("/timeout 命令动态更新超时时长并即时生效", async () => {
+    const signal = new AbortController().signal;
+    const stream = new FakeWritable();
+    const loop = new AgentLoop({
+      brain: new TimeoutThenAnswerBrain(),
+      ears: new FakeEars(["/timeout 20", "任务", "继续", "/exit"]),
+      nose: new RiskChecker(),
+      mouth: new AskUser({ input: inputFrom("y\n") }),
+      eyes: buildEyes(),
+      hands: buildHands(),
+      output: new TextOutput({ stdout: stream, intervalMs: 0 }),
+      signal,
+      timeoutMs: 300_000,
+    });
+    await loop.run();
+    expect(loop.getStatus()).toBe("IDLE");
+    expect(stream.output).toContain("任务超时已更新为 20ms");
+    expect(stream.output).toContain("任务超时");
+    expect(stream.output).toContain("超时后的回答");
+  });
+
+  it("/timeout 非法参数给出提示且会话继续", async () => {
+    const signal = new AbortController().signal;
+    const stream = new FakeWritable();
+    const loop = new AgentLoop({
+      brain: new ScriptedBrain([{ result: { text: "回答" } }]),
+      ears: new FakeEars(["/timeout abc", "问题", "/exit"]),
+      nose: new RiskChecker(),
+      mouth: new AskUser({ input: inputFrom("y\n") }),
+      eyes: buildEyes(),
+      hands: buildHands(),
+      output: new TextOutput({ stdout: stream, intervalMs: 0 }),
+      signal,
+    });
+    await loop.run();
+    expect(stream.output).toContain("无法解析超时时长");
+    expect(stream.output).toContain("回答");
+  });
+
+  it("推理超时后终止本轮并警告，会话继续监听下一条指令", async () => {
+    const signal = new AbortController().signal;
+    const stream = new FakeWritable();
+    const loop = new AgentLoop({
+      brain: new TimeoutThenAnswerBrain(),
+      ears: new FakeEars(["任务", "再来一条", "/exit"]),
+      nose: new RiskChecker(),
+      mouth: new AskUser({ input: inputFrom("y\n") }),
+      eyes: buildEyes(),
+      hands: buildHands(),
+      output: new TextOutput({ stdout: stream, intervalMs: 0 }),
+      signal,
+      timeoutMs: 20,
+    });
+    await loop.run();
+    expect(loop.getStatus()).toBe("IDLE");
+    expect(stream.output).toContain("任务超时");
+    expect(stream.output).toContain("超时后的回答");
+  });
+
+  it("执行中的工具被任务超时中止（命令被杀，结果反馈失败）", async () => {
+    const brain = new ScriptedBrain([
+      {
+        result: {
+          text: "",
+          toolCalls: [
+            {
+              name: "terminal",
+              arguments: { command: 'node -e "setTimeout(() => {}, 10000)"' },
+            },
+          ],
+        },
+      },
+      { result: { text: "结束" } },
+    ]);
+    const signal = new AbortController().signal;
+    const loop = makeLoop({ brain, ears: new FakeEars(["任务", "继续", "/exit"]), signal, timeoutMs: 20 });
+    await loop.run();
+    const toolMessage = brain.messagesOf(1).find((m) => m.role === "tool");
+    const parsed = JSON.parse(toolMessage!.content) as { success: boolean };
+    expect(parsed.success).toBe(false);
+  });
+
+  it("推理期间被中断时状态为 INTERRUPTED 而非 ERROR", async () => {
+    const controller = new AbortController();
+    const loop = makeLoop({ brain: new AbortableBrain(), ears: new FakeEars(["hi"]), signal: controller.signal });
     const runPromise = loop.run();
     setTimeout(() => controller.abort(), 30);
     await runPromise;

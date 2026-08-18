@@ -138,6 +138,15 @@ describe("OllamaBrain", () => {
     expect(body.tools).toBeUndefined();
   });
 
+  it("infer 把 signal 传给 fetch，中断可取消请求", async () => {
+    const fetchImpl = vi.fn().mockResolvedValue(jsonResponse({ message: { role: "assistant", content: "ok" } }));
+    const brain = makeBrain(fetchImpl);
+    const controller = new AbortController();
+    await brain.infer(contextOf({ role: "user", content: "hi" }), TOOLS, controller.signal);
+    const [, init] = fetchImpl.mock.calls[0]!;
+    expect(init!.signal).toBe(controller.signal);
+  });
+
   it("可自定义 baseUrl 与 model", async () => {
     const fetchImpl = vi.fn().mockResolvedValue(jsonResponse({ message: { role: "assistant", content: "ok" } }));
     const brain = new OllamaBrain({ baseUrl: "http://10.0.0.2:8080", model: "qwen3:8b", fetchImpl });
