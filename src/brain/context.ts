@@ -1,7 +1,9 @@
+import type { ToolCall } from "./llm.js";
+
 export type Message =
   | { role: "system"; content: string }
   | { role: "user"; content: string }
-  | { role: "assistant"; content: string }
+  | { role: "assistant"; content: string; toolCalls?: ToolCall[] }
   | { role: "tool"; name: string; content: string };
 
 /** 无 tokenizer 时的近似估算：约 4 字符 ≈ 1 token。 */

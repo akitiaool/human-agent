@@ -8,6 +8,8 @@ export interface ToolCall {
 export interface ToolInfo {
   name: string;
   description: string;
+  /** JSON Schema 形式（`{ type: "object", properties, required }`），供大模型工具调用协议使用。 */
+  parameters: Record<string, unknown>;
 }
 
 export interface BrainInferenceResult {

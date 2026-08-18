@@ -76,6 +76,30 @@ describe("AgentLoop", () => {
     expect(parsed.data).toContain("loop-hi");
   });
 
+  it("工具调用后，assistant 消息（含 toolCalls）与 tool 结果都写入上下文", async () => {
+    const brain = new ScriptedBrain([
+      {
+        result: {
+          text: "",
+          toolCalls: [{ name: "terminal", arguments: { command: "echo chain-test" } }],
+        },
+      },
+      { result: { text: "完成" } },
+    ]);
+    const signal = new AbortController().signal;
+    const loop = makeLoop({ brain, ears: new FakeEars(["执行", "/exit"]), signal });
+    await loop.run();
+    const secondCall = brain.messagesOf(1);
+    const assistant = secondCall.find((m) => m.role === "assistant");
+    expect(assistant).toBeDefined();
+    expect((assistant as { toolCalls?: unknown }).toolCalls).toEqual([
+      { name: "terminal", arguments: { command: "echo chain-test" } },
+    ]);
+    expect(secondCall.find((m) => m.role === "tool")).toBeDefined();
+    const firstCall = brain.messagesOf(0);
+    expect(firstCall.some((m) => m.role === "assistant")).toBe(true);
+  });
+
   it("危险命令经用户拒绝后不执行，结果反馈为 USER_DENIED", async () => {
     const brain = new ScriptedBrain([
       {

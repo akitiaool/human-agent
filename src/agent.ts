@@ -1,5 +1,5 @@
 import { ConversationContext } from "./brain/context.js";
-import { EchoBrain } from "./brain/echo-brain.js";
+import { OllamaBrain } from "./brain/ollama-brain.js";
 import type { BrainInference } from "./brain/llm.js";
 import { TextInput } from "./ears/text-input.js";
 import { FileReader } from "./eyes/file-reader.js";
@@ -48,7 +48,7 @@ export class HumanAgent {
 
   constructor(options: HumanAgentOptions = {}) {
     this.interrupt = new InterruptController();
-    this.brain = options.brain ?? new EchoBrain();
+    this.brain = options.brain ?? buildDefaultBrain();
     this.eyes = options.eyes ?? buildDefaultEyes();
     this.hands = options.hands ?? buildDefaultHands();
     this.nose = options.nose ?? buildDefaultNose();
@@ -75,6 +75,13 @@ export class HumanAgent {
     await loop.run();
     return loop.getStatus();
   }
+}
+
+function buildDefaultBrain(): BrainInference {
+  return new OllamaBrain({
+    ...(process.env.OLLAMA_BASE_URL !== undefined ? { baseUrl: process.env.OLLAMA_BASE_URL } : {}),
+    ...(process.env.OLLAMA_MODEL !== undefined ? { model: process.env.OLLAMA_MODEL } : {}),
+  });
 }
 
 function buildDefaultNose(): NoseContract {

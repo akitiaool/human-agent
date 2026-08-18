@@ -38,12 +38,52 @@ export interface AgentLoopOptions {
 }
 
 const TOOLS: readonly ToolInfo[] = [
-  { name: "read_file", description: "读取指定文件的内容" },
-  { name: "read_dir", description: "列出指定目录的条目" },
-  { name: "search_code", description: "在目录中检索匹配正则表达式的文件内容" },
-  { name: "write_file", description: "写入文件内容（自动创建父目录）" },
-  { name: "apply_patch", description: "对文件应用行级补丁" },
-  { name: "terminal", description: "执行 shell 命令" },
+  {
+    name: "read_file",
+    description: "读取指定文件的内容",
+    parameters: { type: "object", properties: { path: { type: "string" } }, required: ["path"] },
+  },
+  {
+    name: "read_dir",
+    description: "列出指定目录的条目",
+    parameters: { type: "object", properties: { path: { type: "string" } }, required: ["path"] },
+  },
+  {
+    name: "search_code",
+    description: "在目录中检索匹配正则表达式的文件内容",
+    parameters: {
+      type: "object",
+      properties: { pattern: { type: "string" }, dir: { type: "string" } },
+      required: ["pattern"],
+    },
+  },
+  {
+    name: "write_file",
+    description: "写入文件内容（自动创建父目录）",
+    parameters: {
+      type: "object",
+      properties: { path: { type: "string" }, content: { type: "string" } },
+      required: ["path", "content"],
+    },
+  },
+  {
+    name: "apply_patch",
+    description: "对文件应用行级补丁",
+    parameters: {
+      type: "object",
+      properties: { path: { type: "string" }, patch: { type: "string" } },
+      required: ["path", "patch"],
+    },
+  },
+  {
+    name: "terminal",
+    description: "执行 shell 命令",
+    parameters: {
+      type: "object",
+      properties: { command: { type: "string" } },
+      required: ["command"],
+    },
+  },
 ];
 
 /** 生命泵：听取指令 → 大脑思考 → 鼻子嗅探 → 手眼执行 → 反馈结果 → 循环/结束（设计文档 §3.2）。 */
@@ -140,9 +180,11 @@ export class AgentLoop {
       }
       const calls = result.toolCalls ?? [];
       if (calls.length === 0) {
+        this.#context.add({ role: "assistant", content: result.text });
         await this.#output.speak(result.text);
         return false;
       }
+      this.#context.add({ role: "assistant", content: result.text, toolCalls: calls });
       for (const call of calls) {
         if (this.#signal.aborted) {
           this.#status = "INTERRUPTED";

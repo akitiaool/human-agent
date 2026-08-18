@@ -25,13 +25,13 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 阶段四（大脑/心脏 + 全链路）已完成（TDD，79 tests）：
 - `src/brain/llm.ts`：`BrainInference` 统一推理接口（ToolCall/ToolInfo/BrainInferenceResult）
 - `src/brain/context.ts`：会话消息队列（system 永不移除，超预算裁剪最旧非 system 消息）
-- `src/brain/echo-brain.ts`：EchoBrain 回显最后一条 user 消息，真实 LLM 接入前作为默认大脑
+- `src/brain/ollama-brain.ts`：OllamaBrain，走本机 `/api/chat` 协议（`{ baseUrl?: string, model?: string, fetchImpl?: typeof fetch }`），支持工具调用；默认 `http://localhost:11434` + `qwen3:4b`；非 200 抛错（loop 捕获转 ERROR）；assistant 的 toolCalls 序列化为 `tool_calls`（snake_case），工具列表为空时不发 `tools`
 - `src/heart/interrupt.ts`：AbortController 封装（getSignal/abort/isAborted/reset）
-- `src/heart/loop.ts`：生命循环（LISTENING→THINKING→SNIFFING→ACTING→FEEDBACK）；6 个工具的 zod 参数校验（INVALID_ARGS）；terminal 危险命令经 mouth.confirm（USER_DENIED）；`#processTurn` 返回 boolean（true 表示中断/出错，规避 TS 对私有字段的收窄问题）；`onPhase` 回调；maxIterations 兜底
-- `src/agent.ts`：HumanAgent 组装器，默认组装 EchoBrain + 全部器官（鼻子组合 RiskChecker+EnvChecker，显式组合而非对象展开——spread 不复制原型方法）
+- `src/heart/loop.ts`：生命循环（LISTENING→THINKING→SNIFFING→ACTING→FEEDBACK）；6 个工具的 zod 参数校验（INVALID_ARGS）且 `TOOLS` 携带 JSON Schema `parameters`（ToolInfo 契约）；terminal 危险命令经 mouth.confirm（USER_DENIED）；assistant 消息（含 toolCalls）与 tool 结果都写回上下文（Ollama 续接的前提）；`#processTurn` 返回 boolean（true 表示中断/出错，规避 TS 对私有字段的收窄问题）；`onPhase` 回调；maxIterations 兜底
+- `src/agent.ts`：HumanAgent 组装器，默认组装 OllamaBrain + 全部器官（鼻子组合 RiskChecker+EnvChecker，显式组合而非对象展开——spread 不复制原型方法）；环境变量 `OLLAMA_BASE_URL`/`OLLAMA_MODEL` 覆盖默认大脑配置
 - `bin/cli.ts`：SIGINT/SIGTERM → `agent.interrupt.abort()`；结束后 `ears.close()` 防挂起；退出码 ERROR=1 / INTERRUPTED=130 / IDLE=0
 
-**尚未开始**：接入具体大模型替换 EchoBrain（BrainInference 接口已就绪）、`src/eyes/web-crawler.ts`（fetchPageAsMarkdown，契约已定义未实现，loop 未注册工具）、voice/image/browser 等预留器官。
+**尚未开始**：`src/eyes/web-crawler.ts`（fetchPageAsMarkdown，契约已定义未实现，loop 未注册工具）、voice/image/browser 等预留器官。
 
 `human-agent` 是一个拟人化智能体（Humanoid Agent）CLI 工具，技术栈为 TypeScript / Node.js (>= 20.0.0, ESM)。
 
@@ -101,4 +101,4 @@ CLI 入口为 `bin/cli.ts`（处理 argv）。
 1. 骨架与类型（`package.json`/`tsconfig.json`、`src/types/` 与 `ActionResult` 契约）✅
 2. 双手与眼睛（file-reader、terminal、file-writer、risk-checker）✅
 3. 嘴巴与耳朵（text-output、ask-user、text-input）✅
-4. 大脑与心脏（loop 状态机、interrupt、接入具体大模型）✅（LLM 接入待定：目前 EchoBrain 占位）
+4. 大脑与心脏（loop 状态机、interrupt、接入具体大模型）✅（OllamaBrain + qwen3，`OLLAMA_MODEL` 可换模型）
