@@ -21,6 +21,7 @@ const TOOL_SCHEMAS = {
   write_file: z.object({ path: z.string(), content: z.string() }),
   apply_patch: z.object({ path: z.string(), patch: z.string() }),
   terminal: z.object({ command: z.string() }),
+  fetch_page: z.object({ url: z.string() }),
 } as const;
 
 export interface AgentLoopOptions {
@@ -82,6 +83,15 @@ const TOOLS: readonly ToolInfo[] = [
       type: "object",
       properties: { command: { type: "string" } },
       required: ["command"],
+    },
+  },
+  {
+    name: "fetch_page",
+    description: "抓取网页并转换为 Markdown",
+    parameters: {
+      type: "object",
+      properties: { url: { type: "string" } },
+      required: ["url"],
     },
   },
 ];
@@ -240,6 +250,8 @@ export class AgentLoop {
         return this.#hands.applyPatch(args.path as string, args.patch as string);
       case "terminal":
         return this.#hands.executeCommand(args.command as string, this.#signal);
+      case "fetch_page":
+        return this.#eyes.fetchPageAsMarkdown(args.url as string);
       default:
         return fail("UNKNOWN_TOOL", `未知工具: ${name}`);
     }

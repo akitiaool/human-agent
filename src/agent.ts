@@ -3,6 +3,7 @@ import { OllamaBrain } from "./brain/ollama-brain.js";
 import type { BrainInference } from "./brain/llm.js";
 import { TextInput } from "./ears/text-input.js";
 import { FileReader } from "./eyes/file-reader.js";
+import { WebCrawler } from "./eyes/web-crawler.js";
 import { FileWriter } from "./hands/file-writer.js";
 import { Terminal } from "./hands/terminal.js";
 import { AgentLoop } from "./heart/loop.js";
@@ -95,11 +96,12 @@ function buildDefaultNose(): NoseContract {
 
 function buildDefaultEyes(): EyesContract {
   const reader = new FileReader();
+  const crawler = new WebCrawler();
   return {
     readFile: (path) => reader.readFile(path),
     readDir: (path) => reader.readDir(path),
     searchCode: (pattern, dir) => reader.searchCode(pattern, dir),
-    fetchPageAsMarkdown: () => Promise.reject(new Error("web-crawler 尚未实现")),
+    fetchPageAsMarkdown: (url) => crawler.fetchPageAsMarkdown(url),
   };
 }
 

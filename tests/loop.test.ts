@@ -1,4 +1,4 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { ConversationContext } from "../src/brain/context.js";
 import { AgentLoop } from "../src/heart/loop.js";
 import { TextOutput } from "../src/mouth/text-output.js";
@@ -74,6 +74,38 @@ describe("AgentLoop", () => {
     const parsed = JSON.parse(toolMessage!.content) as { success: boolean; data?: string };
     expect(parsed.success).toBe(true);
     expect(parsed.data).toContain("loop-hi");
+  });
+
+  it("fetch_page 工具调用经眼睛抓取网页并反馈 Markdown", async () => {
+    const brain = new ScriptedBrain([
+      {
+        result: {
+          text: "",
+          toolCalls: [{ name: "fetch_page", arguments: { url: "https://example.com" } }],
+        },
+      },
+      { result: { text: "抓取完成" } },
+    ]);
+    const fetchImpl = vi.fn().mockResolvedValue(
+      new Response("<html><body><h1>抓到的标题</h1></body></html>", { status: 200 }),
+    );
+    const signal = new AbortController().signal;
+    const loop = new AgentLoop({
+      brain,
+      ears: new FakeEars(["抓网页", "/exit"]),
+      nose: new RiskChecker(),
+      mouth: new AskUser({ input: inputFrom("y\n") }),
+      eyes: buildEyes({ fetchImpl }),
+      hands: buildHands(),
+      output: new TextOutput({ stdout: new FakeWritable(), intervalMs: 0 }),
+      signal,
+    });
+    await loop.run();
+    const toolMessage = brain.messagesOf(1).find((m) => m.role === "tool");
+    expect(toolMessage).toBeDefined();
+    const parsed = JSON.parse(toolMessage!.content) as { success: boolean; data?: string };
+    expect(parsed.success).toBe(true);
+    expect(parsed.data).toContain("# 抓到的标题");
   });
 
   it("工具调用后，assistant 消息（含 toolCalls）与 tool 结果都写入上下文", async () => {

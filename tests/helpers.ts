@@ -1,6 +1,7 @@
 import { Readable, Writable } from "node:stream";
 import type { ConversationContext, Message } from "../src/brain/context.js";
 import { FileReader } from "../src/eyes/file-reader.js";
+import { WebCrawler } from "../src/eyes/web-crawler.js";
 import { FileWriter } from "../src/hands/file-writer.js";
 import { Terminal } from "../src/hands/terminal.js";
 import type { BrainInference, BrainInferenceResult, ToolInfo } from "../src/brain/llm.js";
@@ -17,13 +18,14 @@ export function buildHands(): HandsContract {
   };
 }
 
-export function buildEyes(): EyesContract {
+export function buildEyes(options: { fetchImpl?: typeof fetch } = {}): EyesContract {
   const reader = new FileReader();
+  const crawler = new WebCrawler(options);
   return {
     readFile: (path) => reader.readFile(path),
     readDir: (path) => reader.readDir(path),
     searchCode: (pattern, dir) => reader.searchCode(pattern, dir),
-    fetchPageAsMarkdown: () => Promise.reject(new Error("web-crawler 尚未实现")),
+    fetchPageAsMarkdown: (url) => crawler.fetchPageAsMarkdown(url),
   };
 }
 

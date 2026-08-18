@@ -14,6 +14,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 - `src/nose/risk-checker.ts`：危险特征规则库（rm -rf、DROP TABLE、git push --force 等）→ SAFE/DANGEROUS
 - `src/nose/env-checker.ts`：环境快照（OS、CWD、git 分支），`getEnvSnapshot({ cwd })` 可指定目录
 - `src/eyes/file-reader.ts`：readFile/readDir/searchCode（searchCode 支持目录参数、跳过 node_modules/.git/dist、相对搜索根返回路径）
+- `src/eyes/web-crawler.ts`：WebCrawler（turndown 转 Clean Markdown，atx 标题 + fenced 代码块；可注入 fetchImpl；非 200/网络异常包装为 FETCH_ERROR 不抛错）
 - `src/hands/terminal.ts`：execa 10 执行命令，`{ shell: true, encoding: "utf8" }`，错误返回 `EXEC_ERROR` + shortMessage
 - `src/hands/file-writer.ts`：writeFile（自动建父目录）+ applyPatch（行级 `- 删除`/`+ 插入` patch 格式，文档见文件头注释）
 
@@ -31,7 +32,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 - `src/agent.ts`：HumanAgent 组装器，默认组装 OllamaBrain + 全部器官（鼻子组合 RiskChecker+EnvChecker，显式组合而非对象展开——spread 不复制原型方法）；环境变量 `OLLAMA_BASE_URL`/`OLLAMA_MODEL` 覆盖默认大脑配置
 - `bin/cli.ts`：SIGINT/SIGTERM → `agent.interrupt.abort()`；结束后 `ears.close()` 防挂起；退出码 ERROR=1 / INTERRUPTED=130 / IDLE=0
 
-**尚未开始**：`src/eyes/web-crawler.ts`（fetchPageAsMarkdown，契约已定义未实现，loop 未注册工具）、voice/image/browser 等预留器官。
+**尚未开始**：voice/image/browser 等预留器官（`eyes/image-viewer.ts`、`ears/voice-input.ts`、`mouth/voice-output.ts`、`hands/browser-action.ts`）。
 
 `human-agent` 是一个拟人化智能体（Humanoid Agent）CLI 工具，技术栈为 TypeScript / Node.js (>= 20.0.0, ESM)。
 
@@ -91,7 +92,7 @@ pnpm test     # vitest 全量运行（tests/ 目录，TDD 流程：先写测试�
 ```
 
 已安装版本（均比设计文档 v1.0.0 中规划的版本新一个以上大版本，实现时注意 API 差异）：
-- runtime：`chalk` 6（ESM-only）、`commander` 15、`execa` 10、`zod` 4（错误 API 与 v3 不同）
+- runtime：`chalk` 6（ESM-only）、`commander` 15、`execa` 10、`zod` 4（错误 API 与 v3 不同）、`turndown` 7（CJS，ESM 默认导入可用）
 - dev：`typescript` 7（原生编译器，`tsc --init` 生成的现代默认配置）、`tsx` 4、`@types/node` 26
 
 CLI 入口为 `bin/cli.ts`（处理 argv）。
