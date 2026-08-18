@@ -1,0 +1,30 @@
+{
+  "compilerOptions": {
+    // Environment
+    "target": "esnext",
+    "lib": ["esnext"],
+    "types": ["node"],
+    "module": "nodenext",
+    "moduleResolution": "nodenext",
+
+    // File Layout: 入口在 bin/ 与 src/，产物保持目录结构 (dist/bin/cli.js)
+    "rootDir": ".",
+    "outDir": "./dist",
+
+    // Stricter Typechecking (设计文档要求 strict，禁止 any)
+    "strict": true,
+    "noUncheckedIndexedAccess": true,
+    "exactOptionalPropertyTypes": true,
+    "noUncheckedSideEffectImports": true,
+    "verbatimModuleSyntax": true,
+    "isolatedModules": true,
+    "moduleDetection": "force",
+    "skipLibCheck": true,
+
+    // Other Outputs
+    "sourceMap": true,
+    "declaration": true,
+    "declarationMap": true
+  },
+  "include": ["bin", "src"]
+}

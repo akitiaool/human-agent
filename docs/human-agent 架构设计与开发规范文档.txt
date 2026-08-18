@@ -1,0 +1,243 @@
+# `human-agent` 架构设计与开发规范文档
+
+> **版本**：v1.0.0  
+> **语言/环境**：TypeScript / Node.js (>= 20.0.0, ESM 规范)  
+> **适用对象**：核心开发人员与模块贡献者  
+
+---
+
+## 1. 项目概述与设计哲学 (Design Philosophy)
+
+`human-agent` 是一个面向开发者日常使用的**拟人化智能体（Humanoid Agent）CLI 工具**。
+
+本项目摒弃了传统软件冰冷复杂的子系统划分，采用**人类生物学器官**作为顶层模块抽象。每个器官承载专一且直观的职责，彼此通过神经信号和生命循环协同运作。
+
+### 核心设计原则 (Core Principles)
+
+1. **动静绝对分离 (Read-Write Segregation)**：
+   * **👁️ 眼睛（Eyes）** 专职负责“看/读”（只读操作），无副作用，无需安全审批；
+   * **✋ 双手（Hands）** 专职负责“动/写”（破坏性操作），必须受控；
+   * **👃 鼻子（Nose）** 在双手行动前进行“风险嗅探”，一旦发现危险气味，交由 **🗣️ 嘴巴（Mouth）** 向人类发起安全确认。
+2. **异常即反馈，永不崩溃 (Errors as Feedback / Self-Healing)**：
+   * 工具（双手、眼睛）执行失败（如命令退出码非 0、文件不存在、网络超时）**严禁向外抛出未捕获异常导致程序崩溃**。
+   * 所有错误必须包装成结构化执行结果反哺给 **🧠 大脑（Brain）**，供大脑在下一个循环中理解报错并自我修复。
+3. **中断第一公民 (Interrupt-First Lifecycle)**：
+   * 用户在任何时刻按下 `Ctrl+C`，**🫀 心脏（Heart）** 必须毫秒级捕获并级联向所有器官下发中断信号（AbortSignal），立即停止子进程、取消网络流、保护现场并优雅复位。
+4. **轻量起步，按需演进 (Minimalist & Extensible)**：
+   * 初期仅引入基础通用依赖，大模型 SDK、TTS/ASR 等重度依赖在具体实现阶段按需引入，保持核心骨架轻盈。
+
+---
+
+## 2. 完整目录结构规范
+
+```text
+human-agent/
+├── bin/
+│   └── cli.ts                 # CLI 命令行启动入口 (处理 argv)
+├── src/
+│   ├── types/                 # 全局 TypeScript 接口与类型定义
+│   │   ├── index.ts           # 导出全局状态、工具结果与事件类型
+│   │   └── organ.ts           # 各器官的标准入参/出参契约
+│   │
+│   ├── brain/                 # 🧠 【大脑】：思考与记忆
+│   │   ├── llm.ts             # 大模型推理适配器 (统一接口定义)
+│   │   └── context.ts         # 会话历史消息链表与 Token 预算管理
+│   │
+│   ├── heart/                 # 🫀 【心脏】：生命循环与生命体征
+│   │   ├── loop.ts            # 自主多步推演主循环 (Autonomous Loop)
+│   │   └── interrupt.ts       # 中断与取消控制器 (AbortController 管理)
+│   │
+│   ├── eyes/                  # 👁️ 【眼睛】：观察/查看 (只读)
+│   │   ├── file-reader.ts     # 读取文件、遍历目录、代码关键词检索
+│   │   ├── web-crawler.ts     # 抓取网页内容并转换为 Clean Markdown
+│   │   └── image-viewer.ts    # 截图与多模态图像感知 (预留)
+│   │
+│   ├── ears/                  # 👂 【耳朵】：接收输入
+│   │   ├── text-input.ts      # 监听终端键盘敲入 (REPL 交互)
+│   │   └── voice-input.ts     # 监听麦克风语音 (ASR 预留)
+│   │
+│   ├── mouth/                 # 🗣️ 【嘴巴】：表达输出
+│   │   ├── text-output.ts     # 终端流式打印 Markdown、Diff 与彩色日志
+│   │   ├── voice-output.ts    # 语音发声合成 (TTS 预留)
+│   │   └── ask-user.ts        # 交互式提问弹窗 (高危操作确认 [Y/n])
+│   │
+│   ├── hands/                 # ✋ 【双手】：修改/执行 (破坏性/动作)
+│   │   ├── file-writer.ts     # 创建/修改文件、精准打代码 Patch
+│   │   ├── terminal.ts        # 执行 Shell / Bash 命令
+│   │   └── browser-action.ts  # 无头浏览器点击、输入表单 (预留)
+│   │
+│   ├── nose/                  # 👃 【鼻子】：嗅探与预警
+│   │   ├── risk-checker.ts    # 命令与代码安全风险评估 (嗅探危险指令)
+│   │   └── env-checker.ts     # 环境状态感知 (CWD、Git 分支、端口占用)
+│   │
+│   ├── agent.ts               # 🧍 人体合一组装类 (HumanAgent 实体)
+│   └── index.ts               # 模块导出统一出口
+│
+├── package.json
+├── tsconfig.json
+└── README.md
+```
+
+---
+
+## 3. 各器官（模块）详细职责说明
+
+### 3.1 🧠 大脑 (`src/brain/`)
+* **`llm.ts`**：定义统一的大脑推理接口 `BrainInference`。输入上下文和可用工具列表，返回思考文本或工具调用意图（Tool Calls）。
+* **`context.ts`**：维护消息队列（`System`, `User`, `Assistant`, `ToolResult`），负责限制上下文长度，超长时执行截断或压缩。
+
+### 3.2 🫀 心脏 (`src/heart/`)
+* **`loop.ts`**：智能体的生命泵（`Heartbeat Loop`）。负责推进循环：
+  $$\text{听取指令} \rightarrow \text{大脑思考} \rightarrow \text{鼻子嗅探} \rightarrow \text{手眼执行} \rightarrow \text{反馈结果} \rightarrow \text{循环/结束}$$
+* **`interrupt.ts`**：持有系统全局的 `AbortController`，对外提供 `abort()` 和 `getSignal()` 方法。
+
+### 3.3 👁️ 眼睛 (`src/eyes/`)
+* **`file-reader.ts`**：提供 `readFile(path)`、`readDir(path)`、`searchCode(pattern)`。
+* **`web-crawler.ts`**：提供 `fetchPageAsMarkdown(url)`，清洗无用的 HTML 标签，返回纯文本/Markdown 节省 Token。
+
+### 3.4 👂 耳朵 (`src/ears/`)
+* **`text-input.ts`**：封装终端输入流，提供 `prompt(question)` 和连续 REPL 监听。
+
+### 3.5 🗣️ 嘴巴 (`src/mouth/`)
+* **`text-output.ts`**：封装流式输出打字机动效、代码高亮、成功/警告/报错的彩色终端格式。
+* **`ask-user.ts`**：提供阻塞式交互确认：`confirm(message): Promise<boolean>`。
+
+### 3.6 ✋ 双手 (`src/hands/`)
+* **`file-writer.ts`**：提供 `writeFile(path, content)`、`applyPatch(path, patch)`。
+* **`terminal.ts`**：基于 `execa` 执行 Shell 命令，绑定中断信号（Signal），支持超时强杀。
+
+### 3.7 👃 鼻子 (`src/nose/`)
+* **`risk-checker.ts`**：包含危险特征规则库（如 `rm -rf`, `DROP TABLE`, `git push --force` 等），输出风险等级：`SAFE` 或 `DANGEROUS`。
+* **`env-checker.ts`**：提供快速获取当前操作系统、当前路径、Git 分支等环境快照。
+
+---
+
+## 4. 依赖管理策略与最小化 `package.json`
+
+当前阶段**只安装基础设施库**，不提前预装任何大模型或重度依赖：
+
+```json
+{
+  "name": "human-agent",
+  "version": "0.1.0",
+  "description": "A humanoid modular AI Agent CLI tool",
+  "type": "module",
+  "bin": {
+    "human-agent": "./bin/cli.ts"
+  },
+  "scripts": {
+    "dev": "tsx bin/cli.ts",
+    "build": "tsc",
+    "start": "node dist/bin/cli.js"
+  },
+  "dependencies": {
+    "chalk": "^5.3.0",
+    "commander": "^12.1.0",
+    "execa": "^9.3.0",
+    "zod": "^3.23.8"
+  },
+  "devDependencies": {
+    "@types/node": "^20.14.0",
+    "tsx": "^4.16.0",
+    "typescript": "^5.5.0"
+  },
+  "engines": {
+    "node": ">=20.0.0"
+  }
+}
+```
+
+---
+
+## 5. 编码规范与约束 (Coding Standards)
+
+1. **类型安全与严格模式**：
+   * `tsconfig.json` 必须开启 `"strict": true`。
+   * **严禁使用 `any`**。未知结构使用 `unknown` 并配合 `zod` 校验。
+2. **ESM 模块化规范**：
+   * 全面采用 ES Module（`import / export`），在本地相对路径导入时需包含扩展名或由 TS 编译规则统一解析。
+3. **无副作用与依赖注入**：
+   * 各器官类必须是**可实例化**的，严禁使用单例模式写死全局状态。
+   * `HumanAgent` 通过构造函数将各个器官组合注入，便于单元测试 mock：
+     ```typescript
+     export class HumanAgent {
+       constructor(
+         public brain: Brain,
+         public heart: Heart,
+         public eyes: Eyes,
+         public hands: Hands,
+         public mouth: Mouth,
+         public nose: Nose,
+         public ears: Ears
+       ) {}
+     }
+     ```
+4. **命名规范**：
+   * 目录名：单数或复数名词小写（如 `brain`, `hands`）。
+   * 文件名：短横线命名法（kebab-case），如 `file-reader.ts`, `risk-checker.ts`。
+   * 类名：大驼峰（PascalCase），如 `FileReader`, `RiskChecker`。
+   * 变量与函数：小驼峰（camelCase），如 `sniffRisk()`, `speakStream()`。
+
+---
+
+## 6. 异常处理与容错原则 (Exception Handling)
+
+### 6.1 工具执行结果统一包装契约
+所有由 **双手（Hands）** 和 **眼睛（Eyes）** 执行的操作，无论成功与否，**必须统一返回 `ActionResult` 类型**，严禁向外抛出未捕获错误：
+
+```typescript
+// src/types/organ.ts
+export interface ActionResult<T = unknown> {
+  success: boolean;
+  data?: T;
+  error?: {
+    code: string;
+    message: string;
+    stack?: string;
+  };
+}
+```
+
+* **示例实现规范**：
+  ```typescript
+  // src/hands/terminal.ts
+  export async function executeCommand(cmd: string, signal?: AbortSignal): Promise<ActionResult<string>> {
+    try {
+      const { stdout, stderr } = await execa({ shell: true, cancelSignal: signal })`${cmd}`;
+      return { success: true, data: stdout || stderr || 'Command executed with no output.' };
+    } catch (err: any) {
+      // 捕获所有错误，包装成失败结果回传给大脑
+      return {
+        success: false,
+        error: {
+          code: 'EXEC_ERROR',
+          message: err.shortMessage || err.message,
+          stack: err.stderr || err.stdout
+        }
+      };
+    }
+  }
+  ```
+
+### 6.2 中断异常处理
+* 当检测到 `signal.aborted` 时，各模块应迅速退出当前操作，并将生命体状态置为 `INTERRUPTED`，保持现有会话历史不丢失。
+
+---
+
+## 7. 开发路线与实现阶段 (Roadmap)
+
+开发者请严格按照以下 4 个阶段递进开发：
+
+* [ ] **阶段一：器官骨架与类型搭建 (Scaffolding)**
+  * 初始化 `package.json` 与 `tsconfig.json`。
+  * 在 `src/types/` 中编写全局类型定义与 `ActionResult` 契约。
+* [ ] **阶段二：双手与眼睛实现 (Sensory & Actions)**
+  * 实现 `eyes/file-reader.ts`（文件读与搜）。
+  * 实现 `hands/terminal.ts` 与 `hands/file-writer.ts`。
+  * 实现 `nose/risk-checker.ts`（基本危险正则匹配）。
+* [ ] **阶段三：嘴巴与耳朵交互 (I/O & TUI)**
+  * 实现 `mouth/text-output.ts`（终端彩色高亮输出）与 `mouth/ask-user.ts`。
+  * 实现 `ears/text-input.ts`（基础 REPL 用户输入）。
+* [ ] **阶段四：大脑与心脏联动 (Brain & Heart Loop)**
+  * 实现 `heart/loop.ts`（状态机与 ReAct 调度循环）与 `heart/interrupt.ts`（Ctrl+C 中断）。
+  * 接入具体大模型到 `brain/llm.ts`，完成全链路跑通。
