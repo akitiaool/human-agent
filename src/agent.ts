@@ -83,20 +83,40 @@ export class HumanAgent {
 }
 
 function buildDefaultBrain(nose: NoseContract, mouth: MouthContract): BrainInference {
-  const bridgePort = process.env.GEMINI_BRIDGE_PORT;
-  if (bridgePort !== undefined) {
-    const port = Number(bridgePort);
-    return new GeminiBridgeThinking({
-      port: Number.isInteger(port) && port > 0 ? port : 8765,
-      nose,
-      mouth,
-    });
-  }
   return new OllamaThinking({
     nose,
     mouth,
     ...(process.env.OLLAMA_BASE_URL !== undefined ? { baseUrl: process.env.OLLAMA_BASE_URL } : {}),
     ...(process.env.OLLAMA_MODEL !== undefined ? { model: process.env.OLLAMA_MODEL } : {}),
+  });
+}
+
+export interface BridgeServiceOptions {
+  port?: number;
+  signal?: AbortSignal;
+  timeoutMs?: number;
+  logger?: (text: string) => void;
+}
+
+/** 桥模式组装：网页对话 + 智能体仅执行工具。port 缺省读 GEMINI_BRIDGE_PORT（非法回退 8765）。 */
+export function buildBridgeService(options: BridgeServiceOptions = {}): GeminiBridgeThinking {
+  const nose = buildDefaultNose();
+  const hands = buildDefaultHands();
+  const eyes = buildDefaultEyes();
+  const port = options.port ?? (() => {
+    const raw = process.env.GEMINI_BRIDGE_PORT;
+    if (raw === undefined) return 8765;
+    const parsed = Number(raw);
+    return Number.isInteger(parsed) && parsed > 0 ? parsed : 8765;
+  })();
+  return new GeminiBridgeThinking({
+    port,
+    nose,
+    hands,
+    eyes,
+    ...(options.signal !== undefined ? { signal: options.signal } : {}),
+    ...(options.timeoutMs !== undefined ? { timeoutMs: options.timeoutMs } : {}),
+    ...(options.logger !== undefined ? { logger: options.logger } : {}),
   });
 }
 

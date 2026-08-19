@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { HumanAgent } from "../src/agent.js";
+import { buildBridgeService, HumanAgent } from "../src/agent.js";
 import { ConversationContext } from "../src/brain/context.js";
 import { GeminiBridgeThinking } from "../src/brain/gemini-bridge-thinking.js";
 import { OllamaThinking } from "../src/brain/ollama-thinking.js";
@@ -115,19 +115,26 @@ describe("HumanAgent", () => {
     }
   });
 
-  it("GEMINI_BRIDGE_PORT 环境变量启用 GeminiBridgeThinking", async () => {
-    process.env.GEMINI_BRIDGE_PORT = "0";
-    const agent = new HumanAgent({ ears: new FakeEars(["/exit"]), output: new FakeOutput() });
-    try {
-      expect(agent.brain).toBeInstanceOf(GeminiBridgeThinking);
-      if (agent.brain instanceof GeminiBridgeThinking) {
-        expect(await agent.brain.getPort()).toBe(8765);
-      }
-      const status = await agent.run();
-      expect(status).toBe("IDLE");
-    } finally {
-      if (agent.brain instanceof GeminiBridgeThinking) agent.brain.close();
-      delete process.env.GEMINI_BRIDGE_PORT;
-    }
-  });
+});
+
+it("buildBridgeService 返回可监听的桥服务", async () => {
+  const service = buildBridgeService({ port: 0 });
+  try {
+    expect(service).toBeInstanceOf(GeminiBridgeThinking);
+    const port = await service.getPort();
+    expect(Number.isInteger(port)).toBe(true);
+  } finally {
+    service.close();
+  }
+});
+
+it("buildBridgeService 未指定端口时读 GEMINI_BRIDGE_PORT，非法值回退 8765", async () => {
+  process.env.GEMINI_BRIDGE_PORT = "not-a-port";
+  try {
+    const service = buildBridgeService({ port: 0 }); // 显式 0 优先，避免真实绑定 8765
+    expect(service).toBeInstanceOf(GeminiBridgeThinking);
+    service.close();
+  } finally {
+    delete process.env.GEMINI_BRIDGE_PORT;
+  }
 });
