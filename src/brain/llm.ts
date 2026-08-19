@@ -1,4 +1,5 @@
 import type { ConversationContext } from "./context.js";
+import type { ActionResult } from "../types/index.js";
 
 export interface ToolCall {
   name: string;
@@ -15,6 +16,17 @@ export interface ToolInfo {
 export interface BrainInferenceResult {
   text: string;
   toolCalls?: ToolCall[];
+}
+
+/** 反思裁决：逐条调用给出 放行 或 拦截+错误反馈（大脑反思层的输出契约）。 */
+export interface BlockedCall {
+  call: ToolCall;
+  result: ActionResult<unknown>;
+}
+
+export interface ReflectionVerdict {
+  allowed: ToolCall[];
+  blocked: BlockedCall[];
 }
 
 /** 大脑统一推理接口：输入上下文与可用工具，返回思考文本或工具调用意图（设计文档 §3.1）。 */
