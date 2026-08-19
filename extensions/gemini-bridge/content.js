@@ -190,7 +190,7 @@ panel.innerHTML = `
 #ha-log::-webkit-scrollbar-thumb { background: #4b5563; border-radius: 4px; }
 #ha-log::-webkit-scrollbar-thumb:hover { background: #6b7280; }
 .ha-approval-overlay {
-  position: fixed; inset: 0; z-index: 2147483646;
+  position: fixed; inset: 0; z-index: 2147483647;
   background: rgba(0,0,0,.55); display: flex; align-items: center; justify-content: center;
 }
 .ha-approval-box {
@@ -751,7 +751,11 @@ async function handleApproval(item) {
   setStatus("等待授权");
   log(`收到审批请求（${item.calls.length} 条危险命令），等待授权…`);
   const decision = await showApprovalDialog(item);
-  if (!(await postApproval(item.id, decision.allowed))) setStatus("错误");
+  if (!(await postApproval(item.id, decision.allowed))) {
+    setStatus("错误");
+    log("审批结果提交失败——桥服务将在审批超时后按拒绝兜底");
+    return;
+  }
   setStatus("待命");
 }
 
