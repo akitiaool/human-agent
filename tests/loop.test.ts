@@ -6,6 +6,7 @@ import { AskUser } from "../src/mouth/ask-user.js";
 import { RiskChecker } from "../src/nose/risk-checker.js";
 import type { AgentPhase } from "../src/types/index.js";
 import type { EarsContract } from "../src/types/index.js";
+import type { BrainInference, BrainInferenceResult, ReflectionVerdict, ToolCall, ToolInfo } from "../src/brain/llm.js";
 import {
   FakeEars,
   FakeWritable,
@@ -43,6 +44,10 @@ class AbortableBrain implements BrainInference {
     });
     return { text: "" };
   }
+
+  async reflect(calls: readonly ToolCall[]): Promise<ReflectionVerdict> {
+    return { allowed: [...calls], blocked: [] };
+  }
 }
 
 /** 第一轮 infer 挂起（等待超时取消），之后正常回答。 */
@@ -63,6 +68,10 @@ class TimeoutThenAnswerBrain implements BrainInference {
       );
     });
     return { text: "" };
+  }
+
+  async reflect(calls: readonly ToolCall[]): Promise<ReflectionVerdict> {
+    return { allowed: [...calls], blocked: [] };
   }
 }
 

@@ -1,5 +1,5 @@
 import { ConversationContext } from "./brain/context.js";
-import { OllamaBrain } from "./brain/ollama-brain.js";
+import { OllamaThinking } from "./brain/thinking/ollama-thinking.js";
 import type { BrainInference } from "./brain/llm.js";
 import { TextInput } from "./ears/text-input.js";
 import { FileReader } from "./eyes/file-reader.js";
@@ -52,7 +52,6 @@ export class HumanAgent {
 
   constructor(options: HumanAgentOptions = {}) {
     this.interrupt = new InterruptController();
-    this.brain = options.brain ?? buildDefaultBrain();
     this.eyes = options.eyes ?? buildDefaultEyes();
     this.hands = options.hands ?? buildDefaultHands();
     this.nose = options.nose ?? buildDefaultNose();
@@ -62,6 +61,7 @@ export class HumanAgent {
     this.context = options.context ?? new ConversationContext({ maxTokens: 8000 });
     this.maxIterations = options.maxIterations ?? 10;
     this.timeoutMs = options.timeoutMs;
+    this.brain = options.brain ?? buildDefaultBrain(this.nose, this.mouth);
   }
 
   async run(): Promise<AgentStatus> {
@@ -83,8 +83,10 @@ export class HumanAgent {
   }
 }
 
-function buildDefaultBrain(): BrainInference {
-  return new OllamaBrain({
+function buildDefaultBrain(nose: NoseContract, mouth: MouthContract): BrainInference {
+  return new OllamaThinking({
+    nose,
+    mouth,
     ...(process.env.OLLAMA_BASE_URL !== undefined ? { baseUrl: process.env.OLLAMA_BASE_URL } : {}),
     ...(process.env.OLLAMA_MODEL !== undefined ? { model: process.env.OLLAMA_MODEL } : {}),
   });

@@ -4,8 +4,21 @@ import { FileReader } from "../src/eyes/file-reader.js";
 import { WebCrawler } from "../src/eyes/web-crawler.js";
 import { FileWriter } from "../src/hands/file-writer.js";
 import { Terminal } from "../src/hands/terminal.js";
-import type { BrainInference, BrainInferenceResult, ToolInfo } from "../src/brain/llm.js";
-import type { EarsContract, EyesContract, HandsContract } from "../src/types/index.js";
+import type {
+  BrainInference,
+  BrainInferenceResult,
+  ReflectionVerdict,
+  ToolCall,
+  ToolInfo,
+} from "../src/brain/llm.js";
+import type {
+  EarsContract,
+  EyesContract,
+  HandsContract,
+  MouthContract,
+  NoseContract,
+  RiskLevel,
+} from "../src/types/index.js";
 
 /** 类方法在 prototype 上，对象展开不会复制，必须显式组合（agent.ts 组装时同理）。 */
 export function buildHands(): HandsContract {
@@ -73,7 +86,10 @@ export interface ScriptedBrainStep {
 export class ScriptedBrain implements BrainInference {
   private readonly calls: { messages: readonly Message[]; tools: readonly ToolInfo[] }[] = [];
 
-  constructor(private readonly steps: ScriptedBrainStep[]) {}
+  constructor(
+    private readonly steps: ScriptedBrainStep[],
+    private readonly reflectVerdict?: ReflectionVerdict,
+  ) {}
 
   async infer(
     context: ConversationContext,
@@ -86,6 +102,10 @@ export class ScriptedBrain implements BrainInference {
     return step.result!;
   }
 
+  async reflect(calls: readonly ToolCall[]): Promise<ReflectionVerdict> {
+    return this.reflectVerdict ?? { allowed: [...calls], blocked: [] };
+  }
+
   callCount(): number {
     return this.calls.length;
   }
@@ -95,4 +115,17 @@ export class ScriptedBrain implements BrainInference {
     if (entry === undefined) throw new Error(`第 ${call} 次调用不存在`);
     return entry.messages;
   }
+}
+
+/** 反思测试替身：可指定风险等级与确认结果。 */
+export function buildStubNose(risk: RiskLevel = "SAFE"): NoseContract {
+  return {
+    checkRisk: () => risk,
+    getEnvSnapshot: () => ({ os: "test", cwd: "" }),
+    checkPorts: async () => [],
+  };
+}
+
+export function buildStubMouth(approve = true): MouthContract {
+  return { confirm: async () => approve };
 }

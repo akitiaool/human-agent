@@ -1,10 +1,20 @@
-import type { ConversationContext, Message } from "./context.js";
-import type { BrainInference, BrainInferenceResult, ToolCall, ToolInfo } from "./llm.js";
+import type { ConversationContext, Message } from "../context.js";
+import type {
+  BrainInference,
+  BrainInferenceResult,
+  ReflectionVerdict,
+  ToolCall,
+  ToolInfo,
+} from "../llm.js";
+import { Reflection } from "../reflection.js";
+import type { MouthContract, NoseContract } from "../../types/index.js";
 
-export interface OllamaBrainOptions {
+export interface OllamaThinkingOptions {
   baseUrl?: string;
   model?: string;
   fetchImpl?: typeof fetch;
+  nose: NoseContract;
+  mouth: MouthContract;
 }
 
 interface OllamaToolCall {
@@ -17,16 +27,18 @@ interface OllamaMessage {
   tool_calls?: OllamaToolCall[];
 }
 
-/** 大脑的 Ollama 实现：走本机 /api/chat 协议，支持工具调用（设计文档 §3.1）。 */
-export class OllamaBrain implements BrainInference {
+/** 思考层的 Ollama 实现：走本机 /api/chat 协议，支持工具调用，反思委托共享 Reflection（设计文档 §4.2）。 */
+export class OllamaThinking implements BrainInference {
   readonly #baseUrl: string;
   readonly #model: string;
   readonly #fetchImpl: typeof fetch;
+  readonly #reflection: Reflection;
 
-  constructor(options: OllamaBrainOptions = {}) {
+  constructor(options: OllamaThinkingOptions) {
     this.#baseUrl = options.baseUrl ?? "http://localhost:11434";
     this.#model = options.model ?? "qwen3:4b";
     this.#fetchImpl = options.fetchImpl ?? fetch;
+    this.#reflection = new Reflection(options.nose, options.mouth);
   }
 
   async infer(
@@ -56,6 +68,10 @@ export class OllamaBrain implements BrainInference {
       text: data.message.content ?? "",
       ...(data.message.tool_calls ? { toolCalls: data.message.tool_calls.map(toToolCall) } : {}),
     };
+  }
+
+  async reflect(calls: readonly ToolCall[]): Promise<ReflectionVerdict> {
+    return this.#reflection.reflect(calls);
   }
 }
 

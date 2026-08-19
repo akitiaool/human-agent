@@ -1,7 +1,8 @@
 import { describe, expect, it, vi } from "vitest";
-import { OllamaBrain } from "../src/brain/ollama-brain.js";
+import { OllamaThinking } from "../src/brain/thinking/ollama-thinking.js";
 import { ConversationContext } from "../src/brain/context.js";
 import type { Message, ToolInfo } from "../src/brain/llm.js";
+import { buildStubMouth, buildStubNose } from "./helpers.js";
 
 function contextOf(...messages: Message[]): ConversationContext {
   const context = new ConversationContext({ maxTokens: 8000 });
@@ -22,7 +23,7 @@ function jsonResponse(data: unknown, status = 200): Response {
 }
 
 function makeBrain(fetchImpl: typeof fetch) {
-  return new OllamaBrain({ fetchImpl });
+  return new OllamaThinking({ fetchImpl, nose: buildStubNose(), mouth: buildStubMouth() });
 }
 
 describe("OllamaBrain", () => {
@@ -149,11 +150,27 @@ describe("OllamaBrain", () => {
 
   it("可自定义 baseUrl 与 model", async () => {
     const fetchImpl = vi.fn().mockResolvedValue(jsonResponse({ message: { role: "assistant", content: "ok" } }));
-    const brain = new OllamaBrain({ baseUrl: "http://10.0.0.2:8080", model: "qwen3:8b", fetchImpl });
+    const brain = new OllamaThinking({
+      baseUrl: "http://10.0.0.2:8080",
+      model: "qwen3:8b",
+      fetchImpl,
+      nose: buildStubNose(),
+      mouth: buildStubMouth(),
+    });
     await brain.infer(contextOf({ role: "user", content: "hi" }), TOOLS);
     const [url] = fetchImpl.mock.calls[0]!;
     expect(String(url)).toBe("http://10.0.0.2:8080/api/chat");
     const body = JSON.parse(fetchImpl.mock.calls[0]![1]!.body as string) as Record<string, unknown>;
     expect(body.model).toBe("qwen3:8b");
+  });
+
+  it("reflect 委托共享反思层：危险命令被拒时拦截为 USER_DENIED", async () => {
+    const brain = new OllamaThinking({
+      fetchImpl: vi.fn().mockResolvedValue(jsonResponse({ message: { role: "assistant", content: "ok" } })),
+      nose: buildStubNose("DANGEROUS"),
+      mouth: buildStubMouth(false),
+    });
+    const verdict = await brain.reflect([{ name: "terminal", arguments: { command: "rm -rf /" } }]);
+    expect(verdict.blocked[0]?.result.error?.code).toBe("USER_DENIED");
   });
 });

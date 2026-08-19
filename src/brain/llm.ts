@@ -36,4 +36,6 @@ export interface BrainInference {
     tools: readonly ToolInfo[],
     signal?: AbortSignal,
   ): Promise<BrainInferenceResult>;
+  /** 反思：对候选工具调用做可行性裁决（存在性/结构/危险嗅探），放行或拦截+错误反馈。 */
+  reflect(calls: readonly ToolCall[]): Promise<ReflectionVerdict>;
 }
