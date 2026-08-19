@@ -6,7 +6,7 @@ import http from "node:http";
 import type { AddressInfo } from "node:net";
 import { executeTool, type ToolOrgans } from "../heart/executor.js";
 import type { ActionResult, EyesContract, HandsContract, NoseContract } from "../types/index.js";
-import { serializeToolProtocol } from "./knowledge.js";
+import { serializeToolProtocol, TOOLS } from "./knowledge.js";
 import type { BrainInferenceResult, ToolCall } from "./llm.js";
 import { Reflection } from "./reflection.js";
 
@@ -36,8 +36,28 @@ export function parseToolCalls(text: string): BrainInferenceResult {
       // 坏 JSON 块丢弃
     }
   }
+  if (calls.length === 0) {
+    // 容错兜底：Gemini 可能丢 ```tool_call``` 围栏只输出裸 JSON（整条恰为已知工具的调用对象）
+    const bare = parseBareToolCall(text.trim());
+    if (bare) return { text: "", toolCalls: [bare] };
+  }
   const stripped = text.replace(pattern, "").trim();
   return { text: stripped, ...(calls.length > 0 ? { toolCalls: calls } : {}) };
+}
+
+/** 裸 JSON 兜底：name 必须是已知工具（防普通对话中的 JSON 被误判），arguments 须为对象。 */
+function parseBareToolCall(text: string): ToolCall | undefined {
+  if (text.length === 0 || !text.startsWith("{")) return undefined;
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(text);
+  } catch {
+    return undefined;
+  }
+  if (!isToolCall(parsed)) return undefined;
+  const name = (parsed as ToolCall).name;
+  if (!TOOLS.some((tool) => tool.name === name)) return undefined;
+  return parsed as ToolCall;
 }
 
 function isToolCall(value: unknown): value is ToolCall {
