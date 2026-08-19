@@ -14,8 +14,15 @@ const SAMPLE_INTERVAL_MS = 700; // 采样间隔（500ms–1s 区间）
 const TASK_RETRY_MS = 1_000; // GET /task 无消息后的重试间隔
 const BRIDGE_RETRY_MIN_MS = 1_000; // 桥不可达时的初始重试间隔
 const BRIDGE_RETRY_MAX_MS = 30_000; // 桥不可达时的重试间隔上限（指数退避）
-const TYPING_MIN_MS = 8; // 逐字输入每字符随机延时下限（防检测）
-const TYPING_MAX_MS = 40; // 逐字输入每字符随机延时上限（防检测）
+const TYPING_MIN_MS = 30; // 纠错重打每字符随机延时下限
+const TYPING_MAX_MS = 80; // 纠错重打每字符随机延时上限
+const TYPO_MAX = 2; // 每段最多错字数（模拟粘贴后纠错）
+const PASTE_GAP_MIN_MS = 400; // 段间停顿下限（模拟人工粘贴节奏）
+const PASTE_GAP_MAX_MS = 900; // 段间停顿上限
+const BACKSPACE_MIN_MS = 40; // 退格/重打字符延时下限
+const BACKSPACE_MAX_MS = 90;
+const COMMON_CJK = "的了一是在不和有这大为中上国个"; // 中文错字候选（同音/高频字近似）
+const KB_ROWS = ["qwertyuiop", "asdfghjkl", "zxcvbnm"]; // 键盘相邻键（模拟手误）
 const REINJECT_SUPPRESS_MS = 5_000; // 新对话重新注入防抖窗口
 const BODY_CHECK_THROTTLE_MS = 200; // body 变更检查节流（虚拟滚动高频 churn 下不每次跑 querySelector）
 const LOG_MAX_LINES = 50;
@@ -29,6 +36,8 @@ const defaultSettings = {
   simulateTyping: true,
   delayMinSec: 3,
   delayMaxSec: 8,
+  segmentLen: 60, // 分段粘贴长度（字符）
+  typoChance: 40, // 每段触发「粘贴错字→退格→重打」纠错的概率（%）
 };
 
 let settings = { ...defaultSettings };
@@ -126,6 +135,16 @@ panel.innerHTML = `
   <span>秒</span>
 </div>
 <div class="ha-row">
+  <span>分段长度</span>
+  <input type="number" id="ha-segment-len" min="10" max="500" step="10">
+  <span>字符</span>
+</div>
+<div class="ha-row">
+  <span>纠错概率</span>
+  <input type="number" id="ha-typo-chance" min="0" max="100" step="5">
+  <span>%</span>
+</div>
+<div class="ha-row">
   <span>桥服务</span>
   <input type="text" id="ha-base-url" spellcheck="false" placeholder="http://127.0.0.1:8765">
 </div>
@@ -171,11 +190,21 @@ function log(text) {
 
 // ---------- 设置持久化（chrome.storage.sync） ----------
 
+function clampSegmentLen(v) {
+  return Number.isFinite(v) ? Math.min(500, Math.max(10, Math.round(v))) : defaultSettings.segmentLen;
+}
+
+function clampTypoChance(v) {
+  return Number.isFinite(v) ? Math.min(100, Math.max(0, Math.round(v))) : defaultSettings.typoChance;
+}
+
 function applySettingsToPanel() {
   panel.querySelector("#ha-auto-mode").checked = settings.autoMode;
   panel.querySelector("#ha-simulate").checked = settings.simulateTyping;
   panel.querySelector("#ha-delay-min").value = settings.delayMinSec;
   panel.querySelector("#ha-delay-max").value = settings.delayMaxSec;
+  panel.querySelector("#ha-segment-len").value = settings.segmentLen;
+  panel.querySelector("#ha-typo-chance").value = settings.typoChance;
   panel.querySelector("#ha-base-url").value = settings.baseUrl;
 }
 
@@ -208,6 +237,16 @@ function setupPanelEvents() {
     const { delayMinSec, delayMaxSec } = clampDelay(settings.delayMinSec, Number(e.target.value));
     settings.delayMinSec = delayMinSec;
     settings.delayMaxSec = delayMaxSec;
+    applySettingsToPanel();
+    scheduleSaveSettings();
+  });
+  panel.querySelector("#ha-segment-len").addEventListener("change", (e) => {
+    settings.segmentLen = clampSegmentLen(Number(e.target.value));
+    applySettingsToPanel();
+    scheduleSaveSettings();
+  });
+  panel.querySelector("#ha-typo-chance").addEventListener("change", (e) => {
+    settings.typoChance = clampTypoChance(Number(e.target.value));
     applySettingsToPanel();
     scheduleSaveSettings();
   });
@@ -271,7 +310,73 @@ function findSendButton() {
   return document.querySelector('ms-run-button button[type="submit"].ms-button-primary');
 }
 
-// A4：模拟人类逐字输入。每字符随机短延时 + input 事件驱动 Angular 表单与自动增高。
+// A4：模拟人类分段粘贴输入。整段瞬间填入（模拟 Ctrl+V），
+// 按概率在段内预留错别字 → 退格删除 → 逐字重打正确字符，段间随机停顿。
+// 不做匀速逐字输入（无防检测意义且回填慢）。
+function splitSegments(text, len) {
+  const segs = [];
+  let i = 0;
+  while (i < text.length) {
+    let end = Math.min(i + len, text.length);
+    if (end < text.length) {
+      const nl = text.lastIndexOf("\n", end); // 就近行断点分段
+      if (nl > i + len / 2) end = nl + 1;
+    }
+    segs.push(text.slice(i, end));
+    i = end;
+  }
+  return segs;
+}
+
+// 模拟手误：字母 → 同行相邻键；数字 → ±1；中文 → 高频字近似；其余不替换
+function neighborKey(ch) {
+  const lower = ch.toLowerCase();
+  for (const row of KB_ROWS) {
+    const idx = row.indexOf(lower);
+    if (idx >= 0) {
+      const n = row[idx + (Math.random() < 0.5 ? -1 : 1)] ?? row[idx - 1] ?? row[idx + 1];
+      return ch === lower ? n : n.toUpperCase();
+    }
+  }
+  if (/\d/.test(ch)) return String((Number(ch) + (Math.random() < 0.5 ? 1 : 9)) % 10);
+  if (/[一-鿿]/.test(ch)) return COMMON_CJK[randInt(0, COMMON_CJK.length - 1)];
+  return ch; // 符号等无法近似 → 不制造错字
+}
+
+// 写入一段：粘贴（可能带错字）→ 按序退格删除错字 → 逐字重打正确字符。segStartCp 为本段起点的码点偏移。
+async function pasteSegment(input, segStartCp, seg) {
+  const fixes = [];
+  if (Math.random() * 100 < settings.typoChance) {
+    const n = randInt(1, Math.min(TYPO_MAX, seg.length));
+    const positions = new Set();
+    while (positions.size < n) positions.add(randInt(0, seg.length - 1));
+    for (const pos of positions) {
+      const correct = seg[pos];
+      const typo = neighborKey(correct);
+      if (typo !== correct) fixes.push({ pos, correct, typo });
+    }
+  }
+  const chars = [...seg];
+  for (const f of fixes) chars[f.pos] = f.typo;
+  const written = chars.join("");
+  input.value += written;
+  input.dispatchEvent(new InputEvent("input", { bubbles: true, inputType: "insertText", data: written }));
+  if (fixes.length === 0) return;
+  await sleep(randInt(200, 500)); // 粘贴后停顿，再开始纠错
+  let all = Array.from(input.value); // 码点数组（避免代理对与 slice 偏移不一致）
+  for (const f of [...fixes].sort((a, b) => b.pos - a.pos)) {
+    const at = segStartCp + f.pos;
+    all.splice(at, 1); // 退格删除错字
+    input.value = all.join("");
+    input.dispatchEvent(new InputEvent("input", { bubbles: true, inputType: "deleteContentBackward" }));
+    await sleep(randInt(BACKSPACE_MIN_MS, BACKSPACE_MAX_MS));
+    all.splice(at, 0, f.correct); // 重打正确字符
+    input.value = all.join("");
+    input.dispatchEvent(new InputEvent("input", { bubbles: true, inputType: "insertText", data: f.correct }));
+    await sleep(randInt(TYPING_MIN_MS, TYPING_MAX_MS));
+  }
+}
+
 async function typeIntoInput(text) {
   const input = findInput();
   if (!input) return false;
@@ -283,10 +388,11 @@ async function typeIntoInput(text) {
   }
   if (settings.simulateTyping) {
     await sleep(randInt(300, 800)); // 初始停顿，模拟人类开始输入前的思考
-    for (const ch of text) {
-      input.value += ch;
-      input.dispatchEvent(new InputEvent("input", { bubbles: true, inputType: "insertText", data: ch }));
-      await sleep(randInt(TYPING_MIN_MS, TYPING_MAX_MS));
+    let segStartCp = 0;
+    for (const seg of splitSegments(text, settings.segmentLen)) {
+      await pasteSegment(input, segStartCp, seg);
+      segStartCp += seg.length;
+      await sleep(randInt(PASTE_GAP_MIN_MS, PASTE_GAP_MAX_MS)); // 段间停顿
     }
   } else {
     input.value = text;
@@ -325,7 +431,7 @@ async function clickSendWhenReady() {
 async function deliverMessage(text, source) {
   delivering = true;
   try {
-    setStatus(settings.simulateTyping ? "回填中（模拟输入）" : "回填中");
+    setStatus(settings.simulateTyping ? "回填中（模拟粘贴）" : "回填中");
     log(`${source === "reinject" ? "重新注入协议文本" : "任务消息到达"}：${truncate(text.replace(/\n/g, " "), 80)}`);
     if (!(await typeIntoInput(text))) {
       setStatus("错误");
@@ -534,6 +640,8 @@ async function init() {
       baseUrl: normalizeBaseUrl(saved.baseUrl),
       delayMinSec,
       delayMaxSec,
+      segmentLen: clampSegmentLen(Number(saved.segmentLen)),
+      typoChance: clampTypoChance(Number(saved.typoChance)),
       autoMode: typeof saved.autoMode === "boolean" ? saved.autoMode : defaultSettings.autoMode,
       simulateTyping:
         typeof saved.simulateTyping === "boolean" ? saved.simulateTyping : defaultSettings.simulateTyping,
