@@ -1,14 +1,14 @@
-# Gemini 桥实现计划
+# Gemini 桥实现计划（v2：网页对话驱动 · 智能体仅执行）
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** 接入网页版 Gemini 作为大脑（浏览器扩展桥），并完成大脑职责模型重构（知识库 / 思考 / 反思分层）。
+**Goal:** 网页版 Gemini 作为对话大脑（浏览器扩展桥），智能体侧仅执行工具；完成大脑职责模型重构（知识库 / 思考 / 反思分层）。
 
-**Architecture:** 大脑分为知识库（`brain/knowledge.ts`，工具 schema 唯一来源）、思考层（`brain/thinking/`，模型推理实现）、反思层（`brain/reflection.ts`，确定性可行性裁决）。Gemini 走浏览器扩展桥：brain 内嵌 HTTP 服务发布任务，插件在 AI Studio 页面发送/抓取回复回传。心脏净化：只保留路由、承受力与循环节拍，可行性裁决全部移交大脑。
+**Architecture（v2，用户拍板）：** 桥模式（`GEMINI_BRIDGE_PORT` 设置时）对话全在网页。插件抓取 Gemini 最新回复 → `POST /result` → 智能体解析 ```tool_call```（无则不回填，循环自然终止）→ 反思层裁决（危险命令**自动拒绝**）→ 共享执行器执行 → 结果序列化 → `GET /task` 长轮询交付 → 插件**模拟人类逐字输入**回填 → 自动模式按防检测随机延迟提交 / 手动模式等用户提交。CLI 仅宿主服务。`GEMINI_BRIDGE_PORT` 不再切换 HumanAgent 内的大脑，而是切换 cli 进程模式。
 
 **Tech Stack:** TypeScript 7（strict + NodeNext ESM）、node:http、zod 4（`z.toJSONSchema`）、vitest 4、Chrome/Edge MV3 扩展（无框架）。
 
-**Spec:** `docs/superpowers/specs/2026-08-19-gemini-bridge-design.md`
+**Spec:** `docs/superpowers/specs/2026-08-19-gemini-bridge-design.md`（v2）
 
 ## Global Constraints
 
@@ -24,1522 +24,352 @@
 
 ---
 
-### Task 1: 大脑知识库（brain/knowledge.ts）
+## 已完成任务（v1，保持有效）
+
+| 任务 | 产出 | 状态 |
+|---|---|---|
+| Task 1 | `src/brain/knowledge.ts`（schemas/TOOLS/serializeToolProtocol）+ `tests/knowledge.test.ts` | ✅ 保持 |
+| Task 2 | `src/brain/reflection.ts`（存在性/zod/危险嗅探裁决）+ llm.ts 契约 + 测试 | ✅ 保持 |
+| Task 3 | `src/brain/thinking/ollama-thinking.ts`（改名 + reflect）+ helpers stub + agent 组装调整 | ✅ 保持（**目录迁移见 Task 10**） |
+| Task 5 | 心脏净化：loop 只留路由/承受力，`#execute` = reflect 裁决路径；AgentPhase 去 SNIFFING | ✅ 保持（**#dispatch 抽取见 Task 11**） |
+| Task 8 | CLAUDE.md / README.md 阶段五段落 | ⚠️ v2 语义下需重写（Task 14） |
+
+**v1 已交付但按 v2 重做：** Task 4（GeminiBridgeThinking，重写为执行型桥服务 → Task 11）、Task 6（agent/cli 组装 → Task 12）、Task 7（浏览器扩展 → Task 13，**阻塞：需用户提供 AI Studio 真实 DOM 结构**）。
+
+---
+
+### Task 10: 布局迁移——thinking 实现移至 src/brain/ 根目录
 
 **Files:**
-- Create: `src/brain/knowledge.ts`
-- Test: `tests/knowledge.test.ts`
+- Rename: `src/brain/thinking/ollama-thinking.ts` → `src/brain/ollama-thinking.ts`（git mv 保留历史）
+- Rename: `src/brain/thinking/gemini-bridge-thinking.ts` → `src/brain/gemini-bridge-thinking.ts`
+- Modify: 所有引用 `thinking/` 路径的 import 与文档（grep `thinking/` 全仓库）
 
 **Interfaces:**
-- Consumes: `ToolInfo`（`src/brain/llm.ts` 现有导出）、zod 4。
-- Produces: `schemas`（7 个 zod schema 的 `as const` 对象）、`TOOLS: readonly ToolInfo[]`（parameters 由 `z.toJSONSchema` 派生）、`serializeToolProtocol(): string`（思考层每轮注入的工具协议文本）。后续 Task 2/4/5 依赖这三者。
+- Produces: `src/brain/` 下直接放置两个 thinking 实现，`src/brain/thinking/` 目录删除。Task 11/12/13/14 全部基于新路径。
 
-- [ ] **Step 1: 写失败测试**
-
-创建 `tests/knowledge.test.ts`：
-
-````ts
-import { describe, expect, it } from "vitest";
-import { z } from "zod";
-import { schemas, serializeToolProtocol, TOOLS } from "../src/brain/knowledge.js";
-
-describe("brain/knowledge", () => {
-  it("知识库包含 7 个工具且名称齐全", () => {
-    expect(TOOLS.map((tool) => tool.name)).toEqual([
-      "read_file",
-      "read_dir",
-      "search_code",
-      "write_file",
-      "apply_patch",
-      "terminal",
-      "fetch_page",
-    ]);
-  });
-
-  it("每个工具的 JSON Schema parameters 均为 object 形态", () => {
-    for (const tool of TOOLS) {
-      expect(tool.parameters.type).toBe("object");
-      expect(tool.parameters.properties).toBeTypeOf("object");
-    }
-  });
-
-  it("TOOLS 的 parameters 与 zod 派生的 JSON Schema 一致", () => {
-    for (const tool of TOOLS) {
-      const name = tool.name as keyof typeof schemas;
-      expect(tool.parameters).toEqual(z.toJSONSchema(schemas[name]));
-    }
-  });
-
-  it("read_file 的 schema 要求 path 为字符串", () => {
-    const jsonSchema = z.toJSONSchema(schemas.read_file) as {
-      properties: Record<string, unknown>;
-      required?: string[];
-    };
-    expect(jsonSchema.properties.path).toEqual({ type: "string" });
-    expect(jsonSchema.required).toEqual(["path"]);
-  });
-
-  it("terminal 的 timeoutMs 可选（required 仅含 command）", () => {
-    const jsonSchema = z.toJSONSchema(schemas.terminal) as { required?: string[] };
-    expect(jsonSchema.required).toEqual(["command"]);
-  });
-
-  it("serializeToolProtocol 输出协议头、全部工具与调用规则", () => {
-    const protocol = serializeToolProtocol();
-    expect(protocol).toContain("【human-agent 工具协议】");
-    expect(protocol).toContain("read_file");
-    expect(protocol).toContain("fetch_page");
-    expect(protocol).toContain("一次只调用一个工具");
-    expect(protocol).toContain("```tool_call");
-  });
-});
-````
-
-- [ ] **Step 2: 运行测试确认失败**
-
-Run: `pnpm exec vitest run tests/knowledge.test.ts`
-Expected: FAIL（模块 `../src/brain/knowledge.js` 不存在）。
-
-- [ ] **Step 3: 实现 knowledge.ts**
-
-创建 `src/brain/knowledge.ts`：
-
-````ts
-// 大脑知识库（认知层）："工具如何使用"的知识——7 个工具的 schema + description。
-// 当前是唯一知识来源；未来 RAG 系统将作为新的知识来源在此聚合。
-import { z } from "zod";
-import type { ToolInfo } from "./llm.js";
-
-export const schemas = {
-  read_file: z.object({ path: z.string() }),
-  read_dir: z.object({ path: z.string() }),
-  search_code: z.object({ pattern: z.string(), dir: z.string().optional() }),
-  write_file: z.object({ path: z.string(), content: z.string() }),
-  apply_patch: z.object({ path: z.string(), patch: z.string() }),
-  terminal: z.object({
-    command: z.string(),
-    timeoutMs: z
-      .number()
-      .int()
-      .positive()
-      .describe("命令超时毫秒数（可选，默认由任务超时控制）")
-      .optional(),
-  }),
-  fetch_page: z.object({ url: z.string() }),
-} as const;
-
-const descriptions = {
-  read_file: "读取指定文件的内容",
-  read_dir: "列出指定目录的条目",
-  search_code: "在目录中检索匹配正则表达式的文件内容",
-  write_file: "写入文件内容（自动创建父目录）",
-  apply_patch: "对文件应用行级补丁",
-  terminal: "执行 shell 命令（可指定 timeoutMs 毫秒超时，超时自动终止）",
-  fetch_page: "抓取网页并转换为 Markdown",
-} as const;
-
-export const TOOLS: readonly ToolInfo[] = (
-  Object.keys(schemas) as (keyof typeof schemas)[]
-).map((name) => ({
-  name,
-  description: descriptions[name],
-  parameters: z.toJSONSchema(schemas[name]) as Record<string, unknown>,
-}));
-
-const PROTOCOL_HEADER =
-  "【human-agent 工具协议】你是 human-agent 智能体的大脑，通过调用工具与本地环境交互。";
-
-const PROTOCOL_RULES = [
-  "调用规则：",
-  "- 需要读取/修改/执行才能完成用户任务时，必须调用工具，不得假装完成",
-  "- 一次只调用一个工具，等待工具结果后再决定下一步",
-  "- 需要调用工具时，输出且只输出一个 JSON 代码块，不要附带其他文字：",
-  "```tool_call",
-  '{"name": "工具名", "arguments": {参数对象}}',
-  "```",
-  "- 工具结果将以「工具返回：{结果 JSON}」的形式出现在下一条消息",
-  "- 任务完成或无需工具时，直接输出最终回答文本",
-].join("\n");
-
-/** 序列化工具协议文本：每轮思考完整注入（可靠性优先，不做首轮后精简）。 */
-export function serializeToolProtocol(): string {
-  const toolLines = TOOLS.map(
-    (tool, index) =>
-      `${index + 1}. ${tool.name}: ${tool.description} | ${JSON.stringify(tool.parameters)}`,
-  );
-  return `${PROTOCOL_HEADER}\n可用工具（名称：用途 | 参数）：\n${toolLines.join("\n")}\n${PROTOCOL_RULES}`;
-}
-````
-
-- [ ] **Step 4: 运行测试确认通过**
-
-Run: `pnpm exec vitest run tests/knowledge.test.ts`
-Expected: PASS（6 个用例）。
-
-- [ ] **Step 5: 跑全量测试确认无回归**
-
-Run: `pnpm test`
-Expected: PASS。
-
-- [ ] **Step 6: Commit**
+- [ ] **Step 1: 迁移文件**
 
 ```bash
-git add src/brain/knowledge.ts tests/knowledge.test.ts
-git commit -m "feat: 大脑知识库——工具 schema 与协议序列化迁入 brain/knowledge.ts"
+git mv src/brain/thinking/ollama-thinking.ts src/brain/ollama-thinking.ts
+git mv src/brain/thinking/gemini-bridge-thinking.ts src/brain/gemini-bridge-thinking.ts
+rmdir src/brain/thinking
+```
+
+- [ ] **Step 2: 修正所有引用**
+
+Grep `thinking/` 覆盖：`src/`、`bin/`、`tests/`、`CLAUDE.md`、`README.md`。逐一修正：
+
+1. 两个迁移文件内部的相对导入（深度变化）：
+   - `ollama-thinking.ts`：`../context.js`→`./context.js`、`../llm.js`→`./llm.js`、`../reflection.js`→`./reflection.js`、`../../types/index.js`→`../types/index.js`
+   - `gemini-bridge-thinking.ts`：同上（含 `../knowledge.js`→`./knowledge.js`）
+2. 引用方：
+   - `src/agent.ts`、`bin/cli.ts`：`./brain/thinking/ollama-thinking.js` → `./brain/ollama-thinking.js`（gemini-bridge-thinking 同）
+   - `tests/ollama-thinking.test.ts`、`tests/gemini-bridge-thinking.test.ts`、`tests/agent.test.ts`：`../src/brain/thinking/*.js` → `../src/brain/*.js`
+3. `CLAUDE.md` / `README.md` 中的 `src/brain/thinking/` 路径改为 `src/brain/`（描述文本的完整重写在 Task 14，此处只改路径事实）
+
+- [ ] **Step 3: 验证**
+
+Run: `pnpm test` → 全绿；`pnpm build` → 编译通过。
+
+- [ ] **Step 4: Commit**
+
+```bash
+git add -A
+git commit -m "refactor: 思考层实现移至 src/brain/ 根目录（不建 thinking/ 子目录）"
 ```
 
 ---
 
-### Task 2: 反思层（brain/reflection.ts）+ 裁决类型
+### Task 11: GeminiBridgeThinking 重写为执行型桥服务 + 共享执行器抽取
 
 **Files:**
-- Create: `src/brain/reflection.ts`
-- Modify: `src/brain/llm.ts`（新增 `BlockedCall` / `ReflectionVerdict` 类型导出）
-- Test: `tests/reflection.test.ts`
+- Rewrite: `src/brain/gemini-bridge-thinking.ts`（v2 执行型桥服务）
+- Create: `src/heart/executor.ts`（共享工具执行器，从 loop #dispatch 抽出）
+- Modify: `src/heart/loop.ts`（#dispatch 删除，改用 executeTool）
+- Rewrite: `tests/gemini-bridge-thinking.test.ts`
+- Test: `tests/loop.test.ts`（回归验证 executor 抽取行为不变）
 
 **Interfaces:**
-- Consumes: `schemas`（Task 1）、`ToolCall`（llm.ts 现有）、`fail`/`NoseContract`/`MouthContract`（types/index.js 现有）。
-- Produces: `BlockedCall` / `ReflectionVerdict`（llm.ts）、`Reflection` 类（`constructor(nose, mouth)`、`reflect(calls): Promise<ReflectionVerdict>`）。Task 3/4 的思考层实现与 Task 5 的 loop 依赖这些。
+- Consumes: `schemas`/`serializeToolProtocol`（knowledge.ts）、`Reflection`（reflection.ts）、`ToolCall`/`BrainInferenceResult`（llm.ts）、`EyesContract`/`HandsContract`/`NoseContract`/`ActionResult`（types）。
+- Produces: `GeminiBridgeThinking`（`{ port?, host?, nose, hands, eyes, signal?, timeoutMs?, logger? }`、`getPort()`、`close()`）、`parseToolCalls`（保持）、`executeTool(organs, name, args, signal?)`（executor.ts）。Task 12 的组装与 cli 依赖。
 
-- [ ] **Step 1: 写失败测试**
+**设计要点（spec v2「GeminiBridgeThinking（桥服务）」节，必须逐条落实）：**
 
-创建 `tests/reflection.test.ts`：
+- 构造注入 nose/hands/eyes；内部 `new Reflection(nose, { confirm: async () => false })`——危险命令自动拒绝（不再调用真实嘴巴）
+- 启动即把 `serializeToolProtocol()` 作为首条回填消息入队
+- HTTP：`GET /task` 长轮询（约 25s 后 204）返回 `{message}`；`POST /result` 收 `{reply}`（非空字符串、≤ 200_000 字符，非法 400）→ `{ok: true, processed: boolean}`；其余 404
+- 处理流水线（单批串行队列）：去重（与最近一次处理内容完全相同 → processed:false）→ parseToolCalls（无 tool_call → processed:false）→ 有则入队（processed:true）→ 批执行：reflect 裁决 → 放行经 executeTool（共享执行器，signal = `AbortSignal.any([signal, AbortSignal.timeout(timeoutMs)])`，timeoutMs>0 时）→ 拦截收集拒绝原因 → 序列化回填消息 → 唤醒长轮询
+- 超时（AbortSignal.timeout 触发）→ 队列一条「工具执行超时」说明；全局中断（signal.aborted）→ 丢弃批次不排队
+- `close()`：waiter 全部以 204 释放、清空 outbox、关服务与全部连接
+- 回填消息格式（spec「回填消息格式」节）：`N. 工具 {name} 参数 {args} → 成功/失败/已拒绝（原因）`，成功/失败附 ActionResult JSON 代码块；拒绝按错误码格式化（USER_DENIED → 危险命令自动拒绝）
 
-````ts
-import { describe, expect, it, vi } from "vitest";
-import { Reflection } from "../src/brain/reflection.js";
-import type { MouthContract, NoseContract, RiskLevel } from "../src/types/index.js";
+- [ ] **Step 1: 抽共享执行器（先 GREEN 后重写，保证 loop 无回归）**
 
-function makeNose(risk: RiskLevel): NoseContract {
-  return {
-    checkRisk: () => risk,
-    getEnvSnapshot: () => ({ os: "test", cwd: "/tmp" }),
-    checkPorts: async () => [],
-  };
-}
-
-function makeMouth(approve: boolean): MouthContract {
-  return { confirm: async () => approve };
-}
-
-describe("Reflection", () => {
-  it("安全命令放行", async () => {
-    const reflection = new Reflection(makeNose("SAFE"), makeMouth(true));
-    const call = { name: "terminal", arguments: { command: "echo hi" } };
-    const verdict = await reflection.reflect([call]);
-    expect(verdict.allowed).toEqual([call]);
-    expect(verdict.blocked).toEqual([]);
-  });
-
-  it("未知工具拦截为 UNKNOWN_TOOL", async () => {
-    const reflection = new Reflection(makeNose("SAFE"), makeMouth(true));
-    const call = { name: "hack_the_planet", arguments: {} };
-    const verdict = await reflection.reflect([call]);
-    expect(verdict.allowed).toEqual([]);
-    expect(verdict.blocked[0]?.result.error?.code).toBe("UNKNOWN_TOOL");
-  });
-
-  it("参数不合法拦截为 INVALID_ARGS", async () => {
-    const reflection = new Reflection(makeNose("SAFE"), makeMouth(true));
-    const call = { name: "read_file", arguments: {} };
-    const verdict = await reflection.reflect([call]);
-    expect(verdict.blocked[0]?.result.error?.code).toBe("INVALID_ARGS");
-  });
-
-  it("危险命令经用户拒绝后拦截为 USER_DENIED", async () => {
-    const confirm = vi.fn().mockResolvedValue(false);
-    const reflection = new Reflection(makeNose("DANGEROUS"), { confirm });
-    const call = { name: "terminal", arguments: { command: "rm -rf /" } };
-    const verdict = await reflection.reflect([call]);
-    expect(verdict.blocked[0]?.result.error?.code).toBe("USER_DENIED");
-    expect(confirm).toHaveBeenCalledWith(expect.stringContaining("rm -rf /"));
-  });
-
-  it("危险命令经用户确认后放行", async () => {
-    const reflection = new Reflection(makeNose("DANGEROUS"), makeMouth(true));
-    const call = { name: "terminal", arguments: { command: "rm -rf /tmp/test" } };
-    const verdict = await reflection.reflect([call]);
-    expect(verdict.allowed).toEqual([call]);
-  });
-
-  it("混合调用逐条裁决", async () => {
-    const reflection = new Reflection(makeNose("SAFE"), makeMouth(true));
-    const good = { name: "read_file", arguments: { path: "a.txt" } };
-    const bad = { name: "read_file", arguments: {} };
-    const verdict = await reflection.reflect([good, bad]);
-    expect(verdict.allowed).toEqual([good]);
-    expect(verdict.blocked).toHaveLength(1);
-  });
-});
-````
-
-- [ ] **Step 2: 运行测试确认失败**
-
-Run: `pnpm exec vitest run tests/reflection.test.ts`
-Expected: FAIL（模块 `../src/brain/reflection.js` 不存在）。
-
-- [ ] **Step 3: llm.ts 新增裁决类型**
-
-在 `src/brain/llm.ts` 中：顶部加 `import type { ActionResult } from "../types/index.js";`，并在 `BrainInferenceResult` 之后新增：
+`tests/loop.test.ts` 现有工具执行用例是 executor 抽取的行为基准。新建 `src/heart/executor.ts`：
 
 ```ts
-/** 反思裁决：逐条调用给出 放行 或 拦截+错误反馈（大脑反思层的输出契约）。 */
-export interface BlockedCall {
-  call: ToolCall;
-  result: ActionResult<unknown>;
+import { fail, type ActionResult, type EyesContract, type HandsContract } from "../types/index.js";
+
+export interface ToolOrgans {
+  eyes: EyesContract;
+  hands: HandsContract;
 }
 
-export interface ReflectionVerdict {
-  allowed: ToolCall[];
-  blocked: BlockedCall[];
+/** 工具执行路由：工具名 → 双手/眼睛方法（loop 与桥服务共用，保持单一映射）。 */
+export async function executeTool(
+  organs: ToolOrgans,
+  name: string,
+  args: Record<string, unknown>,
+  signal?: AbortSignal,
+): Promise<ActionResult<unknown>> {
+  switch (name) {
+    case "read_file":
+      return organs.eyes.readFile(args.path as string);
+    case "read_dir":
+      return organs.eyes.readDir(args.path as string);
+    case "search_code":
+      return organs.eyes.searchCode(args.pattern as string, args.dir as string | undefined);
+    case "write_file":
+      return organs.hands.writeFile(args.path as string, args.content as string);
+    case "apply_patch":
+      return organs.hands.applyPatch(args.path as string, args.patch as string);
+    case "terminal":
+      return organs.hands.executeCommand(
+        args.command as string,
+        signal,
+        args.timeoutMs as number | undefined,
+      );
+    case "fetch_page":
+      return organs.eyes.fetchPageAsMarkdown(args.url as string);
+    default:
+      return fail("UNKNOWN_TOOL", `未知工具: ${name}`);
+  }
 }
 ```
 
-- [ ] **Step 4: 实现 reflection.ts**
+`src/heart/loop.ts`：删除 `#dispatch` 方法，`#execute` 中 `await this.#dispatch(call.name, call.arguments, turnSignal)` 改为 `await executeTool({ eyes: this.#eyes, hands: this.#hands }, call.name, call.arguments, turnSignal)`（import 同步）。跑 `pnpm exec vitest run tests/loop.test.ts` → 全绿（行为不变，这步不是 TDD 的 RED，是抽取回归）。
 
-创建 `src/brain/reflection.ts`：
+- [ ] **Step 2: 重写 gemini-bridge-thinking 测试（RED）**
 
-````ts
-// 反思层（潜意识）：决策后再想"可行吗"。确定性代码，不经过模型，
-// 所有大脑共享同一套实现：存在性 → 结构 → 危险嗅探，逐条裁决。
-import { schemas } from "./knowledge.js";
-import type { ReflectionVerdict, ToolCall } from "./llm.js";
-import { fail, type MouthContract, type NoseContract } from "../types/index.js";
+`tests/gemini-bridge-thinking.test.ts` 整体重写。测试骨架与用例：
 
-export class Reflection {
-  readonly #nose: NoseContract;
-  readonly #mouth: MouthContract;
+```ts
+import { afterEach, describe, expect, it, vi } from "vitest";
+import { GeminiBridgeThinking, parseToolCalls } from "../src/brain/gemini-bridge-thinking.js";
+import type { ActionResult, EyesContract, HandsContract, NoseContract, RiskLevel } from "../src/types/index.js";
+import { buildStubNose } from "./helpers.js";
 
-  constructor(nose: NoseContract, mouth: MouthContract) {
-    this.#nose = nose;
-    this.#mouth = mouth;
-  }
-
-  async reflect(calls: readonly ToolCall[]): Promise<ReflectionVerdict> {
-    const allowed: ToolCall[] = [];
-    const blocked: ReflectionVerdict["blocked"] = [];
-    for (const call of calls) {
-      const schema = schemas[call.name as keyof typeof schemas];
-      if (schema === undefined) {
-        blocked.push({ call, result: fail("UNKNOWN_TOOL", `未知工具: ${call.name}`) });
-        continue;
-      }
-      const parsed = schema.safeParse(call.arguments);
-      if (!parsed.success) {
-        const issues = parsed.error.issues
-          .map((issue) => `${issue.path.join(".")}: ${issue.message}`)
-          .join("; ");
-        blocked.push({
-          call,
-          result: fail("INVALID_ARGS", `工具 ${call.name} 参数不合法: ${issues}`),
-        });
-        continue;
-      }
-      if (call.name === "terminal") {
-        const { command } = parsed.data as { command: string };
-        if (this.#nose.checkRisk(command) === "DANGEROUS") {
-          const approved = await this.#mouth.confirm(`命令存在风险，是否执行？\n  ${command}`);
-          if (!approved) {
-            blocked.push({ call, result: fail("USER_DENIED", `用户拒绝了命令: ${command}`) });
-            continue;
-          }
-        }
-      }
-      allowed.push(call);
-    }
-    return { allowed, blocked };
-  }
+// 记录型 stub 器官：断言"执行了哪些工具"而不真跑命令
+function makeRecordingOrgans() {
+  const calls: Array<{ name: string; args: Record<string, unknown> }> = [];
+  const eyes: EyesContract = {
+    readFile: async (path) => { calls.push({ name: "read_file", args: { path } }); return ok({ content: `内容:${path}` }); },
+    readDir: async (path) => { calls.push({ name: "read_dir", args: { path } }); return ok(["a.txt"]); },
+    searchCode: async (pattern, dir) => { calls.push({ name: "search_code", args: { pattern, dir } }); return ok([]); },
+    fetchPageAsMarkdown: async (url) => { calls.push({ name: "fetch_page", args: { url } }); return ok("# 网页"); },
+  };
+  const hands: HandsContract = {
+    writeFile: async (path, content) => { calls.push({ name: "write_file", args: { path, content } }); return ok(undefined); },
+    applyPatch: async (path, patch) => { calls.push({ name: "apply_patch", args: { path, patch } }); return ok(undefined); },
+    executeCommand: async (command, _signal, timeoutMs) => {
+      calls.push({ name: "terminal", args: { command, timeoutMs } });
+      if (command === "slow") await new Promise((r) => setTimeout(r, 10_000));
+      return ok({ stdout: `输出:${command}`, exitCode: 0 });
+    },
+  };
+  return { calls, eyes, hands };
 }
-````
 
-- [ ] **Step 5: 运行测试确认通过**
+function ok<T>(data: T): ActionResult<T> { return { success: true, data }; }
 
-Run: `pnpm exec vitest run tests/reflection.test.ts`
-Expected: PASS（6 个用例）。
+const openBridges: GeminiBridgeThinking[] = [];
+afterEach(() => { for (const bridge of openBridges.splice(0)) bridge.close(); });
 
-- [ ] **Step 6: 跑全量测试确认无回归**
+async function makeBridge(options: { nose?: NoseContract; timeoutMs?: number; signal?: AbortSignal } = {}) {
+  const organs = makeRecordingOrgans();
+  const bridge = new GeminiBridgeThinking({
+    port: 0,
+    nose: options.nose ?? buildStubNose(),
+    hands: organs.hands,
+    eyes: organs.eyes,
+    ...(options.timeoutMs !== undefined ? { timeoutMs: options.timeoutMs } : {}),
+    ...(options.signal !== undefined ? { signal: options.signal } : {}),
+  });
+  openBridges.push(bridge);
+  const port = await bridge.getPort();
+  return { bridge, port, organs };
+}
+
+/** 长轮询取一条回填消息；无消息时服务端 25s 后 204（测试不等待该路径）。 */
+async function getMessage(port: number): Promise<string | null> {
+  const res = await fetch(`http://127.0.0.1:${port}/task`);
+  if (res.status === 204) return null;
+  const body = (await res.json()) as { message: string };
+  return body.message;
+}
+
+async function postReply(port: number, reply: string): Promise<{ ok: boolean; processed: boolean }> {
+  const res = await fetch(`http://127.0.0.1:${port}/result`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ reply }),
+  });
+  return (await res.json()) as { ok: boolean; processed: boolean };
+}
+
+const toolCall = (name: string, args: object) =>
+  ["```tool_call", JSON.stringify({ name, arguments: args }), "```"].join("\n");
+```
+
+用例清单（全部必须）：见 Self-Review 对应行，具体断言：
+1. parseToolCalls 四例（沿用 v1：纯文本 / 单块 / 坏 JSON / 多块）
+2. 「首条任务为工具协议」：`getMessage` → 含 `【human-agent 工具协议】`
+3. 「含 tool_call 的内容执行后回填结果消息」：`postReply(toolCall("read_file", { path: "a.txt" }))` → `processed: true`；`getMessage` → 含 `工具执行结果`、`read_file`、`内容:a.txt`；`organs.calls` 含 `read_file`
+4. 「无 tool_call 的内容不回填」：`postReply("纯文本回复")` → `processed: false`；`organs.calls` 为空
+5. 「多个 tool_call 汇总为一条消息并全部执行」：post 两个（read_file + terminal echo）→ processed:true → getMessage 含两个工具名；calls 长度 2
+6. 「危险命令自动拒绝」：`makeBridge({ nose: buildStubNose("DANGEROUS") })`；post `toolCall("terminal", { command: "rm -rf /" })` → getMessage 含 `已拒绝` 且含 `危险命令自动拒绝`；`organs.calls` 不含该 terminal（拒绝不执行）
+7. 「未知工具与参数非法拒绝」：post 两个（`hack_planet` + `read_file` 空参）→ getMessage 含 `未知工具` 与 `参数不合法`
+8. 「相同内容重复提交只处理一次」：连续两次相同 post → 第一次 processed:true、第二次 processed:false；`organs.calls` 只执行一次
+9. 「批超时队列执行超时说明」：`makeBridge({ timeoutMs: 100 })`；post `toolCall("terminal", { command: "slow" })` → processed:true → getMessage 含 `超时`；calls 含 slow（已开始执行）
+10. 「全局中断丢弃批次」：`makeBridge({ signal })`，先 `controller.abort()`；post tool_call → processed:true 但批执行被中止 → calls 中 second 工具未执行（post 后小等 50ms 断言 calls 状态）——注意：中断后批不排队，无消息可取（不做 25s 等待断言）
+11. 「close 释放挂起长轮询」：先 `getMessage`（无消息挂起）→ 主流程 `bridge.close()` → fetch 以 204 结束（`Promise.race` 或直接断言 fetch resolve 且 status 204）
+12. 「非法 reply 返回 400」：`postReply("")` → res.status 400
+
+注：用例 10 的「不排队」不做 25s 长轮询等待，仅断言批中止（calls 不完整）；waitFor 用 `await new Promise((r) => setTimeout(r, 50))` 后断言。
+
+- [ ] **Step 3: 运行确认 RED**
+
+Run: `pnpm exec vitest run tests/gemini-bridge-thinking.test.ts`
+Expected: FAIL（模块导出/行为与测试不符——类名保持 GeminiBridgeThinking 但构造签名与 HTTP 行为全变）。
+
+- [ ] **Step 4: 重写 gemini-bridge-thinking.ts**
+
+按 spec「GeminiBridgeThinking（桥服务）」节实现。结构要点：
+- 构造：`readonly #server`/`#portPromise`（沿用 v1 模式：构造内 createServer + listen，`getPort()` 返回 portPromise）；`#reflection = new Reflection(options.nose, { confirm: async () => false })`；`#outbox: string[]`；`#waiters`；`#busy: Promise<void>`（串行链）；`#lastContent: string | undefined`；`#logger`；构造末尾 `this.#outbox.push(serializeToolProtocol())`
+- `#handleRequest`：GET /task → 出队或挂起；POST /result → `#handleResultRequest`；其余 404
+- `#handleResultRequest`：readJsonBody → zod 或手写校验 `typeof reply === "string" && reply.length > 0 && reply.length <= 200_000`（非法 400 `{error}`）→ 去重（`reply === this.#lastContent` → processed:false）→ `parseToolCalls(reply)` → 无 toolCalls → processed:false → 有 → `this.#lastContent = reply; this.#busy = this.#busy.then(() => this.#process(calls, reply))` → processed:true；响应 `{ok:true, processed}` 立即返回（不等待批完成）
+- `#process(calls)`：批 signal = `timeoutMs > 0 ? AbortSignal.any([signal, AbortSignal.timeout(timeoutMs)]) : signal`（signal 为构造注入的 AbortSignal，缺省 `new AbortController().signal`）；`reflection.reflect(calls)` → allowed 逐个 `executeTool({eyes, hands}, name, args, batchSignal)`（每次执行前检查 `batchSignal.aborted` 则停止）→ blocked 收集 → 序列化回填消息（格式见 spec）→ 若超时（非全局中断）则消息为「⚠️ 工具执行超时...」→ `this.#outbox.push(message)` + 唤醒第一个 waiter；全局中断（`signal.aborted`）→ 不排队；catch 异常 → logger 记录、不排队（或排一条错误说明——选择一种并在测试中固定：**选排一条「执行失败」说明**更利于 Gemini 继续，测试 9 之外补一个用例或并入批超时用例的断言——实现时若选择排队，注意用例 10 仅针对全局中断）
+  - 简化裁决：`reflection.reflect(calls)` 一次裁决整批（与 loop 一致）
+- 序列化函数（模块级，便于测试）：`formatExecutionResults(entries: Array<{ name, args, result? | blocked? }>): string`——逐条 `N. 工具 {name} 参数 {JSON} → 成功/失败/已拒绝（原因）`，成功/失败附 `\`\`\`json\n{JSON.stringify(result)}\n\`\`\``；拒绝按 `result.error.code` 映射文案（USER_DENIED → `危险命令自动拒绝，未执行`；其余 → 原文 error.message）
+- `close()`：`waiter(null)` 释放全部（204）、outbox 清空、`#server.close()` + `#server.closeAllConnections()`
+- `parseToolCalls` / `isToolCall`：从 v1 原样保留
+
+- [ ] **Step 5: 运行确认通过**
+
+Run: `pnpm exec vitest run tests/gemini-bridge-thinking.test.ts`
+Expected: PASS（约 13 个用例）。
+
+- [ ] **Step 6: 全量回归**
 
 Run: `pnpm test`
-Expected: PASS（llm.ts 只加类型导出，不破坏现有实现者）。
+Expected: PASS（loop.test.ts 验证 executor 抽取无回归）。
 
 - [ ] **Step 7: Commit**
 
 ```bash
-git add src/brain/reflection.ts src/brain/llm.ts tests/reflection.test.ts
-git commit -m "feat: 大脑反思层——存在性/结构/危险嗅探的可行性裁决"
+git add src/brain/gemini-bridge-thinking.ts src/heart/executor.ts src/heart/loop.ts tests/gemini-bridge-thinking.test.ts
+git commit -m "feat: GeminiBridgeThinking 重写为执行型桥服务——网页内容→tool_call 解析→裁决→执行→回填"
 ```
 
 ---
 
-### Task 3: OllamaBrain 改名 OllamaThinking + reflect 接口接入
-
-将 `BrainInference` 接口扩展 `reflect()`，并把 `src/brain/ollama-brain.ts` 迁为 `src/brain/thinking/ollama-thinking.ts`（类名 `OllamaThinking`，构造必填 `nose`/`mouth`，reflect 委托共享 Reflection）。同步所有实现者（ScriptedBrain、loop.test.ts 的两个测试脑）与 agent.ts 组装（大脑最后构建，注入鼻子/嘴巴）。
+### Task 12: agent.ts buildBridgeService + cli.ts 桥模式宿主分支
 
 **Files:**
-- Rename: `src/brain/ollama-brain.ts` → `src/brain/thinking/ollama-thinking.ts`（git mv 保留历史）
-- Rename: `tests/ollama-brain.test.ts` → `tests/ollama-thinking.test.ts`
-- Modify: `src/brain/llm.ts`（接口加 `reflect`）
-- Modify: `tests/helpers.ts`（ScriptedBrain 可配置 reflect；新增 buildStubNose/buildStubMouth）
-- Modify: `tests/loop.test.ts`（AbortableBrain / TimeoutThenAnswerBrain 加 reflect）
-- Modify: `src/agent.ts`（构造顺序调整：brain 最后构建，注入 nose/mouth）
-- Test: `tests/ollama-thinking.test.ts`（改名 + stub 注入 + 新增 reflect 委托用例）
+- Modify: `src/agent.ts`（buildDefaultBrain 去掉桥分支；新增 buildBridgeService）
+- Modify: `bin/cli.ts`（GEMINI_BRIDGE_PORT → 桥模式分支）
+- Modify: `tests/agent.test.ts`（buildBridgeService 用例；删旧 env 用例）
 
 **Interfaces:**
-- Consumes: `Reflection` + `ReflectionVerdict`（Task 2）、`ToolCall`（llm.ts）。
-- Produces: `OllamaThinking` 类（`{ baseUrl?, model?, fetchImpl?, nose: NoseContract, mouth: MouthContract }`）、`BrainInference.reflect(calls): Promise<ReflectionVerdict>`（所有实现者必须提供）、`buildStubNose(risk?: RiskLevel)` / `buildStubMouth(approve?: boolean)`（helpers，供 Task 4 使用）。
-
-- [ ] **Step 1: 改名并写失败测试**
-
-```bash
-git mv src/brain/ollama-brain.ts src/brain/thinking/ollama-thinking.ts
-git mv tests/ollama-brain.test.ts tests/ollama-thinking.test.ts
-```
-
-编辑 `tests/ollama-thinking.test.ts`：
-1. 顶部 import 改为：
-   ```ts
-   import { describe, expect, it, vi } from "vitest";
-   import { OllamaThinking } from "../src/brain/thinking/ollama-thinking.js";
-   import { ConversationContext } from "../src/brain/context.js";
-   import type { Message, ToolInfo } from "../src/brain/llm.js";
-   import { buildStubMouth, buildStubNose } from "./helpers.js";
-   ```
-2. `makeBrain` 改为：
-   ```ts
-   function makeBrain(fetchImpl: typeof fetch) {
-     return new OllamaThinking({ fetchImpl, nose: buildStubNose(), mouth: buildStubMouth() });
-   }
-   ```
-3. 末尾"可自定义 baseUrl 与 model"用例的构造改为：
-   ```ts
-   const brain = new OllamaThinking({
-     baseUrl: "http://10.0.0.2:8080",
-     model: "qwen3:8b",
-     fetchImpl,
-     nose: buildStubNose(),
-     mouth: buildStubMouth(),
-   });
-   ```
-4. 文件末尾追加 reflect 委托用例：
-   ```ts
-   it("reflect 委托共享反思层：危险命令被拒时拦截为 USER_DENIED", async () => {
-     const brain = new OllamaThinking({
-       fetchImpl: vi.fn().mockResolvedValue(jsonResponse({ message: { role: "assistant", content: "ok" } })),
-       nose: buildStubNose("DANGEROUS"),
-       mouth: buildStubMouth(false),
-     });
-     const verdict = await brain.reflect([{ name: "terminal", arguments: { command: "rm -rf /" } }]);
-     expect(verdict.blocked[0]?.result.error?.code).toBe("USER_DENIED");
-   });
-   ```
-
-- [ ] **Step 2: 运行测试确认失败**
-
-Run: `pnpm exec vitest run tests/ollama-thinking.test.ts`
-Expected: FAIL（类名 `OllamaThinking` 不存在 / 模块未导出）。
-
-- [ ] **Step 3: llm.ts 接口加 reflect**
-
-`src/brain/llm.ts` 的 `BrainInference` 改为：
-
-```ts
-/** 大脑统一推理接口：输入上下文与可用工具，返回思考文本或工具调用意图（设计文档 §3.1）。 */
-export interface BrainInference {
-  infer(
-    context: ConversationContext,
-    tools: readonly ToolInfo[],
-    signal?: AbortSignal,
-  ): Promise<BrainInferenceResult>;
-  /** 反思：对候选工具调用做可行性裁决（存在性/结构/危险嗅探），放行或拦截+错误反馈。 */
-  reflect(calls: readonly ToolCall[]): Promise<ReflectionVerdict>;
-}
-```
-
-- [ ] **Step 4: 实现 ollama-thinking.ts**
-
-编辑 `src/brain/thinking/ollama-thinking.ts`（git mv 后的文件）：
-1. import 改为：
-   ```ts
-   import type { ConversationContext, Message } from "../context.js";
-   import type {
-     BrainInference,
-     BrainInferenceResult,
-     ReflectionVerdict,
-     ToolCall,
-     ToolInfo,
-   } from "../llm.js";
-   import { Reflection } from "../reflection.js";
-   import type { MouthContract, NoseContract } from "../../types/index.js";
-   ```
-2. `OllamaBrainOptions` 改名为 `OllamaThinkingOptions` 并加两个必填字段：
-   ```ts
-   export interface OllamaThinkingOptions {
-     baseUrl?: string;
-     model?: string;
-     fetchImpl?: typeof fetch;
-     nose: NoseContract;
-     mouth: MouthContract;
-   }
-   ```
-3. 类名 `OllamaBrain` → `OllamaThinking`；新增 `readonly #reflection: Reflection;` 字段；构造签名改为 `constructor(options: OllamaThinkingOptions)`，并在末尾加：
-   ```ts
-   this.#reflection = new Reflection(options.nose, options.mouth);
-   ```
-4. 类内新增：
-   ```ts
-   async reflect(calls: readonly ToolCall[]): Promise<ReflectionVerdict> {
-     return this.#reflection.reflect(calls);
-   }
-   ```
-5. 类文档注释更新为："思考层的 Ollama 实现：走本机 /api/chat 协议，支持工具调用，反思委托共享 Reflection（设计文档 §4.2）。"
-6. 文件底部 `toOllamaMessage` / `toOllamaTool` / `toToolCall` 保持不变。
-
-- [ ] **Step 5: helpers.ts 更新**
-
-`tests/helpers.ts`：
-1. import 中 `BrainInference, BrainInferenceResult, ToolInfo` 改为 `BrainInference, BrainInferenceResult, ReflectionVerdict, ToolCall, ToolInfo`；`EarsContract, EyesContract, HandsContract` 改为 `EarsContract, EyesContract, HandsContract, MouthContract, NoseContract, RiskLevel`。
-2. 文件末尾追加：
-   ```ts
-   /** 反思测试替身：可指定风险等级与确认结果。 */
-   export function buildStubNose(risk: RiskLevel = "SAFE"): NoseContract {
-     return {
-       checkRisk: () => risk,
-       getEnvSnapshot: () => ({ os: "test", cwd: "" }),
-       checkPorts: async () => [],
-     };
-   }
-
-   export function buildStubMouth(approve = true): MouthContract {
-     return { confirm: async () => approve };
-   }
-   ```
-3. `ScriptedBrain` 构造加可配置裁决（默认全放行，保持现有用例行为）：
-   ```ts
-   constructor(
-     private readonly steps: ScriptedBrainStep[],
-     private readonly reflectVerdict?: ReflectionVerdict,
-   ) {}
-   ```
-   并在类内新增：
-   ```ts
-   async reflect(calls: readonly ToolCall[]): Promise<ReflectionVerdict> {
-     return this.reflectVerdict ?? { allowed: [...calls], blocked: [] };
-   }
-   ```
-
-- [ ] **Step 6: loop.test.ts 的测试脑补 reflect**
-
-`tests/loop.test.ts` 中 `AbortableBrain` 与 `TimeoutThenAnswerBrain` 两个类（`implements BrainInference`）各加：
-```ts
-async reflect(calls: readonly ToolCall[]): Promise<ReflectionVerdict> {
-  return { allowed: [...calls], blocked: [] };
-}
-```
-并在 import 中给 `BrainInference` 加 `ReflectionVerdict`、`ToolCall` 类型：
-```ts
-import type { BrainInference, BrainInferenceResult, ReflectionVerdict, ToolCall, ToolInfo } from "../src/brain/llm.js";
-```
-
-- [ ] **Step 7: agent.ts 组装调整**
-
-`src/agent.ts`：
-1. `import { OllamaBrain } from "./brain/ollama-brain.js";` 改为：
-   ```ts
-   import { OllamaThinking } from "./brain/thinking/ollama-thinking.js";
-   ```
-2. `buildDefaultBrain` 改为：
-   ```ts
-   function buildDefaultBrain(nose: NoseContract, mouth: MouthContract): BrainInference {
-     return new OllamaThinking({
-       nose,
-       mouth,
-       ...(process.env.OLLAMA_BASE_URL !== undefined ? { baseUrl: process.env.OLLAMA_BASE_URL } : {}),
-       ...(process.env.OLLAMA_MODEL !== undefined ? { model: process.env.OLLAMA_MODEL } : {}),
-     });
-   }
-   ```
-3. `constructor` 字段初始化顺序调整（brain 依赖鼻子/嘴巴，最后构建）——把 `this.brain = options.brain ?? buildDefaultBrain();` 一行移到所有其他字段之后，改为：
-   ```ts
-   this.brain = options.brain ?? buildDefaultBrain(this.nose, this.mouth);
-   ```
-
-- [ ] **Step 8: 跑全量测试确认通过**
-
-Run: `pnpm test`
-Expected: PASS（ollama-thinking 全部用例 + 其余全部）。若 TS 报缺 `reflect` 的实现者，按 Step 5/6 补齐。
-
-- [ ] **Step 9: Commit**
-
-```bash
-git add -A src/brain/llm.ts src/brain/thinking/ollama-thinking.ts src/agent.ts tests/helpers.ts tests/loop.test.ts tests/ollama-thinking.test.ts
-git commit -m "refactor: OllamaBrain 更名 OllamaThinking，BrainInference 增加反思接口"
-```
-
----
-
-### Task 4: GeminiBridgeThinking（网页 Gemini 桥思考层）
-
-**Files:**
-- Create: `src/brain/thinking/gemini-bridge-thinking.ts`
-- Test: `tests/gemini-bridge-thinking.test.ts`
-
-**Interfaces:**
-- Consumes: `serializeToolProtocol`（Task 1）、`Reflection` + `ReflectionVerdict`（Task 2）、`ConversationContext`/`Message`（context.ts）、`ToolCall`/`BrainInferenceResult`/`BrainInference`（llm.ts）、`buildStubNose`/`buildStubMouth`（helpers，Task 3）、`MouthContract`/`NoseContract`。
-- Produces: `GeminiBridgeThinking` 类（`{ port?, host?, nose, mouth }`、`getPort(): Promise<number>`、`close()`）、`parseToolCalls(text): BrainInferenceResult` 纯函数（导出）。Task 6 的 agent 组装与 cli 依赖。
-
-- [ ] **Step 1: 写失败测试**
-
-创建 `tests/gemini-bridge-thinking.test.ts`：
-
-````ts
-import { afterEach, describe, expect, it, vi } from "vitest";
-import {
-  GeminiBridgeThinking,
-  parseToolCalls,
-} from "../src/brain/thinking/gemini-bridge-thinking.js";
-import { ConversationContext } from "../src/brain/context.js";
-import { TOOLS } from "../src/brain/knowledge.js";
-import type { Message } from "../src/brain/llm.js";
-import { buildStubMouth, buildStubNose } from "./helpers.js";
-
-function contextOf(...messages: Message[]): ConversationContext {
-  const context = new ConversationContext({ maxTokens: 8000 });
-  for (const message of messages) context.add(message);
-  return context;
-}
-
-const openBridges: GeminiBridgeThinking[] = [];
-
-afterEach(() => {
-  for (const bridge of openBridges.splice(0)) bridge.close();
-});
-
-async function makeBridge() {
-  const bridge = new GeminiBridgeThinking({ port: 0, nose: buildStubNose(), mouth: buildStubMouth() });
-  openBridges.push(bridge);
-  const port = await bridge.getPort();
-  return { bridge, port };
-}
-
-async function postResult(port: number, id: string, reply: string): Promise<void> {
-  await fetch(`http://127.0.0.1:${port}/result`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ id, reply }),
-  });
-}
-
-describe("parseToolCalls", () => {
-  it("纯文本不产生 toolCalls", () => {
-    const result = parseToolCalls("你好，我是 human-agent");
-    expect(result.text).toBe("你好，我是 human-agent");
-    expect(result.toolCalls).toBeUndefined();
-  });
-
-  it("解析 tool_call 代码块，说明文字保留为 text", () => {
-    const reply = ["让我先看看文件。", "```tool_call", '{"name": "read_file", "arguments": {"path": "a.txt"}}', "```"].join("\n");
-    const result = parseToolCalls(reply);
-    expect(result.text).toBe("让我先看看文件。");
-    expect(result.toolCalls).toEqual([{ name: "read_file", arguments: { path: "a.txt" } }]);
-  });
-
-  it("坏 JSON 块丢弃且原文拼回 text", () => {
-    const reply = ["```tool_call", '{"name": "read_file", "arguments": {"path": }}', "```", "后面还有说明"].join("\n");
-    const result = parseToolCalls(reply);
-    expect(result.toolCalls).toBeUndefined();
-    expect(result.text).toBe("后面还有说明");
-  });
-
-  it("多个块逐一解析，坏块不影响好块", () => {
-    const reply = [
-      "```tool_call",
-      '{"name": "read_file", "arguments": {"path": "a.txt"}}',
-      "```",
-      "```tool_call",
-      "not json",
-      "```",
-      "```tool_call",
-      '{"name": "terminal", "arguments": {"command": "echo hi"}}',
-      "```",
-    ].join("\n");
-    const result = parseToolCalls(reply);
-    expect(result.toolCalls).toHaveLength(2);
-    expect(result.toolCalls![1]).toEqual({ name: "terminal", arguments: { command: "echo hi" } });
-  });
-});
-
-describe("GeminiBridgeThinking", () => {
-  it("发布任务 → 插件长轮询取走 → 回传回复 → infer 返回解析结果", async () => {
-    const { bridge, port } = await makeBridge();
-    const inferPromise = bridge.infer(contextOf({ role: "user", content: "读取 a.txt" }), TOOLS);
-    const response = await fetch(`http://127.0.0.1:${port}/task`);
-    const task = (await response.json()) as { id: string; message: string };
-    expect(task.message).toContain("【human-agent 工具协议】");
-    expect(task.message).toContain("读取 a.txt");
-    const reply = ["```tool_call", '{"name": "read_file", "arguments": {"path": "a.txt"}}', "```"].join("\n");
-    await postResult(port, task.id, reply);
-    const result = await inferPromise;
-    expect(result.toolCalls).toEqual([{ name: "read_file", arguments: { path: "a.txt" } }]);
-  });
-
-  it("每轮只发送增量消息：第二轮不含首轮内容，包含工具结果映射", async () => {
-    const { bridge, port } = await makeBridge();
-    const context = contextOf({ role: "user", content: "第一轮指令" });
-    const first = bridge.infer(context, TOOLS);
-    const task1 = (await (await fetch(`http://127.0.0.1:${port}/task`)).json()) as { id: string };
-    await postResult(port, task1.id, "好的");
-    const firstResult = await first;
-    expect(firstResult.text).toBe("好的");
-
-    context.add({
-      role: "assistant",
-      content: "",
-      toolCalls: [{ name: "terminal", arguments: { command: "echo x" } }],
-    });
-    context.add({ role: "tool", name: "terminal", content: '{"success":true}' });
-    const second = bridge.infer(context, TOOLS);
-    const task2 = (await (await fetch(`http://127.0.0.1:${port}/task`)).json()) as {
-      id: string;
-      message: string;
-    };
-    expect(task2.message).not.toContain("第一轮指令");
-    expect(task2.message).toContain("工具 terminal 返回");
-    await postResult(port, task2.id, "完成");
-    await second;
-  });
-
-  it("signal 中断取消等待中的 infer", async () => {
-    const { bridge } = await makeBridge();
-    const controller = new AbortController();
-    const inferPromise = bridge.infer(
-      contextOf({ role: "user", content: "hi" }),
-      TOOLS,
-      controller.signal,
-    );
-    setTimeout(() => controller.abort(), 20);
-    await expect(inferPromise).rejects.toThrow("aborted");
-  });
-
-  it("reflect 委托共享反思层：危险命令被拒时拦截", async () => {
-    const confirm = vi.fn().mockResolvedValue(false);
-    const bridge = new GeminiBridgeThinking({ port: 0, nose: buildStubNose("DANGEROUS"), mouth: { confirm } });
-    openBridges.push(bridge);
-    await bridge.getPort();
-    const verdict = await bridge.reflect([{ name: "terminal", arguments: { command: "rm -rf /" } }]);
-    expect(verdict.blocked[0]?.result.error?.code).toBe("USER_DENIED");
-  });
-});
-````
-
-- [ ] **Step 2: 运行测试确认失败**
-
-Run: `pnpm exec vitest run tests/gemini-bridge-thinking.test.ts`
-Expected: FAIL（模块不存在）。
-
-- [ ] **Step 3: 实现 gemini-bridge-thinking.ts**
-
-创建 `src/brain/thinking/gemini-bridge-thinking.ts`：
-
-````ts
-// 思考层的网页 Gemini 桥实现：内嵌 HTTP 服务与浏览器扩展通信。
-// infer 组装协议消息 → 任务队列 → 插件在 AI Studio 页面发送并回传回复 → 解析工具调用。
-import { randomUUID } from "node:crypto";
-import http from "node:http";
-import type { AddressInfo } from "node:net";
-import type { ConversationContext, Message } from "../context.js";
-import { serializeToolProtocol } from "../knowledge.js";
-import type {
-  BrainInference,
-  BrainInferenceResult,
-  ReflectionVerdict,
-  ToolCall,
-  ToolInfo,
-} from "../llm.js";
-import { Reflection } from "../reflection.js";
-import type { MouthContract, NoseContract } from "../../types/index.js";
-
-export interface GeminiBridgeThinkingOptions {
-  port?: number;
-  host?: string;
-  nose: NoseContract;
-  mouth: MouthContract;
-}
-
-interface PendingTask {
-  id: string;
-  message: string;
-  resolve: (reply: string) => void;
-  reject: (err: Error) => void;
-  timer: NodeJS.Timeout;
-}
-
-/** 容错解析 ```tool_call``` JSON 代码块：坏 JSON 块丢弃、其余原文拼回 text。 */
-export function parseToolCalls(text: string): BrainInferenceResult {
-  const pattern = /```tool_call\s*\n([\s\S]*?)(?:\n)?```/g;
-  const calls: ToolCall[] = [];
-  for (const match of text.matchAll(pattern)) {
-    try {
-      const parsed = JSON.parse(match[1]!) as unknown;
-      if (isToolCall(parsed)) calls.push(parsed);
-    } catch {
-      // 坏 JSON 块丢弃
-    }
-  }
-  const stripped = text.replace(pattern, "").trim();
-  return { text: stripped, ...(calls.length > 0 ? { toolCalls: calls } : {}) };
-}
-
-function isToolCall(value: unknown): value is ToolCall {
-  if (typeof value !== "object" || value === null) return false;
-  const candidate = value as Record<string, unknown>;
-  return (
-    typeof candidate.name === "string" &&
-    typeof candidate.arguments === "object" &&
-    candidate.arguments !== null
-  );
-}
-
-export class GeminiBridgeThinking implements BrainInference {
-  readonly #server: http.Server;
-  readonly #portPromise: Promise<number>;
-  readonly #reflection: Reflection;
-  readonly #pending = new Map<string, PendingTask>();
-  readonly #waiters: Array<(task: PendingTask | null) => void> = [];
-  #sentCount = 0;
-
-  constructor(options: GeminiBridgeThinkingOptions) {
-    this.#reflection = new Reflection(options.nose, options.mouth);
-    this.#portPromise = new Promise<number>((resolve, reject) => {
-      this.#server = http.createServer((req, res) => this.#handleRequest(req, res));
-      this.#server.on("error", reject);
-      this.#server.listen(options.port ?? 8765, options.host ?? "127.0.0.1", () => {
-        const address = this.#server.address() as AddressInfo;
-        resolve(address.port);
-      });
-    });
-  }
-
-  async getPort(): Promise<number> {
-    return this.#portPromise;
-  }
-
-  /** 关闭 HTTP 服务并释放所有等待中的任务与长轮询。 */
-  close(): void {
-    for (const waiter of this.#waiters) waiter(null);
-    this.#waiters.length = 0;
-    for (const task of this.#pending.values()) {
-      clearTimeout(task.timer);
-      task.reject(new Error("Gemini 桥服务已关闭"));
-    }
-    this.#pending.clear();
-    this.#server.close();
-    this.#server.closeAllConnections();
-  }
-
-  async infer(
-    context: ConversationContext,
-    _tools: readonly ToolInfo[],
-    signal?: AbortSignal,
-  ): Promise<BrainInferenceResult> {
-    const increment = this.#collectIncrement(context);
-    const message =
-      increment === "" ? serializeToolProtocol() : `${serializeToolProtocol()}\n\n${increment}`;
-    const reply = await this.#publish(message, signal);
-    return parseToolCalls(reply);
-  }
-
-  async reflect(calls: readonly ToolCall[]): Promise<ReflectionVerdict> {
-    return this.#reflection.reflect(calls);
-  }
-
-  /** 页面会话保留历史，每轮只发上次发送之后的新消息（新指令 / 工具结果）。 */
-  #collectIncrement(context: ConversationContext): string {
-    const all = context.getAll();
-    const start = Math.min(this.#sentCount, all.length);
-    this.#sentCount = all.length;
-    return all
-      .slice(start)
-      .map(toIncrementText)
-      .filter((part) => part !== "")
-      .join("\n\n");
-  }
-
-  #publish(message: string, signal?: AbortSignal): Promise<string> {
-    return new Promise<string>((resolve, reject) => {
-      const id = randomUUID();
-      const task: PendingTask = { id, message, resolve, reject, timer: undefined! };
-      this.#armTimeout(task);
-      this.#pending.set(task.id, task);
-      const waiter = this.#waiters.shift();
-      if (waiter !== undefined) waiter(task);
-      if (signal !== undefined) {
-        signal.addEventListener(
-          "abort",
-          () => {
-            this.#pending.delete(id);
-            clearTimeout(task.timer);
-            reject(new DOMException("aborted", "AbortError"));
-          },
-          { once: true },
-        );
-      }
-    });
-  }
-
-  #armTimeout(task: PendingTask): void {
-    task.timer = setTimeout(() => {
-      this.#pending.delete(task.id);
-      task.reject(new Error("等待插件回传超时"));
-    }, 60_000);
-  }
-
-  #handleRequest(req: http.IncomingMessage, res: http.ServerResponse): void {
-    const url = new URL(req.url ?? "/", "http://127.0.0.1");
-    if (req.method === "GET" && url.pathname === "/task") {
-      this.#handleTaskRequest(res);
-      return;
-    }
-    if (req.method === "POST" && url.pathname === "/result") {
-      this.#handleResultRequest(req, res);
-      return;
-    }
-    res.writeHead(404).end();
-  }
-
-  /** 长轮询：有待发任务立即返回；无任务挂起约 25s 后 204。 */
-  #handleTaskRequest(res: http.ServerResponse): void {
-    const next = this.#pending.values().next();
-    if (!next.done) {
-      this.#serveTask(next.value, res);
-      return;
-    }
-    const waiter = (task: PendingTask | null): void => {
-      clearTimeout(timer);
-      if (task === null) {
-        res.writeHead(204).end();
-        return;
-      }
-      this.#serveTask(task, res);
-    };
-    const timer = setTimeout(() => {
-      const index = this.#waiters.indexOf(waiter);
-      if (index !== -1) this.#waiters.splice(index, 1);
-      res.writeHead(204).end();
-    }, 25_000);
-    this.#waiters.push(waiter);
-  }
-
-  /** 任务交给插件后仍保留在 #pending（结果按 id 匹配回传），只重置回传超时。 */
-  #serveTask(task: PendingTask, res: http.ServerResponse): void {
-    clearTimeout(task.timer);
-    this.#armTimeout(task);
-    res.writeHead(200, { "Content-Type": "application/json" });
-    res.end(JSON.stringify({ id: task.id, message: task.message }));
-  }
-
-  #handleResultRequest(req: http.IncomingMessage, res: http.ServerResponse): void {
-    readJsonBody(req).then(
-      (body) => {
-        const record = (typeof body === "object" && body !== null ? body : {}) as Record<string, unknown>;
-        const id = typeof record.id === "string" ? record.id : "";
-        const reply = typeof record.reply === "string" ? record.reply : "";
-        const task = this.#pending.get(id);
-        if (task !== undefined) {
-          clearTimeout(task.timer);
-          this.#pending.delete(task.id);
-          task.resolve(reply);
-        }
-        res.writeHead(200, { "Content-Type": "application/json" });
-        res.end(JSON.stringify({ ok: true }));
-      },
-      () => {
-        res.writeHead(400).end();
-      },
-    );
-  }
-}
-
-function toIncrementText(message: Message): string {
-  switch (message.role) {
-    case "system":
-      return "";
-    case "user":
-      return message.content;
-    case "assistant":
-      return message.content;
-    case "tool":
-      return `工具 ${message.name} 返回：${message.content}`;
-  }
-}
-
-function readJsonBody(req: http.IncomingMessage): Promise<unknown> {
-  return new Promise((resolve, reject) => {
-    const chunks: Buffer[] = [];
-    req.on("data", (chunk: Buffer) => chunks.push(chunk));
-    req.on("end", () => {
-      try {
-        resolve(JSON.parse(Buffer.concat(chunks).toString("utf8")) as unknown);
-      } catch {
-        reject(new Error("invalid JSON"));
-      }
-    });
-    req.on("error", reject);
-  });
-}
-````
-
-- [ ] **Step 4: 运行测试确认通过**
-
-Run: `pnpm exec vitest run tests/gemini-bridge-thinking.test.ts`
-Expected: PASS（8 个用例）。若超时/挂起，检查 `close()` 是否释放了长轮询 waiter（`close()` 中 `waiter(null)` 会结束挂起的 GET）。
-
-- [ ] **Step 5: 跑全量测试确认无回归**
-
-Run: `pnpm test`
-Expected: PASS。
-
-- [ ] **Step 6: Commit**
-
-```bash
-git add src/brain/thinking/gemini-bridge-thinking.ts tests/gemini-bridge-thinking.test.ts
-git commit -m "feat: GeminiBridgeThinking——网页 Gemini 桥 HTTP 任务协议与容错解析"
-```
-
----
-
-### Task 5: 心脏净化（loop.ts 移交可行性裁决）
-
-**Files:**
-- Modify: `src/heart/loop.ts`（删 TOOL_SCHEMAS/TOOLS/zod 校验/嗅探/确认；`#execute` 改为走 `brain.reflect`）
-- Modify: `src/types/organ.ts`（AgentPhase 删除 `"SNIFFING"`）
-- Modify: `src/agent.ts`（`run()` 中 AgentLoop 构造删除 `nose`/`mouth` 两行——净化后构造参数不再含它们，不改会编译失败）
-- Modify: `tests/loop.test.ts`（makeLoop 去 nose/mouth、两个危险命令用例改造、phase 断言更新、7 处直接构造删两行）
-
-**Interfaces:**
-- Consumes: `BrainInference.reflect`（Task 3）、`ReflectionVerdict`（Task 2）。
-- Produces: 净化后的 `AgentLoop`（构造参数不再含 `nose`/`mouth`；`#execute(calls, turnSignal)` 内部裁决后路由）。Task 6 的 agent.ts 组装依赖。
+- Consumes: `GeminiBridgeThinking`（Task 11，新构造签名）、`InterruptController`（heart/interrupt.ts，isAborted 存在）。
+- Produces: `buildBridgeService(options?)`（agent.ts 导出）、cli 桥模式分支（宿主服务，SIGINT/SIGTERM 干净退出）。
 
 - [ ] **Step 1: 改测试（RED）**
 
-`tests/loop.test.ts`：
-1. 顶部 import：删除 `AskUser`、`RiskChecker`、`inputFrom`；`fail` 从 `../src/types/index.js` 导入；llm 类型导入改为 `BrainInference, BrainInferenceResult, ReflectionVerdict, ToolCall, ToolInfo`。
-2. `makeLoop` 删除 `nose`/`mouth` 两行并去掉 `mouth?: AskUser` 参数，变为：
-
-```ts
-function makeLoop(options: {
-  brain: BrainInference;
-  ears: EarsContract;
-  signal: AbortSignal;
-  maxIterations?: number;
-  timeoutMs?: number;
-  onPhase?: (phase: AgentPhase, detail?: string) => void;
-}) {
-  return new AgentLoop({
-    brain: options.brain,
-    ears: options.ears,
-    eyes: buildEyes(),
-    hands: buildHands(),
-    output: new TextOutput({ stdout: new FakeWritable(), intervalMs: 0 }),
-    signal: options.signal,
-    maxIterations: options.maxIterations,
-    timeoutMs: options.timeoutMs,
-    onPhase: options.onPhase,
-  });
-}
-```
-
-3. "危险命令经用户拒绝后不执行，结果反馈为 USER_DENIED" 用例整体替换为（反思拦截路径）：
-
-```ts
-it("被反思层拦截的调用作为失败结果反馈给大脑", async () => {
-  const call = { name: "terminal", arguments: { command: "echo rm -rf /" } };
-  const brain = new ScriptedBrain(
-    [
-      { result: { text: "", toolCalls: [call] } },
-      { result: { text: "已跳过" } },
-    ],
-    { allowed: [], blocked: [{ call, result: fail("USER_DENIED", "用户拒绝了命令") }] },
-  );
-  const signal = new AbortController().signal;
-  const loop = makeLoop({ brain, ears: new FakeEars(["删除它", "/exit"]), signal });
-  await loop.run();
-  const toolMessage = brain.messagesOf(1).find((m) => m.role === "tool");
-  expect(toolMessage).toBeDefined();
-  const parsed = JSON.parse(toolMessage!.content) as { success: boolean; error?: { code: string } };
-  expect(parsed.success).toBe(false);
-  expect(parsed.error?.code).toBe("USER_DENIED");
-});
-```
-
-4. 删除整个"危险命令经用户确认后正常执行"用例（确认逻辑已迁至反思层，由 reflection.test.ts 覆盖；放行路径由"工具执行结果作为 tool 消息反馈给大脑"覆盖）。
-5. "按 听→想→嗅→执行→反馈→想 顺序发出阶段事件" 用例改为：
-
-```ts
-it("按 听→想→执行→反馈→想 顺序发出阶段事件", async () => {
-  const phases: AgentPhase[] = [];
-  const brain = new ScriptedBrain([
-    {
-      result: {
-        text: "",
-        toolCalls: [{ name: "terminal", arguments: { command: "echo phase-test" } }],
-      },
-    },
-    { result: { text: "结束" } },
-  ]);
-  const signal = new AbortController().signal;
-  const loop = makeLoop({
-    brain,
-    ears: new FakeEars(["hi", "/exit"]),
-    signal,
-    onPhase: (phase) => phases.push(phase),
-  });
-  await loop.run();
-  expect(phases.slice(0, 5)).toEqual([
-    "LISTENING",
-    "THINKING",
-    "ACTING",
-    "FEEDBACK",
-    "THINKING",
-  ]);
-});
-```
-
-6. 以下用例中直接构造 `new AgentLoop({...})` 的，各删除这两行：
-   ```ts
-   nose: new RiskChecker(),
-   mouth: new AskUser({ input: inputFrom("y\n") }),
-   ```
-   涉及用例：`fetch_page 工具调用经眼睛抓取网页并反馈 Markdown`、`/timeout 命令动态更新超时时长并即时生效`、`/timeout 非法参数给出提示且会话继续`、`推理超时后终止本轮并警告，会话继续监听下一条指令`、`大脑抛错时状态为 ERROR 且输出错误信息`、`大脑持续调用工具时达到最大迭代次数停止`、`上下文在会话中持续累积`。
-
-- [ ] **Step 2: 运行测试确认失败**
-
-Run: `pnpm exec vitest run tests/loop.test.ts`
-Expected: FAIL（`AgentLoopOptions` 不存在的属性 `nose` / `mouth` 等编译错误）。
-
-- [ ] **Step 3: 净化 loop.ts 与 agent.ts**
-
-`src/heart/loop.ts` 整体替换为：
-
-```ts
-import { ConversationContext } from "../brain/context.js";
-import { TOOLS } from "../brain/knowledge.js";
-import type { BrainInference, BrainInferenceResult, ToolCall } from "../brain/llm.js";
-import {
-  fail,
-  type ActionResult,
-  type AgentOutput,
-  type AgentPhase,
-  type AgentStatus,
-  type EarsContract,
-  type EyesContract,
-  type HandsContract,
-} from "../types/index.js";
-
-export interface AgentLoopOptions {
-  brain: BrainInference;
-  ears: EarsContract;
-  eyes: EyesContract;
-  hands: HandsContract;
-  output: AgentOutput;
-  signal: AbortSignal;
-  context?: ConversationContext;
-  maxIterations?: number;
-  /** 单轮任务超时（毫秒），0 表示禁用；超时后终止本轮并继续监听。 */
-  timeoutMs?: number;
-  onPhase?: (phase: AgentPhase, detail?: string) => void;
-}
-
-/** 解析超时时长：纯数字按毫秒；s/m/h 后缀按秒/分/时；0 或 off 表示禁用；非法返回 null。 */
-export function parseTimeout(input: string): number | null {
-  const trimmed = input.trim().toLowerCase();
-  if (trimmed === "0" || trimmed === "off") return 0;
-  const match = /^(\d+)(h|m|s)?$/.exec(trimmed);
-  if (match === null) return null;
-  const value = Number(match[1]);
-  const factor =
-    match[2] === "h" ? 3_600_000 : match[2] === "m" ? 60_000 : match[2] === "s" ? 1_000 : 1;
-  return value * factor;
-}
-
-/** 生命泵：听取指令 → 大脑思考 → 反思裁决 → 放行路由到器官执行 → 反馈 → 循环/结束。
- *  心脏只承担路由、承受力（任务/单命令超时、maxIterations、中断）与循环节拍；
- *  可行性裁决（是否可行）属于大脑反思层，本类不再持有任何判断规则。 */
-export class AgentLoop {
-  readonly #brain: BrainInference;
-  readonly #ears: EarsContract;
-  readonly #eyes: EyesContract;
-  readonly #hands: HandsContract;
-  readonly #output: AgentOutput;
-  readonly #signal: AbortSignal;
-  readonly #context: ConversationContext;
-  readonly #maxIterations: number;
-  #timeoutMs: number;
-  readonly #onPhase: ((phase: AgentPhase, detail?: string) => void) | undefined;
-
-  #status: AgentStatus = "IDLE";
-  #turnTimedOut = false;
-
-  constructor(options: AgentLoopOptions) {
-    this.#brain = options.brain;
-    this.#ears = options.ears;
-    this.#eyes = options.eyes;
-    this.#hands = options.hands;
-    this.#output = options.output;
-    this.#signal = options.signal;
-    this.#context = options.context ?? new ConversationContext({ maxTokens: 8000 });
-    this.#maxIterations = options.maxIterations ?? 10;
-    this.#timeoutMs = options.timeoutMs ?? 300_000;
-    this.#onPhase = options.onPhase;
-  }
-
-  getStatus(): AgentStatus {
-    return this.#status;
-  }
-
-  async run(): Promise<void> {
-    this.#status = "RUNNING";
-    try {
-      for (;;) {
-        this.#emit("LISTENING");
-        if (this.#signal.aborted) {
-          this.#status = "INTERRUPTED";
-          break;
-        }
-        const input = await this.#listen();
-        if (input === null) {
-          if (this.#signal.aborted) this.#status = "INTERRUPTED";
-          break;
-        }
-        if (input.trim() === "" || input.trim() === "/exit") break;
-        if (this.#handleSlashCommand(input)) continue;
-        this.#context.add({ role: "user", content: input });
-        const stopped = await this.#processTurn();
-        if (stopped) break;
-      }
-    } finally {
-      if (this.#status === "RUNNING") this.#status = "IDLE";
-    }
-  }
-
-  /** 处理斜杠命令；返回 true 表示已消费该输入。 */
-  #handleSlashCommand(input: string): boolean {
-    const match = /^\/timeout(?:\s+(.+))?$/.exec(input.trim());
-    if (match === null) return false;
-    const spec = match[1];
-    if (spec === undefined) {
-      this.#output.info(
-        `当前任务超时：${this.#timeoutMs === 0 ? "无限" : `${this.#timeoutMs}ms`}（/timeout 0 禁用）`,
-      );
-      return true;
-    }
-    const ms = parseTimeout(spec);
-    if (ms === null) {
-      this.#output.warn(
-        "无法解析超时时长，格式：/timeout 30s、/timeout 5m、/timeout 1h、/timeout 900（毫秒）或 /timeout 0 禁用",
-      );
-      return true;
-    }
-    this.#timeoutMs = ms;
-    this.#output.info(`任务超时已更新为 ${ms === 0 ? "无限" : `${ms}ms`}`);
-    return true;
-  }
-
-  async #listen(): Promise<string | null> {
-    try {
-      return await Promise.race([this.#ears.prompt("> "), this.#abortPromise()]);
-    } catch {
-      return null;
-    }
-  }
-
-  #abortPromise(): Promise<never> {
-    return new Promise((_, reject) => {
-      this.#signal.addEventListener(
-        "abort",
-        () => reject(new Error("interrupted")),
-        { once: true },
-      );
-    });
-  }
-
-  /** 处理一轮指令；返回 true 表示循环应终止（中断或出错），false 表示继续监听。 */
-  async #processTurn(): Promise<boolean> {
-    const turnController = new AbortController();
-    const turnSignal =
-      this.#timeoutMs > 0
-        ? AbortSignal.any([this.#signal, turnController.signal])
-        : this.#signal;
-    const timer =
-      this.#timeoutMs > 0
-        ? setTimeout(() => {
-            this.#turnTimedOut = true;
-            turnController.abort();
-          }, this.#timeoutMs)
-        : undefined;
-    try {
-      for (let iteration = 0; iteration < this.#maxIterations; iteration++) {
-        if (this.#signal.aborted) {
-          this.#status = "INTERRUPTED";
-          return true;
-        }
-        if (this.#turnTimedOut) {
-          this.#output.warn("任务超时，已终止本轮。");
-          return false;
-        }
-        this.#emit("THINKING");
-        let result: BrainInferenceResult;
-        try {
-          result = await this.#brain.infer(this.#context, TOOLS, turnSignal);
-        } catch (err) {
-          if (this.#signal.aborted) {
-            this.#status = "INTERRUPTED";
-            return true;
-          }
-          if (this.#turnTimedOut) {
-            this.#output.warn("任务超时，已终止本轮。");
-            return false;
-          }
-          this.#status = "ERROR";
-          this.#output.error(`大脑推理失败: ${err instanceof Error ? err.message : String(err)}`);
-          return true;
-        }
-        const calls = result.toolCalls ?? [];
-        if (calls.length === 0) {
-          this.#context.add({ role: "assistant", content: result.text });
-          await this.#output.speak(result.text);
-          return false;
-        }
-        this.#context.add({ role: "assistant", content: result.text, toolCalls: calls });
-        await this.#execute(calls, turnSignal);
-      }
-      this.#output.warn("已达到最大迭代次数，停止本轮推演。");
-      return false;
-    } finally {
-      if (timer !== undefined) clearTimeout(timer);
-      this.#turnTimedOut = false;
-    }
-  }
-
-  /** 反思裁决：放行的调用路由到器官执行，拦截的调用直接反馈错误（裁决规则在大脑，不在心脏）。 */
-  async #execute(calls: readonly ToolCall[], turnSignal: AbortSignal): Promise<void> {
-    const verdict = await this.#brain.reflect(calls);
-    for (const call of verdict.allowed) {
-      if (this.#signal.aborted) {
-        this.#status = "INTERRUPTED";
-        return;
-      }
-      if (this.#turnTimedOut) {
-        this.#output.warn("任务超时，已终止本轮。");
-        return;
-      }
-      this.#emit("ACTING", call.name);
-      const result = await this.#dispatch(call.name, call.arguments, turnSignal);
-      this.#finish(call.name, result);
-      this.#context.add({ role: "tool", name: call.name, content: JSON.stringify(result) });
-    }
-    for (const item of verdict.blocked) {
-      this.#finish(item.call.name, item.result);
-      this.#context.add({ role: "tool", name: item.call.name, content: JSON.stringify(item.result) });
-    }
-  }
-
-  async #dispatch(
-    name: string,
-    args: Record<string, unknown>,
-    turnSignal: AbortSignal,
-  ): Promise<ActionResult<unknown>> {
-    switch (name) {
-      case "read_file":
-        return this.#eyes.readFile(args.path as string);
-      case "read_dir":
-        return this.#eyes.readDir(args.path as string);
-      case "search_code":
-        return this.#eyes.searchCode(args.pattern as string, args.dir as string | undefined);
-      case "write_file":
-        return this.#hands.writeFile(args.path as string, args.content as string);
-      case "apply_patch":
-        return this.#hands.applyPatch(args.path as string, args.patch as string);
-      case "terminal":
-        return this.#hands.executeCommand(
-          args.command as string,
-          turnSignal,
-          args.timeoutMs as number | undefined,
-        );
-      case "fetch_page":
-        return this.#eyes.fetchPageAsMarkdown(args.url as string);
-      default:
-        return fail("UNKNOWN_TOOL", `未知工具: ${name}`);
-    }
-  }
-
-  #finish(name: string, result: ActionResult<unknown>): ActionResult<unknown> {
-    this.#emit("FEEDBACK", name);
-    return result;
-  }
-
-  #emit(phase: AgentPhase, detail?: string): void {
-    this.#onPhase?.(phase, detail);
-  }
-}
-```
-
-`src/agent.ts` 的 `run()` 中 AgentLoop 构造删除两行（净化后不再接受）：
-
-```ts
-    const loop = new AgentLoop({
-      brain: this.brain,
-      ears: this.ears,
-      nose: this.nose,
-      mouth: this.mouth,
-      eyes: this.eyes,
-      hands: this.hands,
-      output: this.output,
-      signal: this.interrupt.getSignal(),
-      context: this.context,
-      maxIterations: this.maxIterations,
-      ...(this.timeoutMs !== undefined ? { timeoutMs: this.timeoutMs } : {}),
-    });
-```
-
-改为：
-
-```ts
-    const loop = new AgentLoop({
-      brain: this.brain,
-      ears: this.ears,
-      eyes: this.eyes,
-      hands: this.hands,
-      output: this.output,
-      signal: this.interrupt.getSignal(),
-      context: this.context,
-      maxIterations: this.maxIterations,
-      ...(this.timeoutMs !== undefined ? { timeoutMs: this.timeoutMs } : {}),
-    });
-```
-
-- [ ] **Step 4: 运行测试确认通过**
-
-Run: `pnpm exec vitest run tests/loop.test.ts`
-Expected: PASS。
-
-- [ ] **Step 5: organ.ts 删除 SNIFFING**
-
-`src/types/organ.ts` 的 `AgentPhase` 改为：
-
-```ts
-export type AgentPhase =
-  | "LISTENING" // 听取指令
-  | "THINKING" // 大脑思考
-  | "ACTING" // 手眼执行
-  | "FEEDBACK"; // 反馈结果
-```
-
-（嗅探已随可行性裁决移入大脑反思层，心脏循环不再有该阶段。）
-
-- [ ] **Step 6: 跑全量测试确认通过**
-
-Run: `pnpm test`
-Expected: PASS（organ.ts 类型删除 SNIFFING 后 loop.test.ts 已同步，无残留引用）。
-
-- [ ] **Step 7: Commit**
-
-```bash
-git add src/heart/loop.ts src/types/organ.ts tests/loop.test.ts
-git commit -m "refactor: 心脏净化——可行性裁决移交大脑反思层，循环只留路由与承受力"
-```
-
----
-
-### Task 6: agent.ts 组装（GEMINI_BRIDGE_PORT 切换）+ cli.ts close
-
-**Files:**
-- Modify: `src/agent.ts`（`GEMINI_BRIDGE_PORT` 环境变量启用 GeminiBridgeThinking）
-- Modify: `bin/cli.ts`（结束后关闭桥服务）
-- Modify: `tests/agent.test.ts`（新增默认大脑与端口切换用例）
-
-**Interfaces:**
-- Consumes: `GeminiBridgeThinking`（Task 4）、`OllamaThinking`（Task 3）、`NoseContract`/`MouthContract`。
-- Produces: 环境变量 `GEMINI_BRIDGE_PORT`（设置即启用 GeminiBridgeThinking，非法值回退 8765）；cli 退出前关闭大脑 HTTP 服务。
-
-- [ ] **Step 1: 写失败测试**
-
 `tests/agent.test.ts`：
-1. import 增加：
-   ```ts
-   import { OllamaThinking } from "../src/brain/thinking/ollama-thinking.js";
-   import { GeminiBridgeThinking } from "../src/brain/thinking/gemini-bridge-thinking.js";
-   ```
-2. "terminal 工具的 timeoutMs 经默认组装透传到命令超时" 用例删除 `mouth: new AskUser(...)` 注入（loop 不再用嘴巴；ScriptedBrain 默认全放行）。
-3. 文件末尾追加两个用例：
+1. import：`GeminiBridgeThinking` 改从 `../src/brain/gemini-bridge-thinking.js` 导入；新增 `buildBridgeService` 从 `../src/agent.js` 导入
+2. **删除**用例「GEMINI_BRIDGE_PORT 环境变量启用 GeminiBridgeThinking」（v2 语义：env 不再切换 HumanAgent 大脑）
+3. 文件末尾追加：
 
 ```ts
-it("默认组装的大脑为 OllamaThinking", async () => {
-  const agent = new HumanAgent({ ears: new FakeEars(["/exit"]), output: new FakeOutput() });
-  expect(agent.brain).toBeInstanceOf(OllamaThinking);
-  await agent.run();
+it("buildBridgeService 返回可监听的桥服务", async () => {
+  const service = buildBridgeService({ port: 0 });
+  try {
+    expect(service).toBeInstanceOf(GeminiBridgeThinking);
+    const port = await service.getPort();
+    expect(Number.isInteger(port)).toBe(true);
+  } finally {
+    service.close();
+  }
 });
 
-it("GEMINI_BRIDGE_PORT 环境变量启用 GeminiBridgeThinking", async () => {
-  process.env.GEMINI_BRIDGE_PORT = "0";
-  const agent = new HumanAgent({ ears: new FakeEars(["/exit"]), output: new FakeOutput() });
+it("buildBridgeService 未指定端口时读 GEMINI_BRIDGE_PORT，非法值回退 8765", async () => {
+  process.env.GEMINI_BRIDGE_PORT = "not-a-port";
   try {
-    expect(agent.brain).toBeInstanceOf(GeminiBridgeThinking);
-    const status = await agent.run();
-    expect(status).toBe("IDLE");
+    const service = buildBridgeService({ port: 0 }); // 显式 0 优先，避免真实绑定 8765
+    expect(service).toBeInstanceOf(GeminiBridgeThinking);
+    service.close();
   } finally {
-    if (agent.brain instanceof GeminiBridgeThinking) agent.brain.close();
     delete process.env.GEMINI_BRIDGE_PORT;
   }
 });
 ```
 
-4. `AskUser` / `inputFrom` 的 import 若不再使用则删除（检查：仅 timeoutMs 用例曾用）。
+（第二个用例以「显式 port 优先于 env」验证 env 解析路径存在；若实现为「port 选项缺省才读 env」，则该用例断言 port 0 生效且 env 不影响——具体断言以实现的语义为准，但必须覆盖 env 解析分支的代码路径。）
 
-- [ ] **Step 2: 运行测试确认失败**
+- [ ] **Step 2: 运行确认 RED**
 
 Run: `pnpm exec vitest run tests/agent.test.ts`
-Expected: FAIL（第二个新用例：`agent.brain` 不是 `GeminiBridgeThinking` 实例）。
+Expected: FAIL（`buildBridgeService` 未导出）。
 
-- [ ] **Step 3: agent.ts 加端口切换**
+- [ ] **Step 3: agent.ts 修改**
 
-`src/agent.ts`：
-1. import 增加：
-   ```ts
-   import { GeminiBridgeThinking } from "./brain/thinking/gemini-bridge-thinking.js";
-   ```
-2. `buildDefaultBrain` 改为：
+1. `buildDefaultBrain` 删除 `GEMINI_BRIDGE_PORT` 分支，恒返回 OllamaThinking（`GeminiBridgeThinking` import 移除）
+2. 新增导出：
 
 ```ts
-function buildDefaultBrain(nose: NoseContract, mouth: MouthContract): BrainInference {
-  const bridgePort = process.env.GEMINI_BRIDGE_PORT;
-  if (bridgePort !== undefined) {
-    const port = Number(bridgePort);
-    return new GeminiBridgeThinking({
-      port: Number.isInteger(port) && port > 0 ? port : 8765,
-      nose,
-      mouth,
-    });
-  }
-  return new OllamaThinking({
+export interface BridgeServiceOptions {
+  port?: number;
+  signal?: AbortSignal;
+  timeoutMs?: number;
+  logger?: (text: string) => void;
+}
+
+/** 桥模式组装：网页对话 + 智能体仅执行工具。port 缺省读 GEMINI_BRIDGE_PORT（非法回退 8765）。 */
+export function buildBridgeService(options: BridgeServiceOptions = {}): GeminiBridgeThinking {
+  const nose = buildDefaultNose();
+  const hands = buildDefaultHands();
+  const eyes = buildDefaultEyes();
+  const port = options.port ?? (() => {
+    const raw = process.env.GEMINI_BRIDGE_PORT;
+    if (raw === undefined) return 8765;
+    const parsed = Number(raw);
+    return Number.isInteger(parsed) && parsed > 0 ? parsed : 8765;
+  })();
+  return new GeminiBridgeThinking({
+    port,
     nose,
-    mouth,
-    ...(process.env.OLLAMA_BASE_URL !== undefined ? { baseUrl: process.env.OLLAMA_BASE_URL } : {}),
-    ...(process.env.OLLAMA_MODEL !== undefined ? { model: process.env.OLLAMA_MODEL } : {}),
+    hands,
+    eyes,
+    ...(options.signal !== undefined ? { signal: options.signal } : {}),
+    ...(options.timeoutMs !== undefined ? { timeoutMs: options.timeoutMs } : {}),
+    ...(options.logger !== undefined ? { logger: options.logger } : {}),
   });
 }
 ```
 
-3. 类文档注释中补充大脑说明（可选项，不改也可）。
+（HumanAgent 类与 Ollama 组装保持不变。）
 
-- [ ] **Step 4: cli.ts 关闭桥服务**
+- [ ] **Step 4: cli.ts 桥模式分支**
 
-`bin/cli.ts` 改为：
+`bin/cli.ts` 整体替换为：
 
 ```ts
 #!/usr/bin/env node
 import { Command } from "commander";
-import { HumanAgent } from "../src/agent.js";
-import { GeminiBridgeThinking } from "../src/brain/thinking/gemini-bridge-thinking.js";
+import { buildBridgeService, HumanAgent } from "../src/agent.js";
+import { InterruptController } from "../src/heart/interrupt.js";
 import { TextInput } from "../src/ears/text-input.js";
 
 const program = new Command();
@@ -1551,554 +381,116 @@ program
 
 program.parse(process.argv);
 
-const agent = new HumanAgent();
-process.on("SIGINT", () => agent.interrupt.abort());
-process.on("SIGTERM", () => agent.interrupt.abort());
-const status = await agent.run();
-if (agent.ears instanceof TextInput) agent.ears.close();
-if (agent.brain instanceof GeminiBridgeThinking) agent.brain.close();
-process.exitCode = status === "ERROR" ? 1 : status === "INTERRUPTED" ? 130 : 0;
-```
-
-- [ ] **Step 5: 运行测试确认通过**
-
-Run: `pnpm exec vitest run tests/agent.test.ts`
-Expected: PASS（4 个用例）。
-
-- [ ] **Step 6: 跑全量测试确认通过**
-
-Run: `pnpm test`
-Expected: PASS。
-
-- [ ] **Step 7: Commit**
-
-```bash
-git add src/agent.ts bin/cli.ts tests/agent.test.ts
-git commit -m "feat: GEMINI_BRIDGE_PORT 环境变量切换 Gemini 桥大脑，退出时关闭桥服务"
-```
-
----
-
-### Task 7: gemini-bridge 浏览器扩展（手动验证）
-
-**Files:**
-- Create: `extensions/gemini-bridge/manifest.json`
-- Create: `extensions/gemini-bridge/background.js`
-- Create: `extensions/gemini-bridge/content.js`
-- Create: `extensions/gemini-bridge/README.md`
-
-**Interfaces:**
-- Consumes: brain 侧 HTTP 协议 `GET /task`（长轮询，约 25s 后 204）、`POST /result {id, reply}`（Task 4）。
-- Produces: 浏览器桥（无自动化测试，按 Task 9 手动 E2E 验证）。端口固定 `127.0.0.1:8765`，与 `manifest.json` 的 host_permissions 一致。
-
-- [ ] **Step 1: manifest.json**
-
-创建 `extensions/gemini-bridge/manifest.json`：
-
-```json
-{
-  "manifest_version": 3,
-  "name": "gemini-bridge",
-  "version": "0.1.0",
-  "description": "human-agent 与网页版 Gemini（AI Studio）之间的桥",
-  "permissions": ["storage"],
-  "host_permissions": ["http://127.0.0.1:8765/*"],
-  "background": {
-    "service_worker": "background.js"
-  },
-  "content_scripts": [
-    {
-      "matches": ["https://aistudio.google.com/*"],
-      "js": ["content.js"],
-      "run_at": "document_idle"
-    }
-  ]
+if (process.env.GEMINI_BRIDGE_PORT !== undefined) {
+  // 桥模式：对话在网页（AI Studio），CLI 仅宿主 HTTP 服务
+  const interrupt = new InterruptController();
+  const service = buildBridgeService({
+    signal: interrupt.getSignal(),
+    logger: (text) => console.log(`[gemini-bridge] ${text}`),
+  });
+  process.on("SIGINT", () => interrupt.abort());
+  process.on("SIGTERM", () => interrupt.abort());
+  try {
+    const port = await service.getPort();
+    console.log(`Gemini 桥已监听 http://127.0.0.1:${port}`);
+    console.log("请在 AI Studio 页面与 Gemini 对话；插件会把 Gemini 的回复传给智能体执行工具，并把结果回填提交。");
+  } catch (err) {
+    console.error(`Gemini 桥无法监听端口：${err instanceof Error ? err.message : String(err)}`);
+    process.exit(1);
+  }
+  await new Promise<void>((resolve) => {
+    if (interrupt.isAborted()) resolve();
+    else interrupt.getSignal().addEventListener("abort", () => resolve(), { once: true });
+  });
+  service.close();
+  process.exitCode = interrupt.isAborted() ? 130 : 0;
+} else {
+  const agent = new HumanAgent();
+  process.on("SIGINT", () => agent.interrupt.abort());
+  process.on("SIGTERM", () => agent.interrupt.abort());
+  const status = await agent.run();
+  if (agent.ears instanceof TextInput) agent.ears.close();
+  process.exitCode = status === "ERROR" ? 1 : status === "INTERRUPTED" ? 130 : 0;
 }
 ```
 
-- [ ] **Step 2: background.js**
+- [ ] **Step 5: 运行确认通过**
 
-创建 `extensions/gemini-bridge/background.js`：
-
-```js
-// HTTP 桥：长轮询取任务、回传结果。host_permissions 规避页面 CSP/CORS 限制。
-const BASE = "http://127.0.0.1:8765";
-
-chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
-  (async () => {
-    if (message.type === "get-task") {
-      const res = await fetch(`${BASE}/task`, { signal: AbortSignal.timeout(30_000) });
-      if (res.status === 204) {
-        sendResponse({ task: null });
-        return;
-      }
-      sendResponse({ task: await res.json() });
-      return;
-    }
-    if (message.type === "submit-result") {
-      const res = await fetch(`${BASE}/result`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ id: message.id, reply: message.reply }),
-      });
-      sendResponse({ ok: res.ok });
-      return;
-    }
-    sendResponse({ error: "unknown message type" });
-  })();
-  return true; // 异步 sendResponse
-});
-```
-
-- [ ] **Step 3: content.js**
-
-创建 `extensions/gemini-bridge/content.js`（双向通道：任务消息填入输入框；发送事件监控——自动点击与用户手动点击页面发送按钮统一走"等待回复 → 回传"路径）：
-
-```js
-// 浮动面板 + AI Studio 页面双向收发。选择器随页面结构可能失效，见 README 排查节。
-const POLL_INTERVAL = 5_000;
-const SEND_DELAY_MIN = 3_000; // 自动发送随机延迟下限
-const SEND_DELAY_MAX = 8_000; // 自动发送随机延迟上限（防止机器人检测）
-const REPLY_STABLE_SAMPLES = 3;
-
-let autoSend = true;
-let pendingTask = null; // 已取到、尚未回传的任务
-let awaitingReply = false; // 已发送、等待 Gemini 回复中
-let lastReply = ""; // 最近一次回传的回复（「回填」使用）
-
-// ---------- 面板 ----------
-const panel = document.createElement("div");
-panel.id = "gemini-bridge-panel";
-panel.innerHTML = `
-<style>
-#gemini-bridge-panel {
-  position: fixed; right: 16px; bottom: 16px; z-index: 2147483647;
-  width: 260px; padding: 10px 12px; border-radius: 10px;
-  background: #1f1f1f; color: #e8e8e8; font: 12px/1.6 system-ui, sans-serif;
-  box-shadow: 0 4px 16px rgba(0,0,0,.35); user-select: none;
-}
-#gemini-bridge-panel .gb-title { font-weight: 700; margin-bottom: 6px; }
-#gemini-bridge-panel .gb-row { display: flex; align-items: center; gap: 6px; margin: 4px 0; }
-#gemini-bridge-panel button {
-  background: #3b82f6; color: #fff; border: 0; border-radius: 6px;
-  padding: 4px 10px; cursor: pointer; font-size: 12px;
-}
-#gemini-bridge-panel button:active { opacity: .7; }
-#gemini-bridge-panel .gb-status { color: #9ca3af; }
-#gemini-bridge-panel .gb-log {
-  margin-top: 6px; max-height: 120px; overflow-y: auto;
-  border-top: 1px solid #333; padding-top: 6px; color: #b0b0b0;
-  white-space: pre-wrap; word-break: break-all;
-}
-</style>
-<div class="gb-title">gemini-bridge</div>
-<label class="gb-row">
-  <input type="checkbox" id="gb-autosend" checked> 自动发送
-</label>
-<div class="gb-row gb-status" id="gb-status">待命中</div>
-<div class="gb-row">
-  <button id="gb-instruct">交给智能体</button>
-  <button id="gb-refill">回填</button>
-</div>
-<div class="gb-log" id="gb-log"></div>
-`;
-document.documentElement.appendChild(panel);
-
-const checkbox = panel.querySelector("#gb-autosend");
-const statusEl = panel.querySelector("#gb-status");
-const logEl = panel.querySelector("#gb-log");
-const instructBtn = panel.querySelector("#gb-instruct");
-const refillBtn = panel.querySelector("#gb-refill");
-
-chrome.storage.sync.get("geminiBridgeAutoSend", ({ geminiBridgeAutoSend }) => {
-  if (typeof geminiBridgeAutoSend === "boolean") {
-    autoSend = geminiBridgeAutoSend;
-    checkbox.checked = autoSend;
-  }
-});
-checkbox.addEventListener("change", () => {
-  autoSend = checkbox.checked;
-  chrome.storage.sync.set({ geminiBridgeAutoSend: autoSend });
-  setStatus(autoSend ? "自动发送" : "手动模式");
-});
-
-function setStatus(text) {
-  statusEl.textContent = text;
-}
-
-function log(text) {
-  const line = `[${new Date().toLocaleTimeString()}] ${text}`;
-  logEl.textContent = `${line}\n${logEl.textContent}`;
-}
-
-// ---------- AI Studio DOM 操作 ----------
-function findInput() {
-  return (
-    document.querySelector('rich-textarea div[contenteditable="true"]') ??
-    document.querySelector('[contenteditable="true"]')
-  );
-}
-
-function findSendButton() {
-  return (
-    document.querySelector('button[data-test-id="send-button"]') ??
-    document.querySelector('button[aria-label*="发送"]') ??
-    document.querySelector('button[aria-label*="Send"]')
-  );
-}
-
-function findStopButton() {
-  return (
-    document.querySelector('[data-test-id="stop-generation-button"]') ??
-    document.querySelector('button[aria-label*="停止"]') ??
-    document.querySelector('button[aria-label*="Stop"]')
-  );
-}
-
-function findLastReply() {
-  const marks = document.querySelectorAll(".markdown");
-  return marks.length > 0 ? marks[marks.length - 1].innerText : "";
-}
-
-function setInput(text) {
-  const el = findInput();
-  if (!el) return false;
-  el.textContent = text;
-  el.dispatchEvent(
-    new InputEvent("input", { bubbles: true, inputType: "insertText", data: text }),
-  );
-  return true;
-}
-
-function clickSend() {
-  const btn = findSendButton();
-  if (!btn) return false;
-  btn.click();
-  return true;
-}
-
-function isSendButton(btn) {
-  return Boolean(
-    btn.matches('button[data-test-id="send-button"]') ||
-      btn.matches('button[aria-label*="发送"]') ||
-      btn.matches('button[aria-label*="Send"]'),
-  );
-}
-
-async function waitReplyReady(timeoutMs = 120_000) {
-  const start = Date.now();
-  let stable = 0;
-  let lastText = "";
-  while (Date.now() - start < timeoutMs) {
-    const stop = findStopButton();
-    const text = findLastReply();
-    if (!stop && text !== "" && text === lastText) {
-      stable += 1;
-      if (stable >= REPLY_STABLE_SAMPLES) return text;
-    } else {
-      stable = 0;
-      lastText = text;
-    }
-    await sleep(500);
-  }
-  return findLastReply();
-}
-
-function sleep(ms) {
-  return new Promise((resolve) => setTimeout(resolve, ms));
-}
-
-// ---------- 双向通道 ----------
-async function submit(task, reply) {
-  await chrome.runtime.sendMessage({ type: "submit-result", id: task.id, reply });
-  lastReply = reply;
-  pendingTask = null;
-  awaitingReply = false;
-  setStatus("已回传");
-  log("已回传回复给 brain");
-}
-
-async function poll() {
-  if (pendingTask !== null || awaitingReply) return;
-  const resp = await chrome.runtime.sendMessage({ type: "get-task" });
-  if (!resp?.task) return;
-  pendingTask = resp.task;
-  log(`任务到达：${resp.task.message.slice(0, 100)}${resp.task.message.length > 100 ? "…" : ""}`);
-  if (!setInput(resp.task.message)) {
-    log("未找到输入框，稍后重试");
-    pendingTask = null;
-    return;
-  }
-  if (autoSend) {
-    const delay = SEND_DELAY_MIN + Math.random() * (SEND_DELAY_MAX - SEND_DELAY_MIN);
-    setStatus(`自动发送（${Math.round(delay / 1000)}s 后）`);
-    setTimeout(() => {
-      if (pendingTask === null || awaitingReply) return;
-      if (!clickSend()) log("未找到发送按钮，请手动点击页面发送按钮");
-    }, delay);
-  } else {
-    setStatus("待发送（手动）");
-    log("已填入输入框，请点击页面发送按钮提交");
-  }
-}
-
-// 发送事件监控：自动点击与用户手动点击页面发送按钮统一进入等待回复 → 回传。
-document.addEventListener(
-  "click",
-  (event) => {
-    const btn = event.target.closest("button");
-    if (!btn || !isSendButton(btn) || pendingTask === null || awaitingReply) return;
-    awaitingReply = true;
-    setStatus("等待 Gemini 回复…");
-    const task = pendingTask;
-    waitReplyReady()
-      .then((reply) => submit(task, reply))
-      .catch(() => {
-        awaitingReply = false;
-        log("等待回复超时，可重新发送");
-      });
-  },
-  true,
-);
-
-instructBtn.addEventListener("click", async () => {
-  if (pendingTask === null) {
-    log("当前没有待发送的任务");
-    return;
-  }
-  const el = findInput();
-  const draft = el ? el.innerText.trim() : "";
-  if (draft === "") {
-    log("输入框为空");
-    return;
-  }
-  await submit(pendingTask, draft);
-});
-
-refillBtn.addEventListener("click", () => {
-  const source = lastReply !== "" ? lastReply : pendingTask?.message;
-  if (!source) {
-    log("暂无可回填的内容");
-    return;
-  }
-  if (setInput(source)) log("已回填到输入框，可编辑后发送");
-});
-
-setInterval(poll, POLL_INTERVAL);
-poll();
-```
-
-- [ ] **Step 4: 插件 README**
-
-创建 `extensions/gemini-bridge/README.md`：
-
-```markdown
-# gemini-bridge 浏览器扩展
-
-human-agent 与网页版 Gemini（AI Studio）之间的**双向通道**：
-brain 的任务消息填入页面输入框（brain → 页面）；Gemini 回复完成后抓取并回传 brain
-（页面 → brain），形成「任务消息 → 页面 → Gemini 回复 → 回传 → 下一轮任务」的双向循环。
-
-## 前置条件
-
-- Chrome / Edge（Chromium 内核）
-- 已登录 https://aistudio.google.com（保持页面打开）
-- human-agent 已启用 Gemini 桥大脑：`GEMINI_BRIDGE_PORT=8765 pnpm dev`（默认端口 8765）
-
-## 安装
-
-1. 浏览器打开 `chrome://extensions`（Edge 为 `edge://extensions`）
-2. 打开右上角「开发者模式」
-3. 点击「加载已解压的扩展程序」，选择本目录（`extensions/gemini-bridge`）
-
-## 使用
-
-- **自动发送**（开关开启）：任务消息填入输入框后，隔**随机时间**（约 3–8s，防止机器人检测）
-  自动点击页面发送按钮；回复稳定后自动回传。
-- **手动模式**（关闭自动发送）：任务消息填入输入框但**不自动发送**，由你点击 AI Studio
-  页面自己的发送按钮提交；插件监控到发送后等待回复完成并自动回传。
-- **交给智能体**：把输入框当前内容**不经页面发送**、直接作为当前任务的回复回传 brain
-  （人工干预快速通道——如直接粘贴 tool_call 让智能体执行）。
-- **回填**：把最近一次任务消息/回复粘贴到输入框，可编辑后再发送。
-
-## 端口配置
-
-扩展默认连接 `127.0.0.1:8765`。若 brain 侧修改端口，需同步修改：
-
-- `manifest.json` 的 `host_permissions`（`http://127.0.0.1:<端口>/*`）
-- `background.js` 顶部的 `BASE` 常量
-
-## 排查：页面结构变化
-
-AI Studio 的 DOM 结构可能更新导致插件失效（如找不到输入框/发送按钮/回复文本）。
-此时打开 DevTools 检查页面元素，更新 `content.js` 顶部的选择器：
-
-- `findInput`：输入框（`rich-textarea div[contenteditable="true"]` 或任意 `[contenteditable="true"]`）
-- `findSendButton`：发送按钮（`button[data-test-id="send-button"]` 等）
-- `findStopButton`：停止生成按钮（生成中才出现，用于判断回复是否完成）
-- `findLastReply`：最后一条模型回复（`.markdown` 元素）
-```
-
-- [ ] **Step 5: 手动验证加载**
-
-在浏览器加载扩展，打开 AI Studio 页面，确认浮动面板出现、开关可用。此步无自动化测试，完整链路在 Task 9 联调。
+Run: `pnpm exec vitest run tests/agent.test.ts` → PASS；`pnpm test` → PASS；`pnpm build` → 通过。
 
 - [ ] **Step 6: Commit**
 
 ```bash
-git add extensions/gemini-bridge/
-git commit -m "feat: gemini-bridge 浏览器扩展——AI Studio 页面收发与人工干预面板"
+git add src/agent.ts bin/cli.ts tests/agent.test.ts
+git commit -m "feat: 桥模式——GEMINI_BRIDGE_PORT 切换 CLI 为宿主服务，buildBridgeService 组装执行型桥"
 ```
 
 ---
 
-### Task 8: 文档更新（CLAUDE.md / README.md）
+### Task 13: gemini-bridge 浏览器扩展重写（阻塞：需真实 DOM）
+
+**状态：BLOCKED** —— content.js 的内容抓取（输入框/发送按钮/模型回复元素/对话容器）必须基于用户提供的 AI Studio 真实 DOM 结构，当前选择器为猜测，不可用。拿到 DOM 后按 spec「插件侧（v2 重写）」节与下列要点执行：
+
+- 面板：自动模式开关 + 防检测设置（延迟区间 min/max 输入、模拟输入开关）+ 状态/日志；**删除**「交给智能体」「回填」按钮与发送事件监控
+- 内容监控循环：最新模型回复文本变化（稳定采样 2–3 次）→ `POST /result {reply}`；去重由服务侧兜底
+- 投递循环：长轮询 `GET /task` → 模拟人类逐字输入（每字符随机短延时，输入完成后合成 InputEvent）→ 自动模式：随机延迟（面板区间）后点击发送（延迟回调时开关已关则跳过）；手动模式：只回填
+- 协议注入：首条任务消息即协议文本，直接回填提交；插件保存该文本，检测到新对话（对话容器清空/重置）时重新注入
+- background.js：get-task（fetch 30s 超时）、submit-result（POST {reply}）、全部 try/catch 答 {error}
+- 手动验证加载 + Commit
+
+---
+
+### Task 14: 文档更新（CLAUDE.md / README.md，v2 语义）
 
 **Files:**
 - Modify: `CLAUDE.md`
 - Modify: `README.md`
 
+按 v2 设计重写阶段五段落、架构行与 Gemini 桥小节（Task 10 已改路径事实，此处写语义）。要点：
+- 阶段五：`src/brain/ollama-thinking.ts` / `gemini-bridge-thinking.ts`（**brain/ 根目录**）；桥服务为**执行型**（接收网页内容 → 解析 ```tool_call``` → 反思裁决（危险自动拒绝）→ 执行 → 回填队列），**非 BrainInference 实现**；`heart/executor.ts` 共享执行器；`GEMINI_BRIDGE_PORT` 切换 **cli 进程模式**（桥模式对话全在网页，CLI 仅宿主）；扩展面板 = 自动模式 + 防检测设置（随机延迟 + 模拟输入）
+- README：功能行、配置表（GEMINI_BRIDGE_PORT 语义）、架构树（brain/ 无 thinking/）、Gemini 桥小节重写
+
 - [ ] **Step 1: CLAUDE.md**
-
-1. 在"阶段四（大脑/心脏 + 全链路）已完成（TDD，104 tests）"段落之后、"**尚未开始**"之前，插入阶段五段落：
-
-````markdown
-阶段五（Gemini 桥 + 大脑职责模型重构）已完成（TDD）：
-- `src/brain/knowledge.ts`：大脑知识库——7 个工具的 zod schema 与 description 唯一来源；`TOOLS`（parameters 由 `z.toJSONSchema()` 派生，消除 TOOL_SCHEMAS 与 TOOLS.parameters 双写）、`schemas`、`serializeToolProtocol()`（思考层每轮完整注入的工具协议文本）
-- `src/brain/reflection.ts`：反思层（潜意识）——确定性代码不经模型，逐条裁决：存在性（UNKNOWN_TOOL）→ zod 结构（INVALID_ARGS）→ terminal 危险嗅探（调鼻子，DANGEROUS 经嘴巴 confirm，拒绝为 USER_DENIED）
-- `src/brain/thinking/`：思考层实现——`ollama-thinking.ts`（OllamaThinking，原 ollama-brain.ts 改名，逻辑不变）、`gemini-bridge-thinking.ts`（GeminiBridgeThinking：内嵌 HTTP 服务默认 127.0.0.1:8765，`GET /task` 长轮询（约 25s 后 204）+ `POST /result` 回传，任务按 id 匹配，`parseToolCalls` 容错解析 ```tool_call``` 代码块，`close()` 关服务）
-- `src/brain/llm.ts`：`BrainInference` 增加 `reflect(calls)`（可行性裁决）；`ReflectionVerdict`/`BlockedCall` 契约
-- `src/heart/loop.ts`：净化——TOOL_SCHEMAS/TOOLS/zod 校验/危险嗅探/嘴巴确认迁出；`#execute` = `brain.reflect(calls)` 裁决 → 放行 dispatch / 拦截结果直接反馈；loop 不再依赖 nose/mouth；`AgentPhase` 去掉 SNIFFING（嗅探属大脑反思，不再有心脏阶段）
-- `src/agent.ts`：组装"带反思的大脑"（thinking 构造注入 nose/mouth 构建共享 Reflection）；`GEMINI_BRIDGE_PORT` 环境变量设置即启用 GeminiBridgeThinking（默认 OllamaThinking，非法值回退 8765）
-- `bin/cli.ts`：结束后 `agent.brain.close()`（若为 GeminiBridgeThinking，与 ears.close() 同模式）
-- `extensions/gemini-bridge/`：Chrome/Edge MV3 扩展——background 长轮询桥 + content 浮动面板（自动发送开关、「交给智能体」、「回填」按钮），AI Studio 页面收发，手动 E2E 验证
-````
-
-2. 架构核心的 🧠 行替换为：
-
-````markdown
-- 🧠 `src/brain/`（大脑）：知识与思考。`knowledge.ts` 知识库（工具如何使用的知识，未来 RAG 在此聚合）、`thinking/` 思考层（模型推理实现：OllamaThinking / GeminiBridgeThinking）、`reflection.ts` 反思层（可行性裁决，确定性代码）、`context.ts` 会话消息队列；`llm.ts` 统一推理接口
-````
-
-3. 🫀 行替换为：
-
-````markdown
-- 🫀 `src/heart/`（心脏）：生命循环。`loop.ts` 推进 `听取指令 → 大脑思考 → 反思裁决 → 手眼执行 → 反馈结果 → 循环/结束`，并承担承受力（任务/单命令超时、maxIterations、中断）；`interrupt.ts` 持有全局 `AbortController`
-````
-
-4. 开发路线追加：
-
-````markdown
-5. Gemini 桥与职责模型重构（knowledge/thinking/reflection、浏览器扩展桥）✅
-````
-
 - [ ] **Step 2: README.md**
-
-1. "功能"列表更新两行：
-
-````markdown
-- **器官化架构**：大脑（知识库 + 思考 + 反思）→ 心脏（路由 + 承受力）→ 鼻子（风险嗅探）→ 手眼（执行）→ 反馈，循环往复
-- **双大脑**：默认本地 Ollama（qwen3）；`GEMINI_BRIDGE_PORT=8765` 切换网页版 Gemini（AI Studio + gemini-bridge 浏览器扩展）
-````
-
-2. "配置"表格增加一行：
-
-````markdown
-| `GEMINI_BRIDGE_PORT` | 未设置（用 Ollama） | 设置即启用 Gemini 桥大脑，端口默认 8765，非法值回退 8765 |
-````
-
-3. "架构"树中 `brain/` 与 `heart/` 两行替换为：
-
-````markdown
-├── brain/    # 🧠 大脑：knowledge 知识库、thinking/ 思考层、reflection 反思层、会话上下文
-├── heart/    # 🫀 心脏：AgentLoop 生命循环（路由 + 承受力）、AbortController 中断
-````
-
-4. 新增"Gemini 桥（网页版 Gemini 大脑）"小节（放在"配置"之后、"架构"之前）：
-
-````markdown
-## Gemini 桥（网页版 Gemini 大脑）
-
-Gemini 官方 API 国内不可直连，但网页版 AI Studio 可用。human-agent 通过浏览器扩展
-`extensions/gemini-bridge/` 作为桥，在 AI Studio 页面收发消息，以网页版 Gemini 作为大脑
-（网页版无原生 function calling，工具调用为 ```tool_call``` 结构化输出模拟）。
-
-```bash
-GEMINI_BRIDGE_PORT=8765 pnpm dev   # 启用 Gemini 桥大脑（默认 8765）
-```
-
-前置：按 `extensions/gemini-bridge/README.md` 加载扩展，保持 AI Studio 页面打开并登录。
-插件提供自动发送开关、「交给智能体」、「回填」按钮，支持人工干预与风控降频（间隔 ≥ 2s）。
-````
-
 - [ ] **Step 3: Commit**
 
 ```bash
 git add CLAUDE.md README.md
-git commit -m "docs: 职责模型重构与 Gemini 桥接入说明"
+git commit -m "docs: 桥模式 v2——网页对话驱动、智能体仅执行工具、执行型桥服务说明"
 ```
 
 ---
 
-### Task 9: 真实联调（手动 E2E，非 TDD）
+### Task 15: 真实联调（手动 E2E，非 TDD）
 
-**Files:** 无代码改动；按清单人工验证。
+**Files:** 无代码改动；按清单人工验证（需要用户操作浏览器）。
 
-- [ ] **Step 1: 基线回归**
-
-Run: `pnpm test` → 全绿；`pnpm build` → 编译通过。
-
-- [ ] **Step 2: Ollama 基线**
-
-Run: `pnpm dev`，输入"读取 package.json"，确认工具调用链路正常（qwen 场景）。
-
-- [ ] **Step 3: 加载扩展**
-
-浏览器加载 `extensions/gemini-bridge`，打开 https://aistudio.google.com 并登录，确认浮动面板出现。
-
-- [ ] **Step 4: Gemini 桥全链路**
-
-```bash
-GEMINI_BRIDGE_PORT=8765 pnpm dev
-```
-
-1. CLI 输入"读取 package.json" → 观察页面自动填入协议文本并发送 → Gemini 回复 ```tool_call``` → 插件回传 → CLI 显示工具执行结果 → 继续下一轮直至 CLI 输出最终回答。
-2. 若页面未自动发送：检查面板"自动发送"开关、DevTools 排查选择器（README 排查节）。
-
-- [ ] **Step 5: 人工干预路径**
-
-关闭"自动发送"开关 → CLI 输入新指令 → 任务消息填入输入框但不发送 → 点击「回填」/编辑输入框 → 点「交给智能体」→ 确认回复回传、CLI 继续。
-
-- [ ] **Step 6: 风控与中断**
-
-1. 连续多轮指令，确认发送间隔 ≥ 2s。
-2. CLI 输入危险命令场景（如删除命令），确认确认交互正常（Gemini 桥下确认仍走 CLI 终端）。
-3. `Ctrl+C` 中断 → 进程干净退出（exit code 130），无残留 node 进程（`GET /task` 长轮询已随服务关闭释放）。
-
-- [ ] **Step 7: 收尾提交（如有联调中发现的小修复）**
-
-按 TDD 规则补测试后提交。
+- [ ] **Step 1: 基线回归**：`pnpm test` 全绿；`pnpm build` 通过
+- [ ] **Step 2: Ollama 基线**：`pnpm dev` 输入"读取 package.json"，工具链路正常
+- [ ] **Step 3: 加载扩展**：chrome://extensions 开发者模式加载 `extensions/gemini-bridge`；打开并登录 aistudio.google.com；浮动面板出现（自动模式开关 + 防检测设置）
+- [ ] **Step 4: 桥全链路**：`GEMINI_BRIDGE_PORT=8765 pnpm dev` → 插件自动回填协议并提交 → 页面输入"读取 package.json" → Gemini 回复 ```tool_call``` → 插件抓取回传 → 智能体执行 → 结果模拟输入回填 → 自动模式随机延迟后提交 → Gemini 总结（无 tool_call）→ 循环自然终止
+- [ ] **Step 5: 手动模式**：关自动模式 → 结果只回填不提交 → 手动点发送 → 循环继续
+- [ ] **Step 6: 防检测与安全**：连续多轮，提交为随机延迟 + 逐字模拟输入；页面生成危险命令（如 rm -rf）→ 智能体自动拒绝 → 拒绝说明回填
+- [ ] **Step 7: 中断**：`Ctrl+C` → 干净退出（exit 130），无残留 node 进程
+- [ ] **Step 8: 收尾提交**（如有联调中发现的小修复，按 TDD 补测试后提交）
 
 ---
 
 ## Self-Review
 
-**Spec 覆盖检查：**
-- 知识库（schema 迁移、zod 派生 parameters、协议序列化）→ Task 1
-- 反思层（存在性/结构/危险嗅探，构造注入 nose/mouth）→ Task 2
-- llm.ts 接口 reflect + 类型契约 → Task 2/3
-- ollama-brain → thinking/ollama-thinking 改名 → Task 3
-- GeminiBridgeThinking（HTTP 服务、任务队列、signal abort、parseToolCalls、close）→ Task 4
-- loop 净化（删 TOOL_SCHEMAS/TOOLS/校验/嗅探/确认，reflect 裁决路径）→ Task 5
-- agent.ts GEMINI_BRIDGE_PORT 切换 + cli.ts close → Task 6
-- 插件（manifest/background/content/README，开关/交给智能体/回填，≥2s 间隔）→ Task 7
-- CLAUDE.md / README.md → Task 8
-- 测试策略（knowledge/reflection/gemini-bridge-thinking 新测；loop/helpers/agent 改造）→ Task 1/2/3/4/5/6
-- 真实联调 → Task 9
+**Spec v2 覆盖检查：**
+- 布局迁移（thinking/ → brain/ 根目录，import 与文档路径）→ Task 10
+- 执行型桥服务（协议注入、POST /result 校验/去重、parseToolCalls、裁决自动拒绝、executeTool 批执行、回填序列化、批超时、全局中断、close 释放）→ Task 11
+- 共享执行器抽取（loop #dispatch → executor.ts，loop 回归）→ Task 11
+- 组装（buildBridgeService、HumanAgent 恒 Ollama）与 cli 桥模式宿主分支 → Task 12
+- 扩展重写（自动模式 + 防检测设置、内容监控、模拟输入、新对话协议重注入、删旧按钮）→ Task 13（阻塞：DOM）
+- 文档 v2 语义 → Task 14
+- 手动 E2E（新清单）→ Task 15
 
 **设计决策说明（spec 未完全定死的落点）：**
-1. **插件为双向通道**：任务消息填入输入框（brain → 页面）与发送后回复回传（页面 → brain）循环往复。发送路径统一走**发送事件监控**——插件在点击捕获阶段判定发送按钮，自动点击（随机延迟 3–8s，防止机器人检测）与用户手动点击页面发送按钮进入同一"等待回复 → 回传"流程，无需区分发送来源。
-2. 「交给智能体」= 输入框当前草稿**不经页面发送**、直接作为当前任务的回复回传 brain（`POST /result`），是人工干预快速通道（可粘贴 tool_call 直接驱动智能体），不是手动模式的唯一提交路径——手动主路径是用户点页面发送按钮。
-3. `AgentPhase` 删除 `SNIFFING`：嗅探已移入大脑反思层，心脏循环不再有该阶段，类型与注释同步更新。
-4. `OllamaThinking` 构造 `nose`/`mouth` 必填（无默认 no-op），TS 强制组装者注入真实器官。
-5. Gemini 桥任务在交予插件后仍保留在 pending map（按 id 匹配回传），回传超时 60s；`close()` 释放全部 waiter 与 pending，防止进程挂起。
+1. **无 id 握手**：v2 是单向流水线（插件推内容、拉回填），处理结果与请求不配对；去重靠插件（内容变化才 POST）+ 服务（#lastContent）双保险。
+2. **协议注入时机**：桥服务启动即把协议文本作为首条回填消息入队；插件保存协议文本，新对话（容器重置）时重新注入——让 Gemini 在任何新对话里都知道 ```tool_call``` 格式。
+3. **超时与中断的差异**：批超时（AbortSignal.timeout）→ 队列「执行超时」说明让 Gemini 继续；全局中断（Ctrl+C）→ 丢弃批次（进程即将退出）。
+4. **危险自动拒绝**：桥服务内部注入 `{ confirm: async () => false }` 嘴巴——复用 Reflection 的 DANGEROUS→USER_DENIED 路径，不新增策略参数。
+5. **拒绝消息按错误码格式化**：USER_DENIED →「危险命令自动拒绝，未执行」；UNKNOWN_TOOL/INVALID_ARGS → 原文原因。
+6. **v2 中 GEMINI_BRIDGE_PORT 是进程模式开关**：设置 → cli 桥模式宿主分支（无 HumanAgent/loop）；未设置 → 原 Ollama 对话模式。HumanAgent 不再感知该环境变量。
