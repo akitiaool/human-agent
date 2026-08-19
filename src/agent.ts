@@ -1,4 +1,5 @@
 import { ConversationContext } from "./brain/context.js";
+import { GeminiBridgeThinking } from "./brain/thinking/gemini-bridge-thinking.js";
 import { OllamaThinking } from "./brain/thinking/ollama-thinking.js";
 import type { BrainInference } from "./brain/llm.js";
 import { TextInput } from "./ears/text-input.js";
@@ -82,6 +83,15 @@ export class HumanAgent {
 }
 
 function buildDefaultBrain(nose: NoseContract, mouth: MouthContract): BrainInference {
+  const bridgePort = process.env.GEMINI_BRIDGE_PORT;
+  if (bridgePort !== undefined) {
+    const port = Number(bridgePort);
+    return new GeminiBridgeThinking({
+      port: Number.isInteger(port) && port > 0 ? port : 8765,
+      nose,
+      mouth,
+    });
+  }
   return new OllamaThinking({
     nose,
     mouth,

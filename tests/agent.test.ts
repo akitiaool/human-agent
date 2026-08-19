@@ -1,10 +1,11 @@
 import { describe, expect, it } from "vitest";
 import { HumanAgent } from "../src/agent.js";
 import { ConversationContext } from "../src/brain/context.js";
-import { AskUser } from "../src/mouth/ask-user.js";
-import type { AgentOutput } from "../src/types/index.js";
-import { FakeEars, FakeWritable, ScriptedBrain, inputFrom } from "./helpers.js";
+import { GeminiBridgeThinking } from "../src/brain/thinking/gemini-bridge-thinking.js";
+import { OllamaThinking } from "../src/brain/thinking/ollama-thinking.js";
 import { TextOutput } from "../src/mouth/text-output.js";
+import type { AgentOutput } from "../src/types/index.js";
+import { FakeEars, FakeWritable, ScriptedBrain } from "./helpers.js";
 
 class FakeOutput implements AgentOutput {
   public spoken: string[] = [];
@@ -63,7 +64,6 @@ describe("HumanAgent", () => {
     const agent = new HumanAgent({
       brain,
       ears: new FakeEars(["任务", "/exit"]),
-      mouth: new AskUser({ input: inputFrom("y\n") }),
       output: new TextOutput({ stdout: new FakeWritable(), intervalMs: 0 }),
     });
     const status = await agent.run();
@@ -100,5 +100,24 @@ describe("HumanAgent", () => {
     const toolMessage = brain.messagesOf(1).find((m) => m.role === "tool");
     const parsed = JSON.parse(toolMessage!.content) as { success: boolean };
     expect(parsed.success).toBe(true);
+  });
+
+  it("默认组装的大脑为 OllamaThinking", async () => {
+    const agent = new HumanAgent({ ears: new FakeEars(["/exit"]), output: new FakeOutput() });
+    expect(agent.brain).toBeInstanceOf(OllamaThinking);
+    await agent.run();
+  });
+
+  it("GEMINI_BRIDGE_PORT 环境变量启用 GeminiBridgeThinking", async () => {
+    process.env.GEMINI_BRIDGE_PORT = "0";
+    const agent = new HumanAgent({ ears: new FakeEars(["/exit"]), output: new FakeOutput() });
+    try {
+      expect(agent.brain).toBeInstanceOf(GeminiBridgeThinking);
+      const status = await agent.run();
+      expect(status).toBe("IDLE");
+    } finally {
+      if (agent.brain instanceof GeminiBridgeThinking) agent.brain.close();
+      delete process.env.GEMINI_BRIDGE_PORT;
+    }
   });
 });
