@@ -107,8 +107,9 @@ panel.innerHTML = `
   position: fixed; right: 16px; bottom: 16px; z-index: 2147483647;
   width: 280px; padding: 10px 12px; border-radius: 10px;
   background: #1f1f1f; color: #e8e8e8; font: 12px/1.6 system-ui, sans-serif;
-  box-shadow: 0 4px 16px rgba(0,0,0,.35); user-select: none;
+  border: 1px solid #4b5563; user-select: none;
   max-height: 70vh; display: flex; flex-direction: column;
+  color-scheme: dark; /* 原生控件（数字 spinner、select 下拉、滚动条）走暗色绘制 */
 }
 #ha-panel .ha-title {
   font-weight: 700; margin-bottom: 6px; display: flex;
@@ -124,10 +125,10 @@ panel.innerHTML = `
   position: fixed; right: 16px; bottom: 16px; z-index: 2147483647;
   width: 40px; height: 40px; border-radius: 50%;
   background: #1f1f1f; border: 1px solid #4b5563;
-  box-shadow: 0 4px 16px rgba(0,0,0,.35);
   display: none; align-items: center; justify-content: center;
-  cursor: grab; user-select: none;
+  cursor: grab; user-select: none; color-scheme: dark;
 }
+#ha-ball:hover { border-color: #6b7280; }
 #ha-ball .ha-dot {
   width: 12px; height: 12px; border-radius: 50%;
   background: #3b82f6; box-shadow: 0 0 6px rgba(59,130,246,.6);
@@ -150,11 +151,23 @@ panel.innerHTML = `
   background: #111827; color: #93c5fd; border: 1px solid #374151;
 }
 #ha-panel .ha-status.ha-err { color: #fca5a5; border-color: #7f1d1d; }
+#ha-panel .ha-log-bar {
+  margin-top: 6px; display: flex; align-items: center; justify-content: flex-end; gap: 6px;
+}
+#ha-panel .ha-log-bar button {
+  background: #111; color: #9ca3af; border: 1px solid #4b5563;
+  border-radius: 4px; font: inherit; padding: 0 8px; cursor: pointer;
+}
+#ha-panel .ha-log-bar button:hover { color: #e8e8e8; border-color: #6b7280; }
 #ha-panel .ha-log {
-  margin-top: 6px; max-height: 160px; overflow-y: auto;
+  margin-top: 4px; max-height: 160px; overflow-y: auto;
   border-top: 1px solid #333; padding-top: 6px; color: #b0b0b0;
   white-space: pre-wrap; word-break: break-all;
 }
+#ha-log::-webkit-scrollbar { width: 8px; }
+#ha-log::-webkit-scrollbar-track { background: #111827; }
+#ha-log::-webkit-scrollbar-thumb { background: #4b5563; border-radius: 4px; }
+#ha-log::-webkit-scrollbar-thumb:hover { background: #6b7280; }
 </style>
 <div class="ha-title">
   <span>gemini-bridge<span class="ha-badge">v2 网页对话驱动</span></span>
@@ -200,6 +213,10 @@ panel.innerHTML = `
   <input type="text" id="ha-base-url" spellcheck="false" placeholder="http://127.0.0.1:8765">
 </div>
 <div class="ha-status" id="ha-status">待命</div>
+<div class="ha-log-bar">
+  <button id="ha-log-export" title="导出日志为文本文件">导出</button>
+  <button id="ha-log-clear" title="清除日志">清除</button>
+</div>
 <div class="ha-log" id="ha-log"></div>
 `;
 document.documentElement.appendChild(panel);
@@ -405,6 +422,20 @@ function setupPanelEvents() {
     applySettingsToPanel();
     scheduleSaveSettings();
     log(`回填速度：${settings.speed}x（下次节奏立即生效）`);
+  });
+  panel.querySelector("#ha-log-clear").addEventListener("click", () => {
+    logEl.textContent = "";
+  });
+  panel.querySelector("#ha-log-export").addEventListener("click", () => {
+    const blob = new Blob([logEl.textContent || "(空日志)"], { type: "text/plain;charset=utf-8" });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = `gemini-bridge-${new Date().toISOString().replace(/[:.]/g, "-")}.log`;
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    URL.revokeObjectURL(url);
   });
   panel.querySelector("#ha-base-url").addEventListener("change", (e) => {
     settings.baseUrl = normalizeBaseUrl(e.target.value);
@@ -620,9 +651,13 @@ async function deliverMessage(text, source) {
       log("手动模式：已回填输入框，请点击页面发送按钮提交");
       return;
     }
-    const delaySec = Math.round(randRange(settings.delayMinSec, settings.delayMaxSec) * 10) / 10;
-    setStatus(`自动提交（${delaySec}s 后）`);
-    await sleep(delaySec * 1000);
+    const delayMs = randRange(settings.delayMinSec, settings.delayMaxSec) * 1000;
+    const deadline = Date.now() + delayMs;
+    const tick = () => setStatus(`自动提交（${Math.max(0, (deadline - Date.now()) / 1000).toFixed(1)}s 后）`);
+    tick();
+    const countdown = setInterval(tick, 200); // 动态倒计时，逐 0.1s 递减
+    await sleep(delayMs);
+    clearInterval(countdown);
     // 竞态守卫：延迟回调触发时开关已关闭 → 跳过点击（A7）
     if (!settings.autoMode) {
       setStatus("待命");
