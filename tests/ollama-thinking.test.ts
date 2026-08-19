@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from "vitest";
-import { OllamaThinking } from "../src/brain/thinking/ollama-thinking.js";
+import { OllamaThinking } from "../src/brain/ollama-thinking.js";
 import { ConversationContext } from "../src/brain/context.js";
 import type { Message, ToolInfo } from "../src/brain/llm.js";
 import { buildStubMouth, buildStubNose } from "./helpers.js";

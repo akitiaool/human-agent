@@ -3,17 +3,17 @@
 import { randomUUID } from "node:crypto";
 import http from "node:http";
 import type { AddressInfo } from "node:net";
-import type { ConversationContext, Message } from "../context.js";
-import { serializeToolProtocol } from "../knowledge.js";
+import type { ConversationContext, Message } from "./context.js";
+import { serializeToolProtocol } from "./knowledge.js";
 import type {
   BrainInference,
   BrainInferenceResult,
   ReflectionVerdict,
   ToolCall,
   ToolInfo,
-} from "../llm.js";
-import { Reflection } from "../reflection.js";
-import type { MouthContract, NoseContract } from "../../types/index.js";
+} from "./llm.js";
+import { Reflection } from "./reflection.js";
+import type { MouthContract, NoseContract } from "../types/index.js";
 
 export interface GeminiBridgeThinkingOptions {
   port?: number;

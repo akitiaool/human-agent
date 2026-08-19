@@ -59,7 +59,7 @@ GEMINI_BRIDGE_PORT=8765 pnpm dev   # 启用 Gemini 桥大脑（默认 8765）
 
 ```text
 src/
-├── brain/    # 🧠 大脑：knowledge 知识库、thinking/ 思考层、reflection 反思层、会话上下文
+├── brain/    # 🧠 大脑：knowledge 知识库、思考层（ollama-thinking/gemini-bridge-thinking）、reflection 反思层、会话上下文
 ├── heart/    # 🫀 心脏：AgentLoop 生命循环（路由 + 承受力）、AbortController 中断
 ├── eyes/     # 👁️ 眼睛：只读——文件读/目录/代码检索、网页抓取
 ├── ears/     # 👂 耳朵：终端输入（单 readline 接口 + 行队列）

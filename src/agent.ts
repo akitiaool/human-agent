@@ -1,6 +1,6 @@
 import { ConversationContext } from "./brain/context.js";
-import { GeminiBridgeThinking } from "./brain/thinking/gemini-bridge-thinking.js";
-import { OllamaThinking } from "./brain/thinking/ollama-thinking.js";
+import { GeminiBridgeThinking } from "./brain/gemini-bridge-thinking.js";
+import { OllamaThinking } from "./brain/ollama-thinking.js";
 import type { BrainInference } from "./brain/llm.js";
 import { TextInput } from "./ears/text-input.js";
 import { FileReader } from "./eyes/file-reader.js";

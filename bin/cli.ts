@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 import { Command } from "commander";
 import { HumanAgent } from "../src/agent.js";
-import { GeminiBridgeThinking } from "../src/brain/thinking/gemini-bridge-thinking.js";
+import { GeminiBridgeThinking } from "../src/brain/gemini-bridge-thinking.js";
 import { TextInput } from "../src/ears/text-input.js";
 
 const program = new Command();

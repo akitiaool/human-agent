@@ -1,13 +1,13 @@
-import type { ConversationContext, Message } from "../context.js";
+import type { ConversationContext, Message } from "./context.js";
 import type {
   BrainInference,
   BrainInferenceResult,
   ReflectionVerdict,
   ToolCall,
   ToolInfo,
-} from "../llm.js";
-import { Reflection } from "../reflection.js";
-import type { MouthContract, NoseContract } from "../../types/index.js";
+} from "./llm.js";
+import { Reflection } from "./reflection.js";
+import type { MouthContract, NoseContract } from "../types/index.js";
 
 export interface OllamaThinkingOptions {
   baseUrl?: string;

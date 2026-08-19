@@ -1,8 +1,8 @@
 import { describe, expect, it } from "vitest";
 import { HumanAgent } from "../src/agent.js";
 import { ConversationContext } from "../src/brain/context.js";
-import { GeminiBridgeThinking } from "../src/brain/thinking/gemini-bridge-thinking.js";
-import { OllamaThinking } from "../src/brain/thinking/ollama-thinking.js";
+import { GeminiBridgeThinking } from "../src/brain/gemini-bridge-thinking.js";
+import { OllamaThinking } from "../src/brain/ollama-thinking.js";
 import { TextOutput } from "../src/mouth/text-output.js";
 import type { AgentOutput } from "../src/types/index.js";
 import { FakeEars, FakeWritable, ScriptedBrain } from "./helpers.js";

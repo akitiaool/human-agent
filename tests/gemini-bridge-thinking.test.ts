@@ -2,7 +2,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   GeminiBridgeThinking,
   parseToolCalls,
-} from "../src/brain/thinking/gemini-bridge-thinking.js";
+} from "../src/brain/gemini-bridge-thinking.js";
 import { ConversationContext } from "../src/brain/context.js";
 import { TOOLS } from "../src/brain/knowledge.js";
 import type { Message } from "../src/brain/llm.js";
