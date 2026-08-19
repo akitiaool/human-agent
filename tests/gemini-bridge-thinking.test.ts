@@ -134,4 +134,35 @@ describe("GeminiBridgeThinking", () => {
     const verdict = await bridge.reflect([{ name: "terminal", arguments: { command: "rm -rf /" } }]);
     expect(verdict.blocked[0]?.result.error?.code).toBe("USER_DENIED");
   });
+
+  it("已交付任务不会重复交付：新任务发布后 GET 返回新任务而非旧任务", async () => {
+    const { bridge, port } = await makeBridge();
+    const context = contextOf({ role: "user", content: "旧任务" });
+    const firstInfer = bridge.infer(context, TOOLS);
+    const first = (await (await fetch(`http://127.0.0.1:${port}/task`)).json()) as {
+      id: string;
+    };
+    context.add({ role: "user", content: "新任务" });
+    const secondInfer = bridge.infer(context, TOOLS);
+    const second = (await (await fetch(`http://127.0.0.1:${port}/task`)).json()) as {
+      id: string;
+      message: string;
+    };
+    expect(second.id).not.toBe(first.id);
+    expect(second.message).toContain("新任务");
+    await postResult(port, first.id, "旧完成");
+    await postResult(port, second.id, "新完成");
+    await firstInfer;
+    await secondInfer;
+  });
+
+  it("长轮询等待：先 GET /task 挂起，任务发布后唤醒交付", async () => {
+    const { bridge, port } = await makeBridge();
+    const poll = fetch(`http://127.0.0.1:${port}/task`);
+    const inferPromise = bridge.infer(contextOf({ role: "user", content: "长轮询指令" }), TOOLS);
+    const task = (await (await poll).json()) as { id: string; message: string };
+    expect(task.message).toContain("长轮询指令");
+    await postResult(port, task.id, "收到");
+    expect((await inferPromise).text).toBe("收到");
+  });
 });

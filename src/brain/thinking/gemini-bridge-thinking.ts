@@ -61,6 +61,7 @@ export class GeminiBridgeThinking implements BrainInference {
   readonly #portPromise: Promise<number>;
   readonly #reflection: Reflection;
   readonly #pending = new Map<string, PendingTask>();
+  readonly #inflight = new Map<string, PendingTask>();
   readonly #waiters: Array<(task: PendingTask | null) => void> = [];
   #sentCount = 0;
 
@@ -84,6 +85,11 @@ export class GeminiBridgeThinking implements BrainInference {
   close(): void {
     for (const waiter of this.#waiters) waiter(null);
     this.#waiters.length = 0;
+    for (const task of this.#inflight.values()) {
+      clearTimeout(task.timer);
+      task.reject(new Error("Gemini 桥服务已关闭"));
+    }
+    this.#inflight.clear();
     for (const task of this.#pending.values()) {
       clearTimeout(task.timer);
       task.reject(new Error("Gemini 桥服务已关闭"));
@@ -134,6 +140,7 @@ export class GeminiBridgeThinking implements BrainInference {
           "abort",
           () => {
             this.#pending.delete(id);
+            this.#inflight.delete(id);
             clearTimeout(task.timer);
             reject(new DOMException("aborted", "AbortError"));
           },
@@ -146,6 +153,7 @@ export class GeminiBridgeThinking implements BrainInference {
   #armTimeout(task: PendingTask): void {
     task.timer = setTimeout(() => {
       this.#pending.delete(task.id);
+      this.#inflight.delete(task.id);
       task.reject(new Error("等待插件回传超时"));
     }, 60_000);
   }
@@ -186,10 +194,12 @@ export class GeminiBridgeThinking implements BrainInference {
     this.#waiters.push(waiter);
   }
 
-  /** 任务交给插件后仍保留在 #pending（结果按 id 匹配回传），只重置回传超时。 */
+  /** 任务交给插件后移入 #inflight（结果按 id 匹配回传），只重置回传超时——杜绝二次交付。 */
   #serveTask(task: PendingTask, res: http.ServerResponse): void {
     clearTimeout(task.timer);
     this.#armTimeout(task);
+    this.#pending.delete(task.id);
+    this.#inflight.set(task.id, task);
     res.writeHead(200, { "Content-Type": "application/json" });
     res.end(JSON.stringify({ id: task.id, message: task.message }));
   }
@@ -200,9 +210,10 @@ export class GeminiBridgeThinking implements BrainInference {
         const record = (typeof body === "object" && body !== null ? body : {}) as Record<string, unknown>;
         const id = typeof record.id === "string" ? record.id : "";
         const reply = typeof record.reply === "string" ? record.reply : "";
-        const task = this.#pending.get(id);
+        const task = this.#inflight.get(id) ?? this.#pending.get(id);
         if (task !== undefined) {
           clearTimeout(task.timer);
+          this.#inflight.delete(task.id);
           this.#pending.delete(task.id);
           task.resolve(reply);
         }
