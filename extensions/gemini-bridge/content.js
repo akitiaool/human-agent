@@ -40,9 +40,10 @@ const defaultSettings = {
   simulateTyping: true,
   delayMinSec: 3,
   delayMaxSec: 8,
-  segmentLenMin: 25, // 分块长度下限（字符，每块在区间内随机，避免等长分段暴露自动化）
-  segmentLenMax: 80, // 分块长度上限
+  segmentLenMin: 2, // 分块长度下限（字符，每块在区间内随机，避免等长分段暴露自动化）
+  segmentLenMax: 1024, // 分块长度上限（正常文本回填尽量少分块）
   typoChance: 40, // 每段触发「粘贴错字→退格→重打」纠错的概率（%）
+  speed: 1, // 回填速度倍率（0.5/1/2/4/10，回填过程中可即时修改）
 };
 
 let settings = { ...defaultSettings };
@@ -60,6 +61,13 @@ let settingsTimer = null; // 面板设置保存防抖
 
 function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+// 回填节奏延时：按当前速度倍率缩放。循环中每步重新读取 settings，
+// 所以回填过程中修改「回填速度」立即生效（已切分好的块长度不变）。
+function pacedSleep(ms) {
+  const rate = settings.speed > 0 ? settings.speed : 1;
+  return sleep(ms / rate);
 }
 
 function randInt(min, max) {
@@ -130,11 +138,12 @@ panel.innerHTML = `
   border: 1px solid #4b5563; border-radius: 4px; padding: 0 4px; margin-left: 4px;
 }
 #ha-panel .ha-row { display: flex; align-items: center; gap: 6px; margin: 4px 0; }
-#ha-panel input[type="number"], #ha-panel input[type="text"] {
+#ha-panel input[type="number"], #ha-panel input[type="text"], #ha-panel select {
   background: #111; color: #e8e8e8; border: 1px solid #4b5563;
   border-radius: 4px; padding: 2px 6px; width: 56px; font: inherit;
 }
 #ha-panel input[type="text"] { width: 150px; flex: 1; }
+#ha-panel select { width: 64px; }
 #ha-panel input[type="checkbox"] { accent-color: #3b82f6; }
 #ha-panel .ha-status {
   margin-top: 6px; padding: 4px 8px; border-radius: 6px;
@@ -175,6 +184,16 @@ panel.innerHTML = `
   <span>纠错概率</span>
   <input type="number" id="ha-typo-chance" min="0" max="100" step="5">
   <span>%</span>
+</div>
+<div class="ha-row">
+  <span>回填速度</span>
+  <select id="ha-speed" title="回填过程中修改立即生效（分块长度已切分，本次不变）">
+    <option value="0.5">0.5x</option>
+    <option value="1">1x</option>
+    <option value="2">2x</option>
+    <option value="4">4x</option>
+    <option value="10">10x</option>
+  </select>
 </div>
 <div class="ha-row">
   <span>桥服务</span>
@@ -313,6 +332,11 @@ function clampTypoChance(v) {
   return Number.isFinite(v) ? Math.min(100, Math.max(0, Math.round(v))) : defaultSettings.typoChance;
 }
 
+function clampSpeed(v) {
+  const s = Number(v);
+  return [0.5, 1, 2, 4, 10].includes(s) ? s : defaultSettings.speed;
+}
+
 function applySettingsToPanel() {
   panel.querySelector("#ha-auto-mode").checked = settings.autoMode;
   panel.querySelector("#ha-simulate").checked = settings.simulateTyping;
@@ -321,6 +345,7 @@ function applySettingsToPanel() {
   panel.querySelector("#ha-segment-min").value = settings.segmentLenMin;
   panel.querySelector("#ha-segment-max").value = settings.segmentLenMax;
   panel.querySelector("#ha-typo-chance").value = settings.typoChance;
+  panel.querySelector("#ha-speed").value = settings.speed;
   panel.querySelector("#ha-base-url").value = settings.baseUrl;
 }
 
@@ -374,6 +399,12 @@ function setupPanelEvents() {
     settings.typoChance = clampTypoChance(Number(e.target.value));
     applySettingsToPanel();
     scheduleSaveSettings();
+  });
+  panel.querySelector("#ha-speed").addEventListener("change", (e) => {
+    settings.speed = clampSpeed(e.target.value);
+    applySettingsToPanel();
+    scheduleSaveSettings();
+    log(`回填速度：${settings.speed}x（下次节奏立即生效）`);
   });
   panel.querySelector("#ha-base-url").addEventListener("change", (e) => {
     settings.baseUrl = normalizeBaseUrl(e.target.value);
@@ -507,19 +538,19 @@ async function pasteSegment(input, segStartCp, seg) {
   input.value += written;
   input.dispatchEvent(new InputEvent("input", { bubbles: true, inputType: "insertText", data: written }));
   if (fixes.length === 0) return;
-  await sleep(randInt(CORRECT_PAUSE_MIN_MS, CORRECT_PAUSE_MAX_MS)); // 纠错前停顿：发现错字→思考→开始修改
+  await pacedSleep(randInt(CORRECT_PAUSE_MIN_MS, CORRECT_PAUSE_MAX_MS)); // 纠错前停顿：发现错字→思考→开始修改
   let all = Array.from(input.value); // 码点数组（避免代理对与 slice 偏移不一致）
   for (const f of [...fixes].sort((a, b) => b.pos - a.pos)) {
     const at = segStartCp + f.pos;
     all.splice(at, 1); // 退格删除错字
     input.value = all.join("");
     input.dispatchEvent(new InputEvent("input", { bubbles: true, inputType: "deleteContentBackward" }));
-    await sleep(randInt(BACKSPACE_MIN_MS, BACKSPACE_MAX_MS));
-    await sleep(randInt(THINK_MIN_MS, THINK_MAX_MS)); // 退格后停顿：想正确字
+    await pacedSleep(randInt(BACKSPACE_MIN_MS, BACKSPACE_MAX_MS));
+    await pacedSleep(randInt(THINK_MIN_MS, THINK_MAX_MS)); // 退格后停顿：想正确字
     all.splice(at, 0, f.correct); // 重打正确字符
     input.value = all.join("");
     input.dispatchEvent(new InputEvent("input", { bubbles: true, inputType: "insertText", data: f.correct }));
-    await sleep(randInt(TYPING_MIN_MS, TYPING_MAX_MS));
+    await pacedSleep(randInt(TYPING_MIN_MS, TYPING_MAX_MS));
   }
 }
 
@@ -533,12 +564,12 @@ async function typeIntoInput(text) {
     input.dispatchEvent(new InputEvent("input", { bubbles: true, inputType: "deleteContentBackward" }));
   }
   if (settings.simulateTyping) {
-    await sleep(randInt(300, 800)); // 初始停顿，模拟人类开始输入前的思考
+    await pacedSleep(randInt(300, 800)); // 初始停顿，模拟人类开始输入前的思考
     let segStartCp = 0;
     for (const seg of splitSegments(text, settings.segmentLenMin, settings.segmentLenMax)) {
       await pasteSegment(input, segStartCp, seg);
       segStartCp += [...seg].length; // 码点偏移（length 为 UTF-16 单位，非 BMP 字符会漂移）
-      await sleep(randInt(PASTE_GAP_MIN_MS, PASTE_GAP_MAX_MS)); // 段间停顿
+      await pacedSleep(randInt(PASTE_GAP_MIN_MS, PASTE_GAP_MAX_MS)); // 段间停顿
     }
   } else {
     input.value = text;
@@ -795,6 +826,7 @@ async function init() {
       segmentLenMin,
       segmentLenMax,
       typoChance: clampTypoChance(Number(saved.typoChance)),
+      speed: clampSpeed(Number(saved.speed)),
       autoMode: typeof saved.autoMode === "boolean" ? saved.autoMode : defaultSettings.autoMode,
       simulateTyping:
         typeof saved.simulateTyping === "boolean" ? saved.simulateTyping : defaultSettings.simulateTyping,
