@@ -1,14 +1,25 @@
-# gemini-bridge 浏览器扩展
+# gemini-bridge 浏览器扩展（v2 网页对话驱动）
 
-human-agent 与网页版 Gemini（AI Studio）之间的**双向通道**：
-brain 的任务消息填入页面输入框（brain → 页面）；Gemini 回复完成后抓取并回传 brain
-（页面 → brain），形成「任务消息 → 页面 → Gemini 回复 → 回传 → 下一轮任务」的双向循环。
+human-agent 与 AI Studio 网页版 Gemini 之间的桥。v2 形态：**对话发生在网页**
+（Google AI Studio），智能体仅执行工具。插件做三件事：
+
+1. **内容监控**：抓取网页上最新的模型回复，POST 给本机桥服务
+   （`POST /result {reply}`），桥服务解析 ```tool_call``` 交给智能体执行；
+2. **投递回填**：长轮询桥服务（`GET /task`）取回填消息（工具执行结果 / 协议文本），
+   **模拟人类逐字输入**到页面输入框，自动模式在随机延迟后点击发送；
+3. **协议注入**：保存桥服务首条任务消息（工具协议文本），检测到新对话时自动重新注入。
+
+整个流水线内容驱动、无 id 握手：`网页回复 → 桥服务解析执行 → 回填消息 → 网页提交 → 新回复…`
+（去重由服务侧兜底，重复提交返回 `processed: false`）。
 
 ## 前置条件
 
 - Chrome / Edge（Chromium 内核）
-- 已登录 https://aistudio.google.com（保持页面打开）
-- human-agent 已启用 Gemini 桥大脑：`GEMINI_BRIDGE_PORT=8765 pnpm dev`（默认端口 8765）
+- 本机已启动 human-agent 桥服务（默认 `127.0.0.1:8765`），建议手动验证：
+  ```bash
+  GEMINI_BRIDGE_PORT=8765 pnpm dev
+  ```
+  可另开终端确认服务可访问：`curl http://127.0.0.1:8765/task`（约 25s 后返回空 204）。
 
 ## 安装
 
@@ -16,29 +27,40 @@ brain 的任务消息填入页面输入框（brain → 页面）；Gemini 回复
 2. 打开右上角「开发者模式」
 3. 点击「加载已解压的扩展程序」，选择本目录（`extensions/gemini-bridge`）
 
-## 使用
+## 使用步骤
 
-- **自动发送**（开关开启）：任务消息填入输入框后，隔**随机时间**（约 3–8s，防止机器人检测）
-  自动点击页面发送按钮；回复稳定后自动回传。
-- **手动模式**（关闭自动发送）：任务消息填入输入框但**不自动发送**，由你点击 AI Studio
-  页面自己的发送按钮提交；插件监控到发送后等待回复完成并自动回传。
-- **交给智能体**：把输入框当前内容**不经页面发送**、直接作为当前任务的回复回传 brain
-  （人工干预快速通道——如直接粘贴 tool_call 让智能体执行）。
-- **回填**：把最近一次任务消息/回复粘贴到输入框，可编辑后再发送。
+1. 先启动桥服务（见上），再打开 https://aistudio.google.com 并进入对话页；
+2. 确认页面右下角出现 gemini-bridge 浮动面板（状态「待命」）；
+3. 桥服务启动即把工具协议文本入队，插件取到后会自动回填并提交（自动模式）——
+   页面第一轮对话应当是以 `【human-agent 工具协议】` 开头的消息；
+4. 之后对 Gemini 的对话都会形成「回复 → 智能体执行工具 → 结果回填 → 提交」循环；
+5. 任务完成或无需工具时 Gemini 直接输出最终回答，流程结束。
 
-## 端口配置
+## 面板设置
 
-扩展默认连接 `127.0.0.1:8765`。若 brain 侧修改端口，需同步修改：
+| 设置 | 说明 |
+|---|---|
+| 自动模式 | 开：回填后随机延迟（防检测区间）自动点击发送；关：只回填，由你手动点页面发送按钮 |
+| 模拟人类逐字输入 | 开：逐字写入 + 每字符随机短延时；关：一次性填入 |
+| 提交延迟（秒，min/max） | 自动模式提交前的随机延迟区间，默认 3–8 秒；min>max 时自动对调 |
+| 桥服务地址 | 默认 `http://127.0.0.1:8765`，可改（纯端口如 `9876` 亦可）；改动后保存在 `chrome.storage.sync` |
 
-- `manifest.json` 的 `host_permissions`（`http://127.0.0.1:<端口>/*`）
-- `background.js` 顶部的 `BASE` 常量
+状态行含义：**待命** / **已抓取回复（等待执行）** / **回填中（模拟输入）** /
+**自动提交（Xs 后）** / **等待 Gemini 回复** / **错误**。
 
-## 排查：页面结构变化
+**注意**：请只在一个 AI Studio 标签页使用本扩展；多个标签页会竞争轮询同一条回填消息。
 
-AI Studio 的 DOM 结构可能更新导致插件失效（如找不到输入框/发送按钮/回复文本）。
-此时打开 DevTools 检查页面元素，更新 `content.js` 顶部的选择器：
+## 排查
 
-- `findInput`：输入框（`rich-textarea div[contenteditable="true"]` 或任意 `[contenteditable="true"]`）
-- `findSendButton`：发送按钮（`button[data-test-id="send-button"]` 等）
-- `findStopButton`：停止生成按钮（生成中才出现，用于判断回复是否完成）
-- `findLastReply`：最后一条模型回复（`.markdown` 元素）
+| 现象 | 可能原因 / 处理 |
+|---|---|
+| 面板状态「错误」，日志显示取任务失败 | 桥服务未启动（先 `GEMINI_BRIDGE_PORT=8765 pnpm dev`）；端口占用（换端口后同步改面板「桥服务地址」与 `manifest.json` 的 `host_permissions`） |
+| 回填后输入框无反应 / 无法提交 | 页面未在对话页（无 `ms-prompt-box textarea`）；或页面 DOM 结构更新导致选择器失效 |
+| 页面结构变化导致失效 | 现象：日志「未找到输入框」「未找到发送按钮」，或监控循环抓不到回复。打开 DevTools 检查元素，更新 `content.js` 顶部选择器常量区域：输入框 `ms-prompt-box textarea.cdk-textarea-autosize.textarea`、发送按钮 `ms-run-button button[type="submit"].ms-button-primary`、模型轮 `ms-chat-turn.text-chunk-host` + `[data-turn-role="Model"]`、完成信号 `#cdk-live-announcer-0`。AI Studio 为 Angular SPA + 虚拟滚动，元素频繁创建/销毁，抓取必须每次现查 DOM |
+| 插件加载时报错 | `chrome://extensions` 页面点「错误」查看 background 日志；确认三个文件无语法错误 |
+| 新对话后协议文本未注入 | 插件只在「检测到新对话」时重新注入已保存的协议文本；若扩展刚加载（存储中无协议文本），需在桥服务启动后先等首条协议消息到达并保存 |
+
+## 安全
+
+桥服务注入"永远拒绝"的嘴巴：危险命令（如 `rm -rf`、`DROP TABLE`）由反思层自动拒绝
+（USER_DENIED），拒绝说明随结果消息回填，**无人值守也安全**。

@@ -1,242 +1,516 @@
-// 浮动面板 + AI Studio 页面双向收发。选择器随页面结构可能失效，见 README 排查节。
-const POLL_INTERVAL = 5_000;
-const SEND_DELAY_MIN = 3_000; // 自动发送随机延迟下限
-const SEND_DELAY_MAX = 8_000; // 自动发送随机延迟上限（防止机器人检测）
-const REPLY_STABLE_SAMPLES = 3;
+// gemini-bridge v2 content script —— 网页对话驱动。
+// 两个循环：
+//   内容监控循环：AI Studio 最新模型回复 → 稳定采样 → POST /result {reply}
+//   投递循环：长轮询 GET /task → 模拟人类逐字回填 → 自动/手动提交
+// 选择器为 AI Studio 真实 DOM（2026-08-19 落定，task-13-brief 附录 A）。
+// 页面是 Angular SPA + cdk-virtual-scroll：元素频繁创建/销毁，
+// 所有抓取基于 MutationObserver 且每次现查 DOM，禁止缓存元素引用跨轮复用。
+// 面板样式统一 ha-* 前缀，避免与页面样式冲突。
 
-let autoSend = true;
-let pendingTask = null; // 已取到、尚未回传的任务
-let awaitingReply = false; // 已发送、等待 Gemini 回复中
-let lastReply = ""; // 最近一次回传的回复（「回填」使用）
+const DEFAULT_BASE_URL = "http://127.0.0.1:8765";
+const PROTOCOL_PREFIX = "【human-agent 工具协议】";
+const STABLE_SAMPLES = 3; // 稳定采样次数（连续 2–3 次，取 3）
+const SAMPLE_INTERVAL_MS = 700; // 采样间隔（500ms–1s 区间）
+const TASK_RETRY_MS = 1_000; // GET /task 无消息/失败后的重试间隔
+const TYPING_MIN_MS = 8; // 逐字输入每字符随机延时下限（防检测）
+const TYPING_MAX_MS = 40; // 逐字输入每字符随机延时上限（防检测）
+const REINJECT_SUPPRESS_MS = 5_000; // 新对话重新注入防抖窗口
+const LOG_MAX_LINES = 50;
 
-// ---------- 面板 ----------
-const panel = document.createElement("div");
-panel.id = "gemini-bridge-panel";
-panel.innerHTML = `
-<style>
-#gemini-bridge-panel {
-  position: fixed; right: 16px; bottom: 16px; z-index: 2147483647;
-  width: 260px; padding: 10px 12px; border-radius: 10px;
-  background: #1f1f1f; color: #e8e8e8; font: 12px/1.6 system-ui, sans-serif;
-  box-shadow: 0 4px 16px rgba(0,0,0,.35); user-select: none;
-}
-#gemini-bridge-panel .gb-title { font-weight: 700; margin-bottom: 6px; }
-#gemini-bridge-panel .gb-row { display: flex; align-items: center; gap: 6px; margin: 4px 0; }
-#gemini-bridge-panel button {
-  background: #3b82f6; color: #fff; border: 0; border-radius: 6px;
-  padding: 4px 10px; cursor: pointer; font-size: 12px;
-}
-#gemini-bridge-panel button:active { opacity: .7; }
-#gemini-bridge-panel .gb-status { color: #9ca3af; }
-#gemini-bridge-panel .gb-log {
-  margin-top: 6px; max-height: 120px; overflow-y: auto;
-  border-top: 1px solid #333; padding-top: 6px; color: #b0b0b0;
-  white-space: pre-wrap; word-break: break-all;
-}
-</style>
-<div class="gb-title">gemini-bridge</div>
-<label class="gb-row">
-  <input type="checkbox" id="gb-autosend" checked> 自动发送
-</label>
-<div class="gb-row gb-status" id="gb-status">待命中</div>
-<div class="gb-row">
-  <button id="gb-instruct">交给智能体</button>
-  <button id="gb-refill">回填</button>
-</div>
-<div class="gb-log" id="gb-log"></div>
-`;
-document.documentElement.appendChild(panel);
+const SETTINGS_KEY = "geminiBridgeSettings";
+const PROTOCOL_KEY = "geminiBridgeProtocol";
 
-const checkbox = panel.querySelector("#gb-autosend");
-const statusEl = panel.querySelector("#gb-status");
-const logEl = panel.querySelector("#gb-log");
-const instructBtn = panel.querySelector("#gb-instruct");
-const refillBtn = panel.querySelector("#gb-refill");
+const defaultSettings = {
+  baseUrl: DEFAULT_BASE_URL,
+  autoMode: true,
+  simulateTyping: true,
+  delayMinSec: 3,
+  delayMaxSec: 8,
+};
 
-chrome.storage.sync.get("geminiBridgeAutoSend", ({ geminiBridgeAutoSend }) => {
-  if (typeof geminiBridgeAutoSend === "boolean") {
-    autoSend = geminiBridgeAutoSend;
-    checkbox.checked = autoSend;
-  }
-});
-checkbox.addEventListener("change", () => {
-  autoSend = checkbox.checked;
-  chrome.storage.sync.set({ geminiBridgeAutoSend: autoSend });
-  setStatus(autoSend ? "自动发送" : "手动模式");
-});
+let settings = { ...defaultSettings };
+let protocolText = ""; // 已保存的工具协议文本（新对话时重新注入）
+let lastPostedReply = ""; // 最近一次回传的回复（避免无谓重发，服务侧亦去重）
+let delivering = false; // 投递循环串行占用标志（同一时刻只回填一条消息）
+let reinjectPending = false; // 待投递循环处理的协议重新注入
+let reinjectSuppressUntil = 0; // 新对话触发防抖时间戳
+let currentStatus = "待命";
+let settingsTimer = null; // 面板设置保存防抖
 
-function setStatus(text) {
-  statusEl.textContent = text;
-}
-
-function log(text) {
-  const line = `[${new Date().toLocaleTimeString()}] ${text}`;
-  logEl.textContent = `${line}\n${logEl.textContent}`;
-}
-
-// ---------- AI Studio DOM 操作 ----------
-function findInput() {
-  return (
-    document.querySelector('rich-textarea div[contenteditable="true"]') ??
-    document.querySelector('[contenteditable="true"]')
-  );
-}
-
-function findSendButton() {
-  return (
-    document.querySelector('button[data-test-id="send-button"]') ??
-    document.querySelector('button[aria-label*="发送"]') ??
-    document.querySelector('button[aria-label*="Send"]')
-  );
-}
-
-function findStopButton() {
-  return (
-    document.querySelector('[data-test-id="stop-generation-button"]') ??
-    document.querySelector('button[aria-label*="停止"]') ??
-    document.querySelector('button[aria-label*="Stop"]')
-  );
-}
-
-function findLastReply() {
-  const marks = document.querySelectorAll(".markdown");
-  return marks.length > 0 ? marks[marks.length - 1].innerText : "";
-}
-
-function setInput(text) {
-  const el = findInput();
-  if (!el) return false;
-  el.textContent = text;
-  el.dispatchEvent(
-    new InputEvent("input", { bubbles: true, inputType: "insertText", data: text }),
-  );
-  return true;
-}
-
-function clickSend() {
-  const btn = findSendButton();
-  if (!btn) return false;
-  btn.click();
-  return true;
-}
-
-function isSendButton(btn) {
-  return Boolean(
-    btn.matches('button[data-test-id="send-button"]') ||
-      btn.matches('button[aria-label*="发送"]') ||
-      btn.matches('button[aria-label*="Send"]'),
-  );
-}
-
-async function waitReplyReady(timeoutMs = 120_000) {
-  const start = Date.now();
-  let stable = 0;
-  let lastText = "";
-  while (Date.now() - start < timeoutMs) {
-    const stop = findStopButton();
-    const text = findLastReply();
-    if (!stop && text !== "" && text === lastText) {
-      stable += 1;
-      if (stable >= REPLY_STABLE_SAMPLES) return text;
-    } else {
-      stable = 0;
-      lastText = text;
-    }
-    await sleep(500);
-  }
-  return findLastReply();
-}
+// ---------- 工具函数 ----------
 
 function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
-// ---------- 双向通道 ----------
-async function submit(task, reply) {
-  const resp = await chrome.runtime.sendMessage({ type: "submit-result", id: task.id, reply });
-  lastReply = reply;
-  pendingTask = null;
-  awaitingReply = false;
+function randInt(min, max) {
+  return min + Math.floor(Math.random() * (max - min + 1));
+}
+
+function randRange(min, max) {
+  return min + Math.random() * (max - min);
+}
+
+function truncate(text, max) {
+  return text.length > max ? `${text.slice(0, max)}…` : text;
+}
+
+function normalizeBaseUrl(raw) {
+  const input = String(raw ?? "").trim();
+  if (/^\d+$/.test(input)) return `http://127.0.0.1:${input}`; // 纯端口 → 默认地址
+  if (/^https?:\/\//i.test(input)) return input.replace(/\/+$/, "");
+  if (input !== "") return `http://${input.replace(/\/+$/, "")}`; // host:port 形式
+  return DEFAULT_BASE_URL;
+}
+
+function clampDelay(min, max) {
+  let lo = Number.isFinite(min) ? Math.max(0, Math.min(600, min)) : defaultSettings.delayMinSec;
+  let hi = Number.isFinite(max) ? Math.max(0, Math.min(600, max)) : defaultSettings.delayMaxSec;
+  if (lo > hi) [lo, hi] = [hi, lo]; // 区间反转时对调
+  return { delayMinSec: lo, delayMaxSec: hi };
+}
+
+// ---------- 面板（ha-* 前缀） ----------
+
+const panel = document.createElement("div");
+panel.id = "ha-panel";
+panel.innerHTML = `
+<style>
+#ha-panel {
+  position: fixed; right: 16px; bottom: 16px; z-index: 2147483647;
+  width: 280px; padding: 10px 12px; border-radius: 10px;
+  background: #1f1f1f; color: #e8e8e8; font: 12px/1.6 system-ui, sans-serif;
+  box-shadow: 0 4px 16px rgba(0,0,0,.35); user-select: none;
+  max-height: 70vh; display: flex; flex-direction: column;
+}
+#ha-panel .ha-title { font-weight: 700; margin-bottom: 6px; }
+#ha-panel .ha-badge {
+  font-size: 10px; font-weight: 400; color: #9ca3af;
+  border: 1px solid #4b5563; border-radius: 4px; padding: 0 4px; margin-left: 4px;
+}
+#ha-panel .ha-row { display: flex; align-items: center; gap: 6px; margin: 4px 0; }
+#ha-panel input[type="number"], #ha-panel input[type="text"] {
+  background: #111; color: #e8e8e8; border: 1px solid #4b5563;
+  border-radius: 4px; padding: 2px 6px; width: 56px; font: inherit;
+}
+#ha-panel input[type="text"] { width: 150px; flex: 1; }
+#ha-panel input[type="checkbox"] { accent-color: #3b82f6; }
+#ha-panel .ha-status {
+  margin-top: 6px; padding: 4px 8px; border-radius: 6px;
+  background: #111827; color: #93c5fd; border: 1px solid #374151;
+}
+#ha-panel .ha-status.ha-err { color: #fca5a5; border-color: #7f1d1d; }
+#ha-panel .ha-log {
+  margin-top: 6px; max-height: 160px; overflow-y: auto;
+  border-top: 1px solid #333; padding-top: 6px; color: #b0b0b0;
+  white-space: pre-wrap; word-break: break-all;
+}
+</style>
+<div class="ha-title">gemini-bridge<span class="ha-badge">v2 网页对话驱动</span></div>
+<label class="ha-row">
+  <input type="checkbox" id="ha-auto-mode"> 自动模式（自动提交回填消息）
+</label>
+<label class="ha-row">
+  <input type="checkbox" id="ha-simulate"> 模拟人类逐字输入
+</label>
+<div class="ha-row">
+  <span>提交延迟</span>
+  <input type="number" id="ha-delay-min" min="0" max="600" step="0.5">
+  <span>~</span>
+  <input type="number" id="ha-delay-max" min="0" max="600" step="0.5">
+  <span>秒</span>
+</div>
+<div class="ha-row">
+  <span>桥服务</span>
+  <input type="text" id="ha-base-url" spellcheck="false" placeholder="http://127.0.0.1:8765">
+</div>
+<div class="ha-status" id="ha-status">待命</div>
+<div class="ha-log" id="ha-log"></div>
+`;
+document.documentElement.appendChild(panel);
+
+const statusEl = panel.querySelector("#ha-status");
+const logEl = panel.querySelector("#ha-log");
+
+function setStatus(text) {
+  currentStatus = text;
+  statusEl.textContent = text;
+  statusEl.classList.toggle("ha-err", text === "错误");
+}
+
+function log(text) {
+  const line = `[${new Date().toLocaleTimeString()}] ${text}`;
+  const lines = logEl.textContent ? logEl.textContent.split("\n") : [];
+  lines.unshift(line);
+  logEl.textContent = lines.slice(0, LOG_MAX_LINES).join("\n");
+}
+
+// ---------- 设置持久化（chrome.storage.sync） ----------
+
+function applySettingsToPanel() {
+  panel.querySelector("#ha-auto-mode").checked = settings.autoMode;
+  panel.querySelector("#ha-simulate").checked = settings.simulateTyping;
+  panel.querySelector("#ha-delay-min").value = settings.delayMinSec;
+  panel.querySelector("#ha-delay-max").value = settings.delayMaxSec;
+  panel.querySelector("#ha-base-url").value = settings.baseUrl;
+}
+
+function scheduleSaveSettings() {
+  clearTimeout(settingsTimer);
+  settingsTimer = setTimeout(() => {
+    chrome.storage.sync.set({ [SETTINGS_KEY]: settings }).catch(() => log("设置保存失败"));
+  }, 200);
+}
+
+function setupPanelEvents() {
+  panel.querySelector("#ha-auto-mode").addEventListener("change", (e) => {
+    settings.autoMode = e.target.checked;
+    scheduleSaveSettings();
+    log(`自动模式：${settings.autoMode ? "开" : "关"}`);
+  });
+  panel.querySelector("#ha-simulate").addEventListener("change", (e) => {
+    settings.simulateTyping = e.target.checked;
+    scheduleSaveSettings();
+    log(`模拟逐字输入：${settings.simulateTyping ? "开" : "关"}`);
+  });
+  panel.querySelector("#ha-delay-min").addEventListener("change", (e) => {
+    const { delayMinSec, delayMaxSec } = clampDelay(Number(e.target.value), settings.delayMaxSec);
+    settings.delayMinSec = delayMinSec;
+    settings.delayMaxSec = delayMaxSec;
+    applySettingsToPanel();
+    scheduleSaveSettings();
+  });
+  panel.querySelector("#ha-delay-max").addEventListener("change", (e) => {
+    const { delayMinSec, delayMaxSec } = clampDelay(settings.delayMinSec, Number(e.target.value));
+    settings.delayMinSec = delayMinSec;
+    settings.delayMaxSec = delayMaxSec;
+    applySettingsToPanel();
+    scheduleSaveSettings();
+  });
+  panel.querySelector("#ha-base-url").addEventListener("change", (e) => {
+    settings.baseUrl = normalizeBaseUrl(e.target.value);
+    panel.querySelector("#ha-base-url").value = settings.baseUrl;
+    scheduleSaveSettings();
+    log(`桥服务地址：${settings.baseUrl}`);
+  });
+}
+
+// ---------- AI Studio DOM 操作（每次现查，禁止缓存跨轮复用） ----------
+
+// A1：对话容器根（其子元素全部为 ms-chat-turn）
+function findChatSessionContent() {
+  return (
+    document.querySelector("ms-chat-session > ms-autoscroll-container > div > div.chat-session-content") ??
+    document.querySelector(".chat-session-content") ??
+    null
+  );
+}
+
+// A2/A3：最后一个内容轮且内部含模型角色的 turn
+function findLastModelTurn() {
+  const turns = document.querySelectorAll("ms-chat-turn.text-chunk-host");
+  for (let i = turns.length - 1; i >= 0; i--) {
+    if (turns[i].querySelector('[data-turn-role="Model"]')) return turns[i];
+  }
+  return null;
+}
+
+// A2：只取 ms-text-chunk 的 innerText（排除 ms-thought-chunk 思考摘要），拼接为 reply
+function extractReply(turn) {
+  return [...turn.querySelectorAll("ms-text-chunk")]
+    .map((chunk) => chunk.innerText.trim())
+    .filter(Boolean)
+    .join("\n");
+}
+
+// A3：完成信号（跨轮残留，仅作提前确认，主判据是稳定采样）
+function announcerReady() {
+  const el = document.getElementById("cdk-live-announcer-0");
+  return Boolean(el && el.textContent.includes("Response ready."));
+}
+
+// A4：输入框（普通 textarea，非 contenteditable）
+function findInput() {
+  return document.querySelector('ms-prompt-box textarea.cdk-textarea-autosize.textarea');
+}
+
+// A5：发送按钮（"Run"，空内容时 aria-disabled="true"）
+function findSendButton() {
+  return document.querySelector('ms-run-button button[type="submit"].ms-button-primary');
+}
+
+// A4：模拟人类逐字输入。每字符随机短延时 + input 事件驱动 Angular 表单与自动增高。
+async function typeIntoInput(text) {
+  const input = findInput();
+  if (!input) return false;
+  input.focus();
+  // 回填前若已有内容（用户手输未清），先清空再写入
+  if (input.value !== "") {
+    input.value = "";
+    input.dispatchEvent(new InputEvent("input", { bubbles: true, inputType: "deleteContentBackward" }));
+  }
+  if (settings.simulateTyping) {
+    await sleep(randInt(300, 800)); // 初始停顿，模拟人类开始输入前的思考
+    for (const ch of text) {
+      input.value += ch;
+      input.dispatchEvent(new InputEvent("input", { bubbles: true, inputType: "insertText", data: ch }));
+      await sleep(randInt(TYPING_MIN_MS, TYPING_MAX_MS));
+    }
+  } else {
+    input.value = text;
+    input.dispatchEvent(new InputEvent("input", { bubbles: true, inputType: "insertText", data: text }));
+  }
+  // 输入完成后的最终 input 事件（同步 cdk-textarea-autosize 高度与表单状态）
+  input.dispatchEvent(new InputEvent("input", { bubbles: true }));
+  return true;
+}
+
+// A5：等待按钮 aria-disabled 解除后 click()；不可用则回退 Ctrl+Enter。
+async function clickSendWhenReady() {
+  const btn = findSendButton();
+  if (btn) {
+    for (let i = 0; i < 50; i++) {
+      if (btn.getAttribute("aria-disabled") !== "true") {
+        btn.click();
+        return true;
+      }
+      await sleep(100);
+    }
+  }
+  const input = findInput();
+  if (!input) return false;
+  log("发送按钮不可用，回退 Ctrl+Enter 提交");
+  for (const type of ["keydown", "keyup"]) {
+    input.dispatchEvent(
+      new KeyboardEvent(type, { key: "Enter", code: "Enter", ctrlKey: true, bubbles: true, cancelable: true }),
+    );
+  }
+  return true;
+}
+
+// ---------- 投递循环：GET /task → 模拟输入 → 自动/手动提交 ----------
+
+async function deliverMessage(text, source) {
+  delivering = true;
+  try {
+    setStatus("回填中（模拟输入）");
+    log(`${source === "reinject" ? "重新注入协议文本" : "任务消息到达"}：${truncate(text.replace(/\n/g, " "), 80)}`);
+    if (!(await typeIntoInput(text))) {
+      setStatus("错误");
+      log("未找到输入框（ms-prompt-box textarea），消息丢失——请确认页面在 AI Studio 对话页");
+      return;
+    }
+    if (!settings.autoMode) {
+      setStatus("待命");
+      log("手动模式：已回填输入框，请点击页面发送按钮提交");
+      return;
+    }
+    const delaySec = Math.round(randRange(settings.delayMinSec, settings.delayMaxSec) * 10) / 10;
+    setStatus(`自动提交（${delaySec}s 后）`);
+    await sleep(delaySec * 1000);
+    // 竞态守卫：延迟回调触发时开关已关闭 → 跳过点击（A7）
+    if (!settings.autoMode) {
+      setStatus("待命");
+      log("延迟期间自动模式已关闭，跳过自动提交（请在输入框手动发送）");
+      return;
+    }
+    if (await clickSendWhenReady()) {
+      setStatus("等待 Gemini 回复");
+      log("已提交，等待 Gemini 回复…");
+    } else {
+      setStatus("错误");
+      log("未找到发送按钮且 Ctrl+Enter 回退失败，请手动提交");
+    }
+  } finally {
+    delivering = false;
+  }
+}
+
+async function deliveryLoop() {
+  while (true) {
+    if (!delivering) {
+      // 新对话触发的协议重新注入优先于取任务，走同一投递流程
+      if (reinjectPending) {
+        reinjectPending = false;
+        await deliverMessage(protocolText, "reinject");
+        continue;
+      }
+      let resp;
+      try {
+        resp = await chrome.runtime.sendMessage({ type: "get-task", baseUrl: settings.baseUrl });
+      } catch (err) {
+        resp = { error: err instanceof Error ? err.message : String(err) };
+      }
+      if (resp?.error) {
+        setStatus("错误");
+        log(`取任务失败：${resp.error}`);
+        await sleep(TASK_RETRY_MS);
+        continue;
+      }
+      if (resp?.task?.message) {
+        const msg = resp.task.message;
+        if (msg.startsWith(PROTOCOL_PREFIX)) {
+          // 首条任务消息即工具协议文本：保存供新对话重新注入（存储持久化，刷新后仍可用）
+          protocolText = msg;
+          chrome.storage.sync.set({ [PROTOCOL_KEY]: protocolText }).catch(() => log("协议文本保存失败"));
+          log("已保存工具协议文本（检测到新对话时自动重新注入）");
+        }
+        await deliverMessage(msg, "task");
+        continue; // 有消息时立即拉取下一条
+      }
+      // 无消息：仅把错误状态恢复为待命，不覆盖「已抓取回复」等有效状态
+      if (currentStatus === "错误") setStatus("待命");
+    }
+    await sleep(TASK_RETRY_MS);
+  }
+}
+
+// ---------- 内容监控循环：最新模型回复 → 稳定采样 → POST /result ----------
+
+async function postResult(reply) {
+  setStatus("已抓取回复（等待执行）");
+  let resp;
+  try {
+    resp = await chrome.runtime.sendMessage({ type: "submit-result", reply, baseUrl: settings.baseUrl });
+  } catch (err) {
+    resp = { error: err instanceof Error ? err.message : String(err) };
+  }
   if (resp?.error) {
-    setStatus("回传失败");
+    setStatus("错误");
     log(`回传失败：${resp.error}`);
     return;
   }
-  setStatus("已回传");
-  log("已回传回复给 brain");
-}
-
-let polling = false;
-async function poll() {
-  if (polling || pendingTask !== null || awaitingReply) return;
-  polling = true;
-  try {
-    const resp = await chrome.runtime.sendMessage({ type: "get-task" });
-    if (!resp?.task) return;
-    pendingTask = resp.task;
-    log(`任务到达：${resp.task.message.slice(0, 100)}${resp.task.message.length > 100 ? "…" : ""}`);
-    if (!setInput(resp.task.message)) {
-      log("未找到输入框，任务已丢失");
-      pendingTask = null;
-      return;
-    }
-    if (autoSend) {
-      const delay = SEND_DELAY_MIN + Math.random() * (SEND_DELAY_MAX - SEND_DELAY_MIN);
-      setStatus(`自动发送（${Math.round(delay / 1000)}s 后）`);
-      setTimeout(() => {
-        if (pendingTask === null || awaitingReply || !autoSend) return;
-        if (!clickSend()) log("未找到发送按钮，请手动点击页面发送按钮");
-      }, delay);
-    } else {
-      setStatus("待发送（手动）");
-      log("已填入输入框，请点击页面发送按钮提交");
-    }
-  } finally {
-    polling = false;
+  lastPostedReply = reply; // 去重由服务侧兜底，插件侧避免无谓重发
+  if (resp.ok) {
+    log(`已回传回复（${reply.length} 字符，${resp.processed ? "已入队执行" : "服务侧忽略（无工具调用/重复）"}）`);
+    if (!resp.processed) setStatus("待命");
+    // processed 时保持「已抓取回复（等待执行）」，直到回填消息到达
+  } else {
+    setStatus("错误");
+    log(`回传被拒：HTTP ${resp.status ?? "?"}`);
   }
 }
 
-// 发送事件监控：自动点击与用户手动点击页面发送按钮统一进入等待回复 → 回传。
-document.addEventListener(
-  "click",
-  (event) => {
-    const btn = event.target.closest("button");
-    if (!btn || !isSendButton(btn) || pendingTask === null || awaitingReply) return;
-    awaitingReply = true;
-    setStatus("等待 Gemini 回复…");
-    const task = pendingTask;
-    waitReplyReady()
-      .then((reply) => submit(task, reply))
-      .catch(() => {
-        awaitingReply = false;
-        log("等待回复超时，可重新发送");
-      });
-  },
-  true,
-);
+async function monitorLoop() {
+  let lastText = "";
+  let stable = 0;
+  while (true) {
+    try {
+      const turn = findLastModelTurn();
+      const text = turn ? extractReply(turn) : "";
+      if (text !== "" && text === lastText) {
+        stable += 1;
+        if (announcerReady()) stable = STABLE_SAMPLES; // 完成信号可提前确认（A3）
+      } else {
+        stable = 0;
+        lastText = text;
+      }
+      if (stable >= STABLE_SAMPLES && text !== "" && text !== lastPostedReply) {
+        stable = 0;
+        await postResult(text);
+      }
+    } catch (err) {
+      log(`监控循环异常：${err instanceof Error ? err.message : String(err)}`);
+    }
+    await sleep(SAMPLE_INTERVAL_MS);
+  }
+}
 
-instructBtn.addEventListener("click", async () => {
-  if (pendingTask === null) {
-    log("当前没有待发送的任务");
+// ---------- 新对话检测（A1）：观察器随容器变化重挂，触发协议文本重新注入 ----------
+
+let bodyObserver = null;
+let contentObserver = null;
+let observedContent = null;
+let lastTurnCount = 0;
+let lastFirstTurn = null;
+let hadSession = false;
+
+function setupNewConversationWatcher() {
+  hadSession = Boolean(document.querySelector("ms-chat-session"));
+  rehangContentObserver();
+  bodyObserver = new MutationObserver(() => {
+    const hasSession = Boolean(document.querySelector("ms-chat-session"));
+    if (hadSession && !hasSession) onNewConversation("对话会话已移除"); // ① session 从 DOM 移除
+    hadSession = hasSession;
+    rehangContentObserver();
+  });
+  bodyObserver.observe(document.body, { childList: true, subtree: true });
+}
+
+// 每次取到新的 .chat-session-content 后在其上重建 childList 观察器
+function rehangContentObserver() {
+  const content = findChatSessionContent();
+  if (!content) {
+    if (observedContent && lastTurnCount > 0) onNewConversation("对话容器已消失");
+    if (contentObserver) {
+      contentObserver.disconnect();
+      contentObserver = null;
+    }
+    observedContent = null;
+    lastTurnCount = 0;
+    lastFirstTurn = null;
     return;
   }
-  const el = findInput();
-  const draft = el ? el.innerText.trim() : "";
-  if (draft === "") {
-    log("输入框为空");
+  if (content === observedContent) return;
+  if (contentObserver) contentObserver.disconnect();
+  observedContent = content;
+  lastTurnCount = content.children.length; // 子元素全部为 ms-chat-turn
+  lastFirstTurn = content.firstElementChild;
+  contentObserver = new MutationObserver(onContentMutation);
+  contentObserver.observe(content, { childList: true });
+}
+
+function onContentMutation() {
+  const content = observedContent;
+  if (!content) return;
+  const count = content.children.length;
+  const first = content.firstElementChild;
+  if (lastTurnCount > 0 && (count === 0 || first !== lastFirstTurn)) {
+    onNewConversation("对话轮次已清空/重置"); // ② 计数清空或首个子元素变化
+  }
+  lastTurnCount = count;
+  lastFirstTurn = first;
+}
+
+function onNewConversation(reason) {
+  if (Date.now() < reinjectSuppressUntil) return; // 防抖：级联变更只触发一次
+  reinjectSuppressUntil = Date.now() + REINJECT_SUPPRESS_MS;
+  if (!protocolText) {
+    log(`检测到新对话（${reason}）：尚无协议文本，跳过重新注入`);
     return;
   }
-  await submit(pendingTask, draft);
-});
+  log(`检测到新对话（${reason}）：排队重新注入协议文本`);
+  reinjectPending = true; // 经投递循环执行（同普通回填消息）
+}
 
-refillBtn.addEventListener("click", () => {
-  const source = lastReply !== "" ? lastReply : pendingTask?.message;
-  if (!source) {
-    log("暂无可回填的内容");
-    return;
+// ---------- 启动 ----------
+
+async function init() {
+  const stored = await chrome.storage.sync.get([SETTINGS_KEY, PROTOCOL_KEY]).catch(() => ({}));
+  const saved = stored[SETTINGS_KEY];
+  if (saved && typeof saved === "object") {
+    const { delayMinSec, delayMaxSec } = clampDelay(Number(saved.delayMinSec), Number(saved.delayMaxSec));
+    settings = {
+      ...defaultSettings,
+      ...saved,
+      baseUrl: normalizeBaseUrl(saved.baseUrl),
+      delayMinSec,
+      delayMaxSec,
+      autoMode: typeof saved.autoMode === "boolean" ? saved.autoMode : defaultSettings.autoMode,
+      simulateTyping:
+        typeof saved.simulateTyping === "boolean" ? saved.simulateTyping : defaultSettings.simulateTyping,
+    };
   }
-  if (setInput(source)) log("已回填到输入框，可编辑后发送");
-});
+  if (typeof stored[PROTOCOL_KEY] === "string" && stored[PROTOCOL_KEY].startsWith(PROTOCOL_PREFIX)) {
+    protocolText = stored[PROTOCOL_KEY];
+  }
+  applySettingsToPanel();
+  setupPanelEvents();
+  setupNewConversationWatcher();
+  setStatus("待命");
+  log(`gemini-bridge v2 已就绪：桥服务 ${settings.baseUrl}，自动模式 ${settings.autoMode ? "开" : "关"}`);
+  deliveryLoop(); // 投递循环：长轮询取回填消息
+  monitorLoop(); // 内容监控循环：最新回复 → POST /result
+}
 
-setInterval(poll, POLL_INTERVAL);
-poll();
+init();
