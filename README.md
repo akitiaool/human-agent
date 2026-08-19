@@ -4,11 +4,11 @@
 
 ## 功能
 
-- **器官化架构**：大脑（LLM 推理）→ 心脏（生命周期循环）→ 鼻子（风险嗅探）→ 手眼（执行）→ 反馈，循环往复
+- **器官化架构**：大脑（知识库 + 思考 + 反思）→ 心脏（路由 + 承受力）→ 鼻子（风险嗅探）→ 手眼（执行）→ 反馈，循环往复
 - **工具调用**：读文件、列目录、代码检索、写文件、行级 Patch、执行命令、抓取网页转 Markdown
 - **风险拦截**：危险命令（`rm -rf`、`DROP TABLE`、`git push --force` 等）执行前向用户确认
 - **中断优先**：`Ctrl+C` 毫秒级中断，级联停止子进程，会话状态不丢失
-- **本地大脑**：默认接入本地 Ollama（qwen3），无需 API 费用，数据不出本机
+- **双大脑**：默认本地 Ollama（qwen3）；`GEMINI_BRIDGE_PORT=8765` 切换网页版 Gemini（AI Studio + gemini-bridge 浏览器扩展）
 
 ## 快速开始
 
@@ -40,13 +40,27 @@ pnpm test       # vitest 全量测试（TDD 流程：先写测试并看其失败
 | --- | --- | --- |
 | `OLLAMA_BASE_URL` | `http://localhost:11434` | Ollama 服务地址 |
 | `OLLAMA_MODEL` | `qwen3:4b` | 模型名，如 `qwen3:8b` |
+| `GEMINI_BRIDGE_PORT` | 未设置（用 Ollama） | 设置即启用 Gemini 桥大脑，端口默认 8765，非法值回退 8765 |
+
+## Gemini 桥（网页版 Gemini 大脑）
+
+Gemini 官方 API 国内不可直连，但网页版 AI Studio 可用。human-agent 通过浏览器扩展
+`extensions/gemini-bridge/` 作为桥，在 AI Studio 页面收发消息，以网页版 Gemini 作为大脑
+（网页版无原生 function calling，工具调用为 ```tool_call``` 结构化输出模拟）。
+
+```bash
+GEMINI_BRIDGE_PORT=8765 pnpm dev   # 启用 Gemini 桥大脑（默认 8765）
+```
+
+前置：按 `extensions/gemini-bridge/README.md` 加载扩展，保持 AI Studio 页面打开并登录。
+插件提供自动发送开关、「交给智能体」、「回填」按钮，支持人工干预与风控降频（自动发送为随机 3–8s 延迟）。
 
 ## 架构
 
 ```text
 src/
-├── brain/    # 🧠 大脑：Ollama 推理接口、会话上下文与 Token 预算
-├── heart/    # 🫀 心脏：AgentLoop 生命循环、AbortController 中断
+├── brain/    # 🧠 大脑：knowledge 知识库、thinking/ 思考层、reflection 反思层、会话上下文
+├── heart/    # 🫀 心脏：AgentLoop 生命循环（路由 + 承受力）、AbortController 中断
 ├── eyes/     # 👁️ 眼睛：只读——文件读/目录/代码检索、网页抓取
 ├── ears/     # 👂 耳朵：终端输入（单 readline 接口 + 行队列）
 ├── mouth/    # 🗣️ 嘴巴：打字机输出、彩色日志、危险操作确认
