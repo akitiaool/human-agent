@@ -1,5 +1,8 @@
 # Gemini 桥设计文档 v2（网页对话驱动 · 智能体仅执行）
 
+> **修订（2026-08-19）**：Ruling ④「危险命令自动拒绝」已被审批机制取代——
+> 见 `2026-08-19-approval-design.md`。本文危险命令相关行保留历史记录，以新 spec 为准。
+
 日期：2026-08-19（v2 设计纠正）
 状态：v1 已与用户逐节确认；v2 经用户拍板 4 项决策后定稿
 
@@ -24,7 +27,7 @@ v1 把桥做反了：CLI 驱动对话，插件把任务消息脚本化塞进网�
 | 智能体如何处理网页内容 | **仅执行工具**：解析 Gemini 回复中的 ```tool_call``` 块 → 反思层裁决 → 双手/眼睛执行 → 结果回填；无 tool_call 不回填，循环自然终止（不引入 Ollama 推理） |
 | CLI 在桥模式下的角色 | **仅宿主服务**：CLI 只运行 HTTP 服务 + 状态日志，对话全在网页，不再注入任务消息 |
 | 防检测设置 | **随机延迟 + 模拟输入**：回填后逐字/逐段模拟人类打字，提交前随机延迟（区间可配置，默认 3–8s） |
-| 危险命令确认 | **自动拒绝并反馈**：危险命令直接拒绝，拒绝说明作为处理结果回填给 Gemini（不再走 CLI 终端确认） |
+| 审批授权 | **审批授权**：危险命令经扩展弹窗人工授权（默认），面板可开自动授权静默放行；拒绝/超时说明回填给 Gemini |
 
 ## 桥模式数据流（v2）
 
@@ -36,7 +39,7 @@ v1 把桥做反了：CLI 驱动对话，插件把任务消息脚本化塞进网�
 [智能体] 解析 ```tool_call``` 块（parseToolCalls）
    ├─ 无 → 不动作（循环自然终止，不回填）
    └─ 有 → 反思层逐条裁决（存在性 → zod 结构 → 危险嗅探）
-        ├─ DANGEROUS → 自动拒绝（不发确认）
+        ├─ DANGEROUS → 审批请求（扩展弹窗授权）
         ├─ UNKNOWN_TOOL / INVALID_ARGS → 拒绝
         └─ 放行 → 共享执行器路由到双手/眼睛执行（批级超时 + 全局中断）
        → 全部结果序列化为回填消息 → 队列
@@ -59,7 +62,7 @@ v1 把桥做反了：CLI 驱动对话，插件把任务消息脚本化塞进网�
   ├─ reflection.ts      反思层（潜意识）：确定性可行性裁决，所有大脑共享
   │                     · 存在性 → UNKNOWN_TOOL · zod 结构 → INVALID_ARGS
   │                     · terminal 危险嗅探 → DANGEROUS → 经嘴巴确认 → USER_DENIED
-  │                     （桥模式注入"永远拒绝"的嘴巴 → 危险命令自动拒绝）
+  │                     （桥模式预筛摘出危险命令 → 审批请求；反思层嘴巴保持"永远拒绝"作防御）
   ├─ ollama-thinking.ts 思考层 Ollama 实现（BrainInference：infer + reflect），CLI 对话模式用
   ├─ gemini-bridge-thinking.ts  桥服务（执行型，非 BrainInference）：
   │                     内嵌 HTTP 服务，接收网页内容 → 解析 tool_call → 裁决 → 执行 → 回填队列
@@ -93,7 +96,7 @@ v1 把桥做反了：CLI 驱动对话，插件把任务消息脚本化塞进网�
   · nose/hands/eyes：反射裁决与工具执行所需器官（构造注入，无全局状态）
   · signal：全局中断 AbortSignal（Ctrl+C 级联）；timeoutMs：单批执行超时（默认 300s，0 禁用）
   · logger：可选回调，宿主（cli）打印状态
-  · 内部：Reflection(nose, 永远拒绝的嘴巴) —— 危险命令自动拒绝
+  · 内部：预筛摘出危险命令 → 批量审批（POST /approval 逐条裁决）；Reflection(nose, 永远拒绝的嘴巴) —— 防御
 HTTP 服务（node:http，默认 127.0.0.1:8765）：
   GET  /task    长轮询：有回填消息立即返回 {message}；无则挂起约 25s 后 204
   POST /result  接收 {reply}（网页最新内容）→ 返回 {ok: true, processed: boolean}
@@ -131,13 +134,13 @@ loop.ts 的 #dispatch 删除，改用 executeTool（行为不变，loop 测试�
 ```json
 {"success":true,"data":"..."}
 ```
-2. 工具 terminal 参数 {"command":"rm -rf /"} → 已拒绝（USER_DENIED：危险命令自动拒绝，未执行）
+2. 工具 terminal 参数 {"command":"rm -rf /"} → 已拒绝（USER_DENIED：用户未授权，未执行）
 3. 工具 read_file 参数 {} → 已拒绝（INVALID_ARGS：参数不合法...）
 ```
 
 - 每调用一行：`N. 工具 {name} 参数 {args} → 成功/失败/已拒绝（原因）`
 - 成功/失败附 ActionResult 的 JSON 代码块（供 Gemini 对照继续）
-- 拒绝按错误码格式化：USER_DENIED → 危险命令自动拒绝；UNKNOWN_TOOL / INVALID_ARGS → 原文原因
+- 拒绝按错误码格式化：USER_DENIED → 未授权/审批超时；UNKNOWN_TOOL / INVALID_ARGS → 原文原因
 
 ### 插件侧（extensions/gemini-bridge/，v2 重写）
 
@@ -188,7 +191,7 @@ POST /result    {reply: string} → {ok: true, processed: boolean}；非法 → 
 
 - **自动模式**（开关开启）：回填消息经**模拟人类逐字输入**填入输入框后，按防检测设置（随机延迟区间，默认 3–8s）自动点击页面发送按钮；延迟回调时开关已关闭则不点击（竞态守卫）
 - **手动模式**（开关关闭）：仍自动回填（模拟输入），但不自动提交，由用户点击页面发送按钮；发送后插件照常监控下一轮回复
-- **危险命令自动拒绝**：桥服务注入"永远拒绝"的嘴巴，反思层危险裁决直接 USER_DENIED，拒绝说明随结果消息回填——无人值守，安全优先
+- **危险命令审批授权**：预筛摘出 → 审批请求下发 → 允许的执行 / 拒绝与超时回填说明；自动授权开关静默放行
 - 插件面板防检测设置：延迟区间（秒，min/max）+ 模拟输入开关；存入 chrome.storage.sync
 
 ## 测试策略（TDD）
@@ -199,7 +202,7 @@ POST /result    {reply: string} → {ok: true, processed: boolean}；非法 → 
   - POST 含 tool_call → processed: true → GET /task 取到「工具执行结果」消息（记录型 stub 器官断言执行）
   - POST 无 tool_call → processed: false（不回填）
   - 多个 tool_call 汇总为一条消息、全部执行
-  - 危险命令自动拒绝：不回填执行结果、stub 器官未被调用、消息含拒绝说明（confirm 不被调用）
+  - 危险命令审批：未授权不执行、stub 器官未被调用；允许后执行并回填结果
   - 未知工具 / 参数非法拒绝（INVALID_ARGS）
   - 相同内容重复 POST 只处理一次（第二次 processed: false）
   - 批超时（timeoutMs 短）：队列「执行超时」说明
