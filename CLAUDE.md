@@ -107,7 +107,7 @@ pnpm test     # vitest 全量运行（tests/ 目录，TDD 流程：先写测试�
 
 CLI 入口为 `bin/cli.ts`（处理 argv）。
 
-## 开发路线（4 阶段递进）
+## 开发路线（5 阶段递进）
 
 1. 骨架与类型（`package.json`/`tsconfig.json`、`src/types/` 与 `ActionResult` 契约）✅
 2. 双手与眼睛（file-reader、terminal、file-writer、risk-checker）✅
