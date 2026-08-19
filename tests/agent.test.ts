@@ -103,9 +103,16 @@ describe("HumanAgent", () => {
   });
 
   it("默认组装的大脑为 OllamaThinking", async () => {
+    const savedBridgePort = process.env.GEMINI_BRIDGE_PORT;
+    delete process.env.GEMINI_BRIDGE_PORT;
     const agent = new HumanAgent({ ears: new FakeEars(["/exit"]), output: new FakeOutput() });
-    expect(agent.brain).toBeInstanceOf(OllamaThinking);
-    await agent.run();
+    try {
+      expect(agent.brain).toBeInstanceOf(OllamaThinking);
+      await agent.run();
+    } finally {
+      if (savedBridgePort !== undefined) process.env.GEMINI_BRIDGE_PORT = savedBridgePort;
+      else delete process.env.GEMINI_BRIDGE_PORT;
+    }
   });
 
   it("GEMINI_BRIDGE_PORT 环境变量启用 GeminiBridgeThinking", async () => {
@@ -113,6 +120,9 @@ describe("HumanAgent", () => {
     const agent = new HumanAgent({ ears: new FakeEars(["/exit"]), output: new FakeOutput() });
     try {
       expect(agent.brain).toBeInstanceOf(GeminiBridgeThinking);
+      if (agent.brain instanceof GeminiBridgeThinking) {
+        expect(await agent.brain.getPort()).toBe(8765);
+      }
       const status = await agent.run();
       expect(status).toBe("IDLE");
     } finally {
