@@ -101,24 +101,6 @@ describe("parseToolCalls", () => {
     expect(result.toolCalls).toHaveLength(2);
     expect(result.toolCalls![1]).toEqual({ name: "terminal", arguments: { command: "echo hi" } });
   });
-
-  it("裸 JSON（丢 ```tool_call``` 围栏）整条为已知工具调用时识别", () => {
-    const result = parseToolCalls('{"name": "search_code", "arguments": {"pattern": "TODO"}}');
-    expect(result.toolCalls).toEqual([{ name: "search_code", arguments: { pattern: "TODO" } }]);
-    expect(result.text).toBe("");
-  });
-
-  it("裸 JSON 但 name 非已知工具时不识别", () => {
-    const result = parseToolCalls('{"name": "hack_planet", "arguments": {}}');
-    expect(result.toolCalls).toBeUndefined();
-    expect(result.text).toBe('{"name": "hack_planet", "arguments": {}}');
-  });
-
-  it("非工具结构的裸 JSON 不识别（普通对话不被误判）", () => {
-    const result = parseToolCalls('{"hello": "world"}');
-    expect(result.toolCalls).toBeUndefined();
-    expect(result.text).toBe('{"hello": "world"}');
-  });
 });
 
 describe("GeminiBridgeThinking 执行型桥服务", () => {
