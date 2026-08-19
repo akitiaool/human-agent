@@ -15,6 +15,7 @@ const TASK_RETRY_MS = 1_000; // GET /task 无消息/失败后的重试间隔
 const TYPING_MIN_MS = 8; // 逐字输入每字符随机延时下限（防检测）
 const TYPING_MAX_MS = 40; // 逐字输入每字符随机延时上限（防检测）
 const REINJECT_SUPPRESS_MS = 5_000; // 新对话重新注入防抖窗口
+const BODY_CHECK_THROTTLE_MS = 200; // body 变更检查节流（虚拟滚动高频 churn 下不每次跑 querySelector）
 const LOG_MAX_LINES = 50;
 
 const SETTINGS_KEY = "geminiBridgeSettings";
@@ -223,10 +224,18 @@ function extractReply(turn) {
     .join("\n");
 }
 
-// A3：完成信号（跨轮残留，仅作提前确认，主判据是稳定采样）
-function announcerReady() {
+// A3：完成信号。announcer 的 "Response ready." 文本跨轮残留，
+// 仅当它在本轮内容最后一次变化之后才转为 ready（上升沿时间戳晚于 lastContentChangeAt）才算完成信号；
+// 残留的旧 ready 状态不生效，只依赖连续稳定采样计数。
+let announcerPrevReady = false; // 上一轮采样时 announcer 是否已显示 "Response ready."
+let announcerReadySince = 0; // 最近一次 announcer 转为 ready 的时间戳
+
+function announcerReady(lastContentChangeAt) {
   const el = document.getElementById("cdk-live-announcer-0");
-  return Boolean(el && el.textContent.includes("Response ready."));
+  const ready = Boolean(el && el.textContent.includes("Response ready."));
+  if (ready && !announcerPrevReady) announcerReadySince = Date.now(); // 上升沿才刷新时间戳
+  announcerPrevReady = ready;
+  return ready && announcerReadySince > lastContentChangeAt;
 }
 
 // A4：输入框（普通 textarea，非 contenteditable）
@@ -293,7 +302,7 @@ async function clickSendWhenReady() {
 async function deliverMessage(text, source) {
   delivering = true;
   try {
-    setStatus("回填中（模拟输入）");
+    setStatus(settings.simulateTyping ? "回填中（模拟输入）" : "回填中");
     log(`${source === "reinject" ? "重新注入协议文本" : "任务消息到达"}：${truncate(text.replace(/\n/g, " "), 80)}`);
     if (!(await typeIntoInput(text))) {
       setStatus("错误");
@@ -380,8 +389,8 @@ async function postResult(reply) {
     log(`回传失败：${resp.error}`);
     return;
   }
-  lastPostedReply = reply; // 去重由服务侧兜底，插件侧避免无谓重发
   if (resp.ok) {
+    lastPostedReply = reply; // 仅成功回传才更新去重标记；失败时保持旧值，下轮采样继续重发
     log(`已回传回复（${reply.length} 字符，${resp.processed ? "已入队执行" : "服务侧忽略（无工具调用/重复）"}）`);
     if (!resp.processed) setStatus("待命");
     // processed 时保持「已抓取回复（等待执行）」，直到回填消息到达
@@ -394,16 +403,18 @@ async function postResult(reply) {
 async function monitorLoop() {
   let lastText = "";
   let stable = 0;
+  let lastContentChangeAt = 0; // 当前内容最后一次变化的时间戳
   while (true) {
     try {
       const turn = findLastModelTurn();
       const text = turn ? extractReply(turn) : "";
       if (text !== "" && text === lastText) {
         stable += 1;
-        if (announcerReady()) stable = STABLE_SAMPLES; // 完成信号可提前确认（A3）
+        if (announcerReady(lastContentChangeAt)) stable = STABLE_SAMPLES; // 完成信号可提前确认（A3）
       } else {
         stable = 0;
         lastText = text;
+        lastContentChangeAt = Date.now();
       }
       if (stable >= STABLE_SAMPLES && text !== "" && text !== lastPostedReply) {
         stable = 0;
@@ -419,6 +430,7 @@ async function monitorLoop() {
 // ---------- 新对话检测（A1）：观察器随容器变化重挂，触发协议文本重新注入 ----------
 
 let bodyObserver = null;
+let lastBodyCheck = 0; // body 变更回调节流时间戳
 let contentObserver = null;
 let observedContent = null;
 let lastTurnCount = 0;
@@ -429,6 +441,9 @@ function setupNewConversationWatcher() {
   hadSession = Boolean(document.querySelector("ms-chat-session"));
   rehangContentObserver();
   bodyObserver = new MutationObserver(() => {
+    const now = Date.now();
+    if (now - lastBodyCheck < BODY_CHECK_THROTTLE_MS) return; // 节流：虚拟滚动高频变更不每次现查
+    lastBodyCheck = now;
     const hasSession = Boolean(document.querySelector("ms-chat-session"));
     if (hadSession && !hasSession) onNewConversation("对话会话已移除"); // ① session 从 DOM 移除
     hadSession = hasSession;

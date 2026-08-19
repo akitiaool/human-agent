@@ -5,6 +5,7 @@
 
 const DEFAULT_BASE_URL = "http://127.0.0.1:8765";
 const GET_TASK_TIMEOUT_MS = 30_000; // 服务端长轮询约 25s 后 204，30s 超时兜底
+const POST_RESULT_TIMEOUT_MS = 10_000; // POST /result 超时兜底，避免服务端挂起时 sendResponse 悬置
 
 function resolveBase(baseUrl) {
   if (typeof baseUrl === "string" && /^https?:\/\//i.test(baseUrl)) {
@@ -52,11 +53,27 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
           sendResponse({ ok: false, error: "empty reply" });
           return;
         }
-        const res = await fetch(`${base}/result`, {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ reply }),
-        });
+        let res;
+        try {
+          res = await fetch(`${base}/result`, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ reply }),
+            signal: AbortSignal.timeout(POST_RESULT_TIMEOUT_MS),
+          });
+        } catch (err) {
+          // 超时/中断统一答 {ok:false, error}，不悬置 sendResponse
+          sendResponse({
+            ok: false,
+            error:
+              err?.name === "TimeoutError" || err?.name === "AbortError"
+                ? "POST /result 超时"
+                : err instanceof Error
+                  ? err.message
+                  : String(err),
+          });
+          return;
+        }
         if (res.ok) {
           let processed = false;
           try {
