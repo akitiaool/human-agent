@@ -154,7 +154,7 @@ describe("GeminiBridgeThinking 执行型桥服务", () => {
 
   it("多个 tool_call 汇总为一条消息并全部执行", async () => {
     const { port, organs } = await makeBridge();
-    await getMessage(port);
+    await getMessageText(port);
     const reply = [
       toolCall("read_file", { path: "a.txt" }),
       toolCall("terminal", { command: "echo hi" }),
@@ -264,9 +264,11 @@ describe("GeminiBridgeThinking 执行型桥服务", () => {
     await postReply(port, toolCall("terminal", { command: "rm -rf /" }));
     const body = await getMessage(port);
     expect(body?.type).toBe("approval");
+    const id = (body as { id: number }).id;
     controller.abort();
     await new Promise((r) => setTimeout(r, 50));
     expect(organs.calls).toEqual([]);
+    expect(await postApproval(port, id, [true])).toBe(404); // 审批条目已作废
   });
 
   it("参数非法的危险命令不进审批，直接 INVALID_ARGS 拒绝", async () => {

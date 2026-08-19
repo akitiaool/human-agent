@@ -209,7 +209,7 @@ export class GeminiBridgeThinking {
     return true;
   }
 
-  /** 单批流水线：预筛摘出危险命令 → 反思裁决其余 → 批量审批 → 按原 calls 顺序执行/拒绝 → 回填。 */
+  /** 单批流水线：预筛摘出危险命令 → 批量审批（await 裁决）→ 反思裁决其余 → 按原 calls 顺序执行/拒绝 → 回填。 */
   async #process(calls: readonly ToolCall[]): Promise<void> {
     if (this.#signal.aborted) return; // 全局中断：丢弃批次
     const batchSignal =
@@ -234,14 +234,14 @@ export class GeminiBridgeThinking {
       rest.push(call);
     }
 
-    // 批量审批：一条请求含全部危险命令；批中止时作废审批条目
+    // 批量审批：一条请求含全部危险命令；批中止时作废审批条目并清除兜底定时器
     let decision: ApprovalDecision | undefined;
     if (dangerous.length > 0) {
-      const { id, promise } = this.#requestApproval(dangerous);
+      const { id, promise, cancel } = this.#requestApproval(dangerous);
       try {
         decision = await Promise.race([promise, abortSignalPromise(batchSignal)]);
       } catch {
-        this.#approvals.delete(id);
+        cancel(); // 批中止：作废审批条目并清除兜底定时器（否则 CLI 退出被 timer 拖延）
         if (this.#signal.aborted) return; // 全局中断：丢弃批次
         this.#pushMessage(`⚠️ 工具执行超时（超过 ${this.#timeoutMs}ms），已终止`);
         return;
@@ -309,8 +309,12 @@ export class GeminiBridgeThinking {
     if (waiter !== undefined) waiter();
   }
 
-  /** 审批请求入队并返回裁决 promise；兜底超时（approvalTimeoutMs）全部按拒绝。 */
-  #requestApproval(calls: readonly ToolCall[]): { id: number; promise: Promise<ApprovalDecision> } {
+  /** 审批请求入队并返回裁决 promise 与 cancel（作废条目 + 清除兜底定时器）；兜底超时（approvalTimeoutMs）全部按拒绝。 */
+  #requestApproval(calls: readonly ToolCall[]): {
+    id: number;
+    promise: Promise<ApprovalDecision>;
+    cancel: () => void;
+  } {
     const id = this.#nextApprovalId++;
     let settle!: (decision: ApprovalDecision) => void;
     const timer = setTimeout(() => {
@@ -326,7 +330,14 @@ export class GeminiBridgeThinking {
     this.#outbox.push({ type: "approval", id, calls: [...calls] });
     this.#logger?.(`审批请求已入队（id ${id}，${calls.length} 条危险命令）`);
     this.#wakeWaiter();
-    return { id, promise };
+    return {
+      id,
+      promise,
+      cancel: () => {
+        this.#approvals.delete(id);
+        clearTimeout(timer);
+      },
+    };
   }
 
   /** 收扩展审批结果：已知且未处理的 id → 逐条放行；未知 id（已超时/已处理）→ 404。 */
