@@ -1,16 +1,16 @@
 import { ConversationContext } from "../brain/context.js";
 import { TOOLS } from "../brain/knowledge.js";
 import type { BrainInference, BrainInferenceResult, ToolCall } from "../brain/llm.js";
-import {
-  fail,
-  type ActionResult,
-  type AgentOutput,
-  type AgentPhase,
-  type AgentStatus,
-  type EarsContract,
-  type EyesContract,
-  type HandsContract,
+import type {
+  ActionResult,
+  AgentOutput,
+  AgentPhase,
+  AgentStatus,
+  EarsContract,
+  EyesContract,
+  HandsContract,
 } from "../types/index.js";
+import { executeTool } from "./executor.js";
 
 export interface AgentLoopOptions {
   brain: BrainInference;
@@ -224,42 +224,18 @@ export class AgentLoop {
         return;
       }
       this.#emit("ACTING", call.name);
-      const result = await this.#dispatch(call.name, call.arguments, turnSignal);
+      const result = await executeTool(
+        { eyes: this.#eyes, hands: this.#hands },
+        call.name,
+        call.arguments,
+        turnSignal,
+      );
       this.#finish(call.name, result);
       this.#context.add({ role: "tool", name: call.name, content: JSON.stringify(result) });
     }
     for (const item of verdict.blocked) {
       this.#finish(item.call.name, item.result);
       this.#context.add({ role: "tool", name: item.call.name, content: JSON.stringify(item.result) });
-    }
-  }
-
-  async #dispatch(
-    name: string,
-    args: Record<string, unknown>,
-    turnSignal: AbortSignal,
-  ): Promise<ActionResult<unknown>> {
-    switch (name) {
-      case "read_file":
-        return this.#eyes.readFile(args.path as string);
-      case "read_dir":
-        return this.#eyes.readDir(args.path as string);
-      case "search_code":
-        return this.#eyes.searchCode(args.pattern as string, args.dir as string | undefined);
-      case "write_file":
-        return this.#hands.writeFile(args.path as string, args.content as string);
-      case "apply_patch":
-        return this.#hands.applyPatch(args.path as string, args.patch as string);
-      case "terminal":
-        return this.#hands.executeCommand(
-          args.command as string,
-          turnSignal,
-          args.timeoutMs as number | undefined,
-        );
-      case "fetch_page":
-        return this.#eyes.fetchPageAsMarkdown(args.url as string);
-      default:
-        return fail("UNKNOWN_TOOL", `未知工具: ${name}`);
     }
   }
 
