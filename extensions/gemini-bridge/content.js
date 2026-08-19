@@ -14,15 +14,17 @@ const SAMPLE_INTERVAL_MS = 700; // 采样间隔（500ms–1s 区间）
 const TASK_RETRY_MS = 1_000; // GET /task 无消息后的重试间隔
 const BRIDGE_RETRY_MIN_MS = 1_000; // 桥不可达时的初始重试间隔
 const BRIDGE_RETRY_MAX_MS = 30_000; // 桥不可达时的重试间隔上限（指数退避）
-const TYPING_MIN_MS = 120; // 纠错重打每字符延时下限（真人键入节奏 120–350ms/字）
-const TYPING_MAX_MS = 350;
+const TYPING_MIN_MS = 200; // 纠错重打每字符延时下限（真人键入节奏 200–500ms/字）
+const TYPING_MAX_MS = 500;
 const TYPO_MAX = 2; // 每段最多错字数（模拟粘贴后纠错）
 const PASTE_GAP_MIN_MS = 400; // 段间停顿下限（模拟人工粘贴节奏）
 const PASTE_GAP_MAX_MS = 900; // 段间停顿上限
-const BACKSPACE_MIN_MS = 120; // 退格延时下限（退格键点按间隔 120–320ms）
-const BACKSPACE_MAX_MS = 320;
-const CORRECT_PAUSE_MIN_MS = 600; // 纠错前停顿下限（发现错字→思考→开始修改）
-const CORRECT_PAUSE_MAX_MS = 1_500;
+const BACKSPACE_MIN_MS = 150; // 退格延时下限（退格键点按间隔 150–450ms）
+const BACKSPACE_MAX_MS = 450;
+const CORRECT_PAUSE_MIN_MS = 1_000; // 纠错前停顿下限（发现错字→思考→开始修改）
+const CORRECT_PAUSE_MAX_MS = 2_500;
+const THINK_MIN_MS = 300; // 退格后重打前的「想字」停顿下限
+const THINK_MAX_MS = 800;
 const COMMON_CJK = "的了一是在不和有这大为中上国个"; // 中文错字候选（同音/高频字近似）
 const KB_ROWS = ["qwertyuiop", "asdfghjkl", "zxcvbnm"]; // 键盘相邻键（模拟手误）
 const REINJECT_SUPPRESS_MS = 5_000; // 新对话重新注入防抖窗口
@@ -100,7 +102,29 @@ panel.innerHTML = `
   box-shadow: 0 4px 16px rgba(0,0,0,.35); user-select: none;
   max-height: 70vh; display: flex; flex-direction: column;
 }
-#ha-panel .ha-title { font-weight: 700; margin-bottom: 6px; }
+#ha-panel .ha-title {
+  font-weight: 700; margin-bottom: 6px; display: flex;
+  align-items: center; justify-content: space-between; cursor: grab;
+}
+#ha-panel #ha-collapse {
+  background: #111; color: #9ca3af; border: 1px solid #4b5563;
+  border-radius: 4px; width: 20px; height: 20px; line-height: 1;
+  font: inherit; cursor: pointer; padding: 0;
+}
+#ha-panel #ha-collapse:hover { color: #e8e8e8; border-color: #6b7280; }
+#ha-ball {
+  position: fixed; right: 16px; bottom: 16px; z-index: 2147483647;
+  width: 40px; height: 40px; border-radius: 50%;
+  background: #1f1f1f; border: 1px solid #4b5563;
+  box-shadow: 0 4px 16px rgba(0,0,0,.35);
+  display: none; align-items: center; justify-content: center;
+  cursor: grab; user-select: none;
+}
+#ha-ball .ha-dot {
+  width: 12px; height: 12px; border-radius: 50%;
+  background: #3b82f6; box-shadow: 0 0 6px rgba(59,130,246,.6);
+}
+#ha-ball .ha-dot.ha-err { background: #ef4444; box-shadow: 0 0 6px rgba(239,68,68,.6); }
 #ha-panel .ha-badge {
   font-size: 10px; font-weight: 400; color: #9ca3af;
   border: 1px solid #4b5563; border-radius: 4px; padding: 0 4px; margin-left: 4px;
@@ -123,7 +147,10 @@ panel.innerHTML = `
   white-space: pre-wrap; word-break: break-all;
 }
 </style>
-<div class="ha-title">gemini-bridge<span class="ha-badge">v2 网页对话驱动</span></div>
+<div class="ha-title">
+  <span>gemini-bridge<span class="ha-badge">v2 网页对话驱动</span></span>
+  <button id="ha-collapse" title="收起为悬浮球">–</button>
+</div>
 <label class="ha-row">
   <input type="checkbox" id="ha-auto-mode"> 自动模式（自动提交回填消息）
 </label>
@@ -139,9 +166,9 @@ panel.innerHTML = `
 </div>
 <div class="ha-row">
   <span>分块长度</span>
-  <input type="number" id="ha-segment-min" min="10" max="500" step="10">
+  <input type="number" id="ha-segment-min" min="2" max="1024" step="1">
   <span>~</span>
-  <input type="number" id="ha-segment-max" min="10" max="500" step="10">
+  <input type="number" id="ha-segment-max" min="2" max="1024" step="1">
   <span>字符</span>
 </div>
 <div class="ha-row">
@@ -158,14 +185,94 @@ panel.innerHTML = `
 `;
 document.documentElement.appendChild(panel);
 
+// 悬浮球：面板收起后的最小形态（状态圆点），双击展开完整面板
+const ball = document.createElement("div");
+ball.id = "ha-ball";
+ball.title = "双击展开面板";
+ball.innerHTML = `<span class="ha-dot" id="ha-ball-dot"></span>`;
+document.documentElement.appendChild(ball);
+
 const statusEl = panel.querySelector("#ha-status");
 const logEl = panel.querySelector("#ha-log");
+const ballDot = ball.querySelector("#ha-ball-dot");
 
 function setStatus(text) {
   currentStatus = text;
   statusEl.textContent = text;
-  statusEl.classList.toggle("ha-err", text === "错误" || text === "桥未连接（重试中）");
+  const err = text === "错误" || text === "桥未连接（重试中）";
+  statusEl.classList.toggle("ha-err", err);
+  ballDot.classList.toggle("ha-err", err);
 }
+
+// ---------- 面板拖拽与悬浮球 ----------
+
+// 从 right/bottom 定位迁移到 left/top（getBoundingClientRect 当前坐标），此后拖拽只改 left/top
+function migrateToXY(el) {
+  const rect = el.getBoundingClientRect();
+  el.style.left = `${rect.left}px`;
+  el.style.top = `${rect.top}px`;
+  el.style.right = "auto";
+  el.style.bottom = "auto";
+}
+
+// 拖 handle 移动 target（指针按住移动，松开结束；不拦截按钮点击）
+function makeDraggable(handle, target) {
+  handle.addEventListener("pointerdown", (e) => {
+    if (e.button !== 0 || e.target.closest("button")) return;
+    migrateToXY(target);
+    const startX = e.clientX;
+    const startY = e.clientY;
+    const baseLeft = parseFloat(target.style.left);
+    const baseTop = parseFloat(target.style.top);
+    const move = (ev) => {
+      target.style.left = `${baseLeft + ev.clientX - startX}px`;
+      target.style.top = `${baseTop + ev.clientY - startY}px`;
+    };
+    const up = () => {
+      window.removeEventListener("pointermove", move);
+      window.removeEventListener("pointerup", up);
+    };
+    window.addEventListener("pointermove", move);
+    window.addEventListener("pointerup", up);
+  });
+}
+
+// 收起为悬浮球：面板与球共享位置，球显示在当前面板位置
+function collapsePanel() {
+  migrateToXY(panel);
+  ball.style.left = panel.style.left;
+  ball.style.top = panel.style.top;
+  ball.style.right = "auto";
+  ball.style.bottom = "auto";
+  panel.style.display = "none";
+  ball.style.display = "flex";
+}
+
+function expandPanel() {
+  if (ball.style.left) {
+    // 球被拖过：展开时面板落在球的位置
+    panel.style.left = ball.style.left;
+    panel.style.top = ball.style.top;
+    panel.style.right = "auto";
+    panel.style.bottom = "auto";
+  }
+  ball.style.display = "none";
+  panel.style.display = "flex";
+}
+
+makeDraggable(panel.querySelector(".ha-title"), panel);
+makeDraggable(ball, ball);
+panel.querySelector("#ha-collapse").addEventListener("click", collapsePanel);
+let lastBallClick = 0;
+ball.addEventListener("click", () => {
+  const now = Date.now();
+  if (now - lastBallClick < 300) {
+    expandPanel();
+    lastBallClick = 0; // 防展开后同位置快速单击再触发
+    return;
+  }
+  lastBallClick = now;
+});
 
 // 桥不可达降级：进入时状态切「桥未连接」并只记一条日志；返回本次退避间隔（调用方 sleep 后翻倍）
 function noteBridgeFailure(errText) {
@@ -196,8 +303,8 @@ function log(text) {
 // ---------- 设置持久化（chrome.storage.sync） ----------
 
 function clampSegment(min, max) {
-  let lo = Number.isFinite(min) ? Math.min(500, Math.max(10, Math.round(min))) : defaultSettings.segmentLenMin;
-  let hi = Number.isFinite(max) ? Math.min(500, Math.max(10, Math.round(max))) : defaultSettings.segmentLenMax;
+  let lo = Number.isFinite(min) ? Math.min(1024, Math.max(2, Math.round(min))) : defaultSettings.segmentLenMin;
+  let hi = Number.isFinite(max) ? Math.min(1024, Math.max(2, Math.round(max))) : defaultSettings.segmentLenMax;
   if (lo > hi) [lo, hi] = [hi, lo]; // 区间反转时对调
   return { segmentLenMin: lo, segmentLenMax: hi };
 }
@@ -408,6 +515,7 @@ async function pasteSegment(input, segStartCp, seg) {
     input.value = all.join("");
     input.dispatchEvent(new InputEvent("input", { bubbles: true, inputType: "deleteContentBackward" }));
     await sleep(randInt(BACKSPACE_MIN_MS, BACKSPACE_MAX_MS));
+    await sleep(randInt(THINK_MIN_MS, THINK_MAX_MS)); // 退格后停顿：想正确字
     all.splice(at, 0, f.correct); // 重打正确字符
     input.value = all.join("");
     input.dispatchEvent(new InputEvent("input", { bubbles: true, inputType: "insertText", data: f.correct }));
