@@ -49,7 +49,6 @@ export type AgentStatus = "IDLE" | "RUNNING" | "INTERRUPTED" | "ERROR";
 export type AgentPhase =
   | "LISTENING" // 听取指令
   | "THINKING" // 大脑思考
-  | "SNIFFING" // 鼻子嗅探
   | "ACTING" // 手眼执行
   | "FEEDBACK"; // 反馈结果
 

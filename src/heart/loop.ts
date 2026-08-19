@@ -1,5 +1,6 @@
 import { ConversationContext } from "../brain/context.js";
-import type { BrainInference, BrainInferenceResult, ToolCall, ToolInfo } from "../brain/llm.js";
+import { TOOLS } from "../brain/knowledge.js";
+import type { BrainInference, BrainInferenceResult, ToolCall } from "../brain/llm.js";
 import {
   fail,
   type ActionResult,
@@ -9,29 +10,11 @@ import {
   type EarsContract,
   type EyesContract,
   type HandsContract,
-  type MouthContract,
-  type NoseContract,
 } from "../types/index.js";
-import { z } from "zod";
-
-const TOOL_SCHEMAS = {
-  read_file: z.object({ path: z.string() }),
-  read_dir: z.object({ path: z.string() }),
-  search_code: z.object({ pattern: z.string(), dir: z.string().optional() }),
-  write_file: z.object({ path: z.string(), content: z.string() }),
-  apply_patch: z.object({ path: z.string(), patch: z.string() }),
-  terminal: z.object({
-    command: z.string(),
-    timeoutMs: z.number().int().positive().optional(),
-  }),
-  fetch_page: z.object({ url: z.string() }),
-} as const;
 
 export interface AgentLoopOptions {
   brain: BrainInference;
   ears: EarsContract;
-  nose: NoseContract;
-  mouth: MouthContract;
   eyes: EyesContract;
   hands: HandsContract;
   output: AgentOutput;
@@ -55,73 +38,12 @@ export function parseTimeout(input: string): number | null {
   return value * factor;
 }
 
-const TOOLS: readonly ToolInfo[] = [
-  {
-    name: "read_file",
-    description: "读取指定文件的内容",
-    parameters: { type: "object", properties: { path: { type: "string" } }, required: ["path"] },
-  },
-  {
-    name: "read_dir",
-    description: "列出指定目录的条目",
-    parameters: { type: "object", properties: { path: { type: "string" } }, required: ["path"] },
-  },
-  {
-    name: "search_code",
-    description: "在目录中检索匹配正则表达式的文件内容",
-    parameters: {
-      type: "object",
-      properties: { pattern: { type: "string" }, dir: { type: "string" } },
-      required: ["pattern"],
-    },
-  },
-  {
-    name: "write_file",
-    description: "写入文件内容（自动创建父目录）",
-    parameters: {
-      type: "object",
-      properties: { path: { type: "string" }, content: { type: "string" } },
-      required: ["path", "content"],
-    },
-  },
-  {
-    name: "apply_patch",
-    description: "对文件应用行级补丁",
-    parameters: {
-      type: "object",
-      properties: { path: { type: "string" }, patch: { type: "string" } },
-      required: ["path", "patch"],
-    },
-  },
-  {
-    name: "terminal",
-    description: "执行 shell 命令（可指定 timeoutMs 毫秒超时，超时自动终止）",
-    parameters: {
-      type: "object",
-      properties: {
-        command: { type: "string" },
-        timeoutMs: { type: "number", description: "命令超时毫秒数（可选，默认由任务超时控制）" },
-      },
-      required: ["command"],
-    },
-  },
-  {
-    name: "fetch_page",
-    description: "抓取网页并转换为 Markdown",
-    parameters: {
-      type: "object",
-      properties: { url: { type: "string" } },
-      required: ["url"],
-    },
-  },
-];
-
-/** 生命泵：听取指令 → 大脑思考 → 鼻子嗅探 → 手眼执行 → 反馈结果 → 循环/结束（设计文档 §3.2）。 */
+/** 生命泵：听取指令 → 大脑思考 → 反思裁决 → 放行路由到器官执行 → 反馈 → 循环/结束。
+ *  心脏只承担路由、承受力（任务/单命令超时、maxIterations、中断）与循环节拍；
+ *  可行性裁决（是否可行）属于大脑反思层，本类不再持有任何判断规则。 */
 export class AgentLoop {
   readonly #brain: BrainInference;
   readonly #ears: EarsContract;
-  readonly #nose: NoseContract;
-  readonly #mouth: MouthContract;
   readonly #eyes: EyesContract;
   readonly #hands: HandsContract;
   readonly #output: AgentOutput;
@@ -137,8 +59,6 @@ export class AgentLoop {
   constructor(options: AgentLoopOptions) {
     this.#brain = options.brain;
     this.#ears = options.ears;
-    this.#nose = options.nose;
-    this.#mouth = options.mouth;
     this.#eyes = options.eyes;
     this.#hands = options.hands;
     this.#output = options.output;
@@ -267,18 +187,7 @@ export class AgentLoop {
           return false;
         }
         this.#context.add({ role: "assistant", content: result.text, toolCalls: calls });
-        for (const call of calls) {
-          if (this.#signal.aborted) {
-            this.#status = "INTERRUPTED";
-            return true;
-          }
-          if (this.#turnTimedOut) {
-            this.#output.warn("任务超时，已终止本轮。");
-            return false;
-          }
-          const actionResult = await this.#execute(call, turnSignal);
-          this.#context.add({ role: "tool", name: call.name, content: JSON.stringify(actionResult) });
-        }
+        await this.#execute(calls, turnSignal);
       }
       this.#output.warn("已达到最大迭代次数，停止本轮推演。");
       return false;
@@ -288,32 +197,27 @@ export class AgentLoop {
     }
   }
 
-  async #execute(call: ToolCall, turnSignal: AbortSignal): Promise<ActionResult<unknown>> {
-    this.#emit("SNIFFING", call.name);
-    const schema = TOOL_SCHEMAS[call.name as keyof typeof TOOL_SCHEMAS];
-    if (schema === undefined) {
-      return this.#finish(call.name, fail("UNKNOWN_TOOL", `未知工具: ${call.name}`));
-    }
-    const parsed = schema.safeParse(call.arguments);
-    if (!parsed.success) {
-      const issues = parsed.error.issues
-        .map((issue) => `${issue.path.join(".")}: ${issue.message}`)
-        .join("; ");
-      return this.#finish(call.name, fail("INVALID_ARGS", `工具 ${call.name} 参数不合法: ${issues}`));
-    }
-    if (call.name === "terminal") {
-      const { command } = parsed.data as { command: string };
-      const risk = this.#nose.checkRisk(command);
-      if (risk === "DANGEROUS") {
-        const approved = await this.#mouth.confirm(`命令存在风险，是否执行？\n  ${command}`);
-        if (!approved) {
-          return this.#finish(call.name, fail("USER_DENIED", `用户拒绝了命令: ${command}`));
-        }
+  /** 反思裁决：放行的调用路由到器官执行，拦截的调用直接反馈错误（裁决规则在大脑，不在心脏）。 */
+  async #execute(calls: readonly ToolCall[], turnSignal: AbortSignal): Promise<void> {
+    const verdict = await this.#brain.reflect(calls);
+    for (const call of verdict.allowed) {
+      if (this.#signal.aborted) {
+        this.#status = "INTERRUPTED";
+        return;
       }
+      if (this.#turnTimedOut) {
+        this.#output.warn("任务超时，已终止本轮。");
+        return;
+      }
+      this.#emit("ACTING", call.name);
+      const result = await this.#dispatch(call.name, call.arguments, turnSignal);
+      this.#finish(call.name, result);
+      this.#context.add({ role: "tool", name: call.name, content: JSON.stringify(result) });
     }
-    this.#emit("ACTING", call.name);
-    const result = await this.#dispatch(call.name, parsed.data, turnSignal);
-    return this.#finish(call.name, result);
+    for (const item of verdict.blocked) {
+      this.#finish(item.call.name, item.result);
+      this.#context.add({ role: "tool", name: item.call.name, content: JSON.stringify(item.result) });
+    }
   }
 
   async #dispatch(

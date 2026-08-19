@@ -68,8 +68,6 @@ export class HumanAgent {
     const loop = new AgentLoop({
       brain: this.brain,
       ears: this.ears,
-      nose: this.nose,
-      mouth: this.mouth,
       eyes: this.eyes,
       hands: this.hands,
       output: this.output,

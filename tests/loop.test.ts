@@ -2,10 +2,7 @@ import { describe, expect, it, vi } from "vitest";
 import { ConversationContext } from "../src/brain/context.js";
 import { AgentLoop } from "../src/heart/loop.js";
 import { TextOutput } from "../src/mouth/text-output.js";
-import { AskUser } from "../src/mouth/ask-user.js";
-import { RiskChecker } from "../src/nose/risk-checker.js";
-import type { AgentPhase } from "../src/types/index.js";
-import type { EarsContract } from "../src/types/index.js";
+import { fail, type AgentPhase, type EarsContract } from "../src/types/index.js";
 import type { BrainInference, BrainInferenceResult, ReflectionVerdict, ToolCall, ToolInfo } from "../src/brain/llm.js";
 import {
   FakeEars,
@@ -13,7 +10,6 @@ import {
   ScriptedBrain,
   buildEyes,
   buildHands,
-  inputFrom,
 } from "./helpers.js";
 
 class HangingEars implements EarsContract {
@@ -79,7 +75,6 @@ function makeLoop(options: {
   brain: BrainInference;
   ears: EarsContract;
   signal: AbortSignal;
-  mouth?: AskUser;
   maxIterations?: number;
   timeoutMs?: number;
   onPhase?: (phase: AgentPhase, detail?: string) => void;
@@ -87,8 +82,6 @@ function makeLoop(options: {
   return new AgentLoop({
     brain: options.brain,
     ears: options.ears,
-    nose: new RiskChecker(),
-    mouth: options.mouth ?? new AskUser({ input: inputFrom("y\n") }),
     eyes: buildEyes(),
     hands: buildHands(),
     output: new TextOutput({ stdout: new FakeWritable(), intervalMs: 0 }),
@@ -147,8 +140,6 @@ describe("AgentLoop", () => {
     const loop = new AgentLoop({
       brain,
       ears: new FakeEars(["抓网页", "/exit"]),
-      nose: new RiskChecker(),
-      mouth: new AskUser({ input: inputFrom("y\n") }),
       eyes: buildEyes({ fetchImpl }),
       hands: buildHands(),
       output: new TextOutput({ stdout: new FakeWritable(), intervalMs: 0 }),
@@ -186,53 +177,23 @@ describe("AgentLoop", () => {
     expect(firstCall.some((m) => m.role === "assistant")).toBe(true);
   });
 
-  it("危险命令经用户拒绝后不执行，结果反馈为 USER_DENIED", async () => {
-    const brain = new ScriptedBrain([
-      {
-        result: {
-          text: "",
-          toolCalls: [{ name: "terminal", arguments: { command: "echo rm -rf /" } }],
-        },
-      },
-      { result: { text: "已跳过" } },
-    ]);
+  it("被反思层拦截的调用作为失败结果反馈给大脑", async () => {
+    const call = { name: "terminal", arguments: { command: "echo rm -rf /" } };
+    const brain = new ScriptedBrain(
+      [
+        { result: { text: "", toolCalls: [call] } },
+        { result: { text: "已跳过" } },
+      ],
+      { allowed: [], blocked: [{ call, result: fail("USER_DENIED", "用户拒绝了命令") }] },
+    );
     const signal = new AbortController().signal;
-    const loop = makeLoop({
-      brain,
-      ears: new FakeEars(["删除它", "/exit"]),
-      signal,
-      mouth: new AskUser({ input: inputFrom("n\n") }),
-    });
+    const loop = makeLoop({ brain, ears: new FakeEars(["删除它", "/exit"]), signal });
     await loop.run();
     const toolMessage = brain.messagesOf(1).find((m) => m.role === "tool");
     expect(toolMessage).toBeDefined();
     const parsed = JSON.parse(toolMessage!.content) as { success: boolean; error?: { code: string } };
     expect(parsed.success).toBe(false);
     expect(parsed.error?.code).toBe("USER_DENIED");
-  });
-
-  it("危险命令经用户确认后正常执行", async () => {
-    const brain = new ScriptedBrain([
-      {
-        result: {
-          text: "",
-          toolCalls: [{ name: "terminal", arguments: { command: "echo approved-run" } }],
-        },
-      },
-      { result: { text: "已执行" } },
-    ]);
-    const signal = new AbortController().signal;
-    const loop = makeLoop({
-      brain,
-      ears: new FakeEars(["执行", "/exit"]),
-      signal,
-      mouth: new AskUser({ input: inputFrom("y\n") }),
-    });
-    await loop.run();
-    const toolMessage = brain.messagesOf(1).find((m) => m.role === "tool");
-    const parsed = JSON.parse(toolMessage!.content) as { success: boolean; data?: string };
-    expect(parsed.success).toBe(true);
-    expect(parsed.data).toContain("approved-run");
   });
 
   it("输入为空或 /exit 时退出且不调用大脑", async () => {
@@ -271,8 +232,6 @@ describe("AgentLoop", () => {
     const loop = new AgentLoop({
       brain: new TimeoutThenAnswerBrain(),
       ears: new FakeEars(["/timeout 20", "任务", "继续", "/exit"]),
-      nose: new RiskChecker(),
-      mouth: new AskUser({ input: inputFrom("y\n") }),
       eyes: buildEyes(),
       hands: buildHands(),
       output: new TextOutput({ stdout: stream, intervalMs: 0 }),
@@ -292,8 +251,6 @@ describe("AgentLoop", () => {
     const loop = new AgentLoop({
       brain: new ScriptedBrain([{ result: { text: "回答" } }]),
       ears: new FakeEars(["/timeout abc", "问题", "/exit"]),
-      nose: new RiskChecker(),
-      mouth: new AskUser({ input: inputFrom("y\n") }),
       eyes: buildEyes(),
       hands: buildHands(),
       output: new TextOutput({ stdout: stream, intervalMs: 0 }),
@@ -310,8 +267,6 @@ describe("AgentLoop", () => {
     const loop = new AgentLoop({
       brain: new TimeoutThenAnswerBrain(),
       ears: new FakeEars(["任务", "再来一条", "/exit"]),
-      nose: new RiskChecker(),
-      mouth: new AskUser({ input: inputFrom("y\n") }),
       eyes: buildEyes(),
       hands: buildHands(),
       output: new TextOutput({ stdout: stream, intervalMs: 0 }),
@@ -363,8 +318,6 @@ describe("AgentLoop", () => {
     const loop = new AgentLoop({
       brain,
       ears: new FakeEars(["hi", "/exit"]),
-      nose: new RiskChecker(),
-      mouth: new AskUser({ input: inputFrom("y\n") }),
       eyes: buildEyes(),
       hands: buildHands(),
       output,
@@ -385,8 +338,6 @@ describe("AgentLoop", () => {
     const loop = new AgentLoop({
       brain,
       ears: new FakeEars(["hi", "/exit"]),
-      nose: new RiskChecker(),
-      mouth: new AskUser({ input: inputFrom("y\n") }),
       eyes: buildEyes(),
       hands: buildHands(),
       output,
@@ -399,7 +350,7 @@ describe("AgentLoop", () => {
     expect(loop.getStatus()).toBe("IDLE");
   });
 
-  it("按 听→想→嗅→执行→反馈→想 顺序发出阶段事件", async () => {
+  it("按 听→想→执行→反馈→想 顺序发出阶段事件", async () => {
     const phases: AgentPhase[] = [];
     const brain = new ScriptedBrain([
       {
@@ -418,10 +369,9 @@ describe("AgentLoop", () => {
       onPhase: (phase) => phases.push(phase),
     });
     await loop.run();
-    expect(phases.slice(0, 6)).toEqual([
+    expect(phases.slice(0, 5)).toEqual([
       "LISTENING",
       "THINKING",
-      "SNIFFING",
       "ACTING",
       "FEEDBACK",
       "THINKING",
@@ -468,8 +418,6 @@ describe("AgentLoop", () => {
     const loop = new AgentLoop({
       brain,
       ears: new FakeEars(["q1", "q2", "/exit"]),
-      nose: new RiskChecker(),
-      mouth: new AskUser({ input: inputFrom("y\n") }),
       eyes: buildEyes(),
       hands: buildHands(),
       output,
