@@ -108,6 +108,7 @@ export class GeminiBridgeThinking implements BrainInference {
     const message =
       increment === "" ? serializeToolProtocol() : `${serializeToolProtocol()}\n\n${increment}`;
     const reply = await this.#publish(message, signal);
+    this.#sentCount = context.getAll().length;
     return parseToolCalls(reply);
   }
 
@@ -115,11 +116,12 @@ export class GeminiBridgeThinking implements BrainInference {
     return this.#reflection.reflect(calls);
   }
 
-  /** 页面会话保留历史，每轮只发上次发送之后的新消息（新指令 / 工具结果）。 */
+  /** 页面会话保留历史，每轮只发上次成功发送之后的新消息（新指令 / 工具结果）。
+   *  光标只在发布成功后于 infer 中推进；上下文被裁剪收缩到光标以下时从索引 0 重发
+   *  （system 消息映射为空串被过滤），页面重复可接受，工具结果漏发不可接受。 */
   #collectIncrement(context: ConversationContext): string {
     const all = context.getAll();
-    const start = Math.min(this.#sentCount, all.length);
-    this.#sentCount = all.length;
+    const start = all.length < this.#sentCount ? 0 : this.#sentCount;
     return all
       .slice(start)
       .map(toIncrementText)
@@ -151,11 +153,12 @@ export class GeminiBridgeThinking implements BrainInference {
   }
 
   #armTimeout(task: PendingTask): void {
+    // 回传超时须大于插件侧 waitReplyReady(120s) 上限，人工模式下用户操作延迟不应丢回复
     task.timer = setTimeout(() => {
       this.#pending.delete(task.id);
       this.#inflight.delete(task.id);
       task.reject(new Error("等待插件回传超时"));
-    }, 60_000);
+    }, 150_000);
   }
 
   #handleRequest(req: http.IncomingMessage, res: http.ServerResponse): void {

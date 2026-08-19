@@ -187,7 +187,21 @@ export class AgentLoop {
           return false;
         }
         this.#context.add({ role: "assistant", content: result.text, toolCalls: calls });
-        await this.#execute(calls, turnSignal);
+        try {
+          await this.#execute(calls, turnSignal);
+        } catch (err) {
+          if (this.#signal.aborted) {
+            this.#status = "INTERRUPTED";
+            return true;
+          }
+          if (this.#turnTimedOut) {
+            this.#output.warn("任务超时，已终止本轮。");
+            return false;
+          }
+          this.#status = "ERROR";
+          this.#output.error(`执行阶段失败: ${err instanceof Error ? err.message : String(err)}`);
+          return true;
+        }
       }
       this.#output.warn("已达到最大迭代次数，停止本轮推演。");
       return false;

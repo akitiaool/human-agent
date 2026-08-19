@@ -431,4 +431,33 @@ describe("AgentLoop", () => {
       "q2",
     ]);
   });
+
+  it("反思层抛错时状态为 ERROR 且异常不逃逸（异常即反馈）", async () => {
+    class ReflectBoomBrain implements BrainInference {
+      async infer(): Promise<BrainInferenceResult> {
+        return {
+          text: "",
+          toolCalls: [{ name: "terminal", arguments: { command: "echo boom" } }],
+        };
+      }
+      async reflect(): Promise<ReflectionVerdict> {
+        throw new Error("reflect boom");
+      }
+    }
+    const signal = new AbortController().signal;
+    const stream = new FakeWritable();
+    const output = new TextOutput({ stdout: stream, intervalMs: 0 });
+    const loop = new AgentLoop({
+      brain: new ReflectBoomBrain(),
+      ears: new FakeEars(["hi", "/exit"]),
+      eyes: buildEyes(),
+      hands: buildHands(),
+      output,
+      signal,
+    });
+    await loop.run();
+    expect(loop.getStatus()).toBe("ERROR");
+    expect(stream.output).toContain("执行阶段失败");
+    expect(stream.output).toContain("reflect boom");
+  });
 });

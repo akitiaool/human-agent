@@ -165,4 +165,56 @@ describe("GeminiBridgeThinking", () => {
     await postResult(port, task.id, "收到");
     expect((await inferPromise).text).toBe("收到");
   });
+
+  it("发布中断后光标不回退：下一轮重发未成功发布的增量", async () => {
+    const { bridge, port } = await makeBridge();
+    const context = contextOf({ role: "user", content: "首轮指令" });
+    const controller = new AbortController();
+    const first = bridge.infer(context, TOOLS, controller.signal);
+    const task1 = (await (await fetch(`http://127.0.0.1:${port}/task`)).json()) as { id: string };
+    controller.abort();
+    await expect(first).rejects.toThrow("aborted");
+    context.add({ role: "user", content: "第二轮指令" });
+    const second = bridge.infer(context, TOOLS);
+    const task2 = (await (await fetch(`http://127.0.0.1:${port}/task`)).json()) as {
+      id: string;
+      message: string;
+    };
+    expect(task2.message).toContain("首轮指令");
+    expect(task2.message).toContain("第二轮指令");
+    await postResult(port, task2.id, "完成");
+    await second;
+  });
+
+  it("上下文裁剪后从最早消息重发：工具结果不漏发", async () => {
+    // maxTokens=100（约 4 字符/token）：首轮两条指令共 2 token；
+    // 追加 400 字符 assistant 消息（100 token）触发裁剪清掉两条 user，
+    // 再追加 tool 消息（4 token）使总量 104 > 100 再次裁剪掉 assistant——
+    // 上下文收缩到只剩 tool 消息（长度 1 < 光标 2），必须从索引 0 重发。
+    const { bridge, port } = await makeBridge();
+    const context = new ConversationContext({ maxTokens: 100 });
+    context.add({ role: "user", content: "第一轮" });
+    context.add({ role: "user", content: "第二轮" });
+    const first = bridge.infer(context, TOOLS);
+    const task1 = (await (await fetch(`http://127.0.0.1:${port}/task`)).json()) as { id: string };
+    await postResult(port, task1.id, "好");
+    await first;
+    context.add({ role: "assistant", content: "x".repeat(400) });
+    context.add({ role: "tool", name: "terminal", content: '{"success":true}' });
+    const second = bridge.infer(context, TOOLS);
+    const task2 = (await (await fetch(`http://127.0.0.1:${port}/task`)).json()) as {
+      id: string;
+      message: string;
+    };
+    expect(task2.message).toContain("工具 terminal 返回");
+    await postResult(port, task2.id, "完成");
+    await second;
+  });
+
+  it("close() 释放等待中的 infer", async () => {
+    const { bridge } = await makeBridge();
+    const inferPromise = bridge.infer(contextOf({ role: "user", content: "hi" }), TOOLS);
+    bridge.close();
+    await expect(inferPromise).rejects.toThrow("已关闭");
+  });
 });

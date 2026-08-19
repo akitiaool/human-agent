@@ -184,7 +184,7 @@ async function poll() {
       const delay = SEND_DELAY_MIN + Math.random() * (SEND_DELAY_MAX - SEND_DELAY_MIN);
       setStatus(`自动发送（${Math.round(delay / 1000)}s 后）`);
       setTimeout(() => {
-        if (pendingTask === null || awaitingReply) return;
+        if (pendingTask === null || awaitingReply || !autoSend) return;
         if (!clickSend()) log("未找到发送按钮，请手动点击页面发送按钮");
       }, delay);
     } else {
