@@ -14,13 +14,15 @@ const SAMPLE_INTERVAL_MS = 700; // 采样间隔（500ms–1s 区间）
 const TASK_RETRY_MS = 1_000; // GET /task 无消息后的重试间隔
 const BRIDGE_RETRY_MIN_MS = 1_000; // 桥不可达时的初始重试间隔
 const BRIDGE_RETRY_MAX_MS = 30_000; // 桥不可达时的重试间隔上限（指数退避）
-const TYPING_MIN_MS = 30; // 纠错重打每字符随机延时下限
-const TYPING_MAX_MS = 80; // 纠错重打每字符随机延时上限
+const TYPING_MIN_MS = 120; // 纠错重打每字符延时下限（真人键入节奏 120–350ms/字）
+const TYPING_MAX_MS = 350;
 const TYPO_MAX = 2; // 每段最多错字数（模拟粘贴后纠错）
 const PASTE_GAP_MIN_MS = 400; // 段间停顿下限（模拟人工粘贴节奏）
 const PASTE_GAP_MAX_MS = 900; // 段间停顿上限
-const BACKSPACE_MIN_MS = 40; // 退格/重打字符延时下限
-const BACKSPACE_MAX_MS = 90;
+const BACKSPACE_MIN_MS = 120; // 退格延时下限（退格键点按间隔 120–320ms）
+const BACKSPACE_MAX_MS = 320;
+const CORRECT_PAUSE_MIN_MS = 600; // 纠错前停顿下限（发现错字→思考→开始修改）
+const CORRECT_PAUSE_MAX_MS = 1_500;
 const COMMON_CJK = "的了一是在不和有这大为中上国个"; // 中文错字候选（同音/高频字近似）
 const KB_ROWS = ["qwertyuiop", "asdfghjkl", "zxcvbnm"]; // 键盘相邻键（模拟手误）
 const REINJECT_SUPPRESS_MS = 5_000; // 新对话重新注入防抖窗口
@@ -36,7 +38,8 @@ const defaultSettings = {
   simulateTyping: true,
   delayMinSec: 3,
   delayMaxSec: 8,
-  segmentLen: 60, // 分段粘贴长度（字符）
+  segmentLenMin: 25, // 分块长度下限（字符，每块在区间内随机，避免等长分段暴露自动化）
+  segmentLenMax: 80, // 分块长度上限
   typoChance: 40, // 每段触发「粘贴错字→退格→重打」纠错的概率（%）
 };
 
@@ -135,8 +138,10 @@ panel.innerHTML = `
   <span>秒</span>
 </div>
 <div class="ha-row">
-  <span>分段长度</span>
-  <input type="number" id="ha-segment-len" min="10" max="500" step="10">
+  <span>分块长度</span>
+  <input type="number" id="ha-segment-min" min="10" max="500" step="10">
+  <span>~</span>
+  <input type="number" id="ha-segment-max" min="10" max="500" step="10">
   <span>字符</span>
 </div>
 <div class="ha-row">
@@ -190,8 +195,11 @@ function log(text) {
 
 // ---------- 设置持久化（chrome.storage.sync） ----------
 
-function clampSegmentLen(v) {
-  return Number.isFinite(v) ? Math.min(500, Math.max(10, Math.round(v))) : defaultSettings.segmentLen;
+function clampSegment(min, max) {
+  let lo = Number.isFinite(min) ? Math.min(500, Math.max(10, Math.round(min))) : defaultSettings.segmentLenMin;
+  let hi = Number.isFinite(max) ? Math.min(500, Math.max(10, Math.round(max))) : defaultSettings.segmentLenMax;
+  if (lo > hi) [lo, hi] = [hi, lo]; // 区间反转时对调
+  return { segmentLenMin: lo, segmentLenMax: hi };
 }
 
 function clampTypoChance(v) {
@@ -203,7 +211,8 @@ function applySettingsToPanel() {
   panel.querySelector("#ha-simulate").checked = settings.simulateTyping;
   panel.querySelector("#ha-delay-min").value = settings.delayMinSec;
   panel.querySelector("#ha-delay-max").value = settings.delayMaxSec;
-  panel.querySelector("#ha-segment-len").value = settings.segmentLen;
+  panel.querySelector("#ha-segment-min").value = settings.segmentLenMin;
+  panel.querySelector("#ha-segment-max").value = settings.segmentLenMax;
   panel.querySelector("#ha-typo-chance").value = settings.typoChance;
   panel.querySelector("#ha-base-url").value = settings.baseUrl;
 }
@@ -240,8 +249,17 @@ function setupPanelEvents() {
     applySettingsToPanel();
     scheduleSaveSettings();
   });
-  panel.querySelector("#ha-segment-len").addEventListener("change", (e) => {
-    settings.segmentLen = clampSegmentLen(Number(e.target.value));
+  panel.querySelector("#ha-segment-min").addEventListener("change", (e) => {
+    const { segmentLenMin, segmentLenMax } = clampSegment(Number(e.target.value), settings.segmentLenMax);
+    settings.segmentLenMin = segmentLenMin;
+    settings.segmentLenMax = segmentLenMax;
+    applySettingsToPanel();
+    scheduleSaveSettings();
+  });
+  panel.querySelector("#ha-segment-max").addEventListener("change", (e) => {
+    const { segmentLenMin, segmentLenMax } = clampSegment(settings.segmentLenMin, Number(e.target.value));
+    settings.segmentLenMin = segmentLenMin;
+    settings.segmentLenMax = segmentLenMax;
     applySettingsToPanel();
     scheduleSaveSettings();
   });
@@ -326,15 +344,22 @@ function findSendButton() {
 // A4：模拟人类分段粘贴输入。整段瞬间填入（模拟 Ctrl+V），
 // 按概率在段内预留错别字 → 退格删除 → 逐字重打正确字符，段间随机停顿。
 // 不做匀速逐字输入（无防检测意义且回填慢）。
-function splitSegments(text, len) {
+// 分块长度在 [minLen, maxLen] 区间内逐块随机（等长分段会暴露自动化）；
+// 剩余不足 minLen 时并入当前块收尾，不产生碎片块。
+function splitSegments(text, minLen, maxLen) {
   const segs = [];
   let i = 0;
   while (i < text.length) {
-    let end = Math.min(i + len, text.length);
-    if (end < text.length) {
-      const nl = text.lastIndexOf("\n", end); // 就近行断点分段
-      if (nl > i + len / 2) end = nl + 1;
+    const remaining = text.length - i;
+    let len = randInt(minLen, maxLen);
+    if (remaining <= maxLen) {
+      segs.push(text.slice(i)); // 收尾块
+      break;
     }
+    if (remaining - len < minLen) len = remaining; // 剩余太少则并入本块（可能略超上限，真实粘贴本就无精确边界）
+    let end = Math.min(i + len, text.length);
+    const nl = text.lastIndexOf("\n", end); // 就近行断点分段
+    if (nl > i + minLen / 2) end = nl + 1;
     segs.push(text.slice(i, end));
     i = end;
   }
@@ -375,7 +400,7 @@ async function pasteSegment(input, segStartCp, seg) {
   input.value += written;
   input.dispatchEvent(new InputEvent("input", { bubbles: true, inputType: "insertText", data: written }));
   if (fixes.length === 0) return;
-  await sleep(randInt(200, 500)); // 粘贴后停顿，再开始纠错
+  await sleep(randInt(CORRECT_PAUSE_MIN_MS, CORRECT_PAUSE_MAX_MS)); // 纠错前停顿：发现错字→思考→开始修改
   let all = Array.from(input.value); // 码点数组（避免代理对与 slice 偏移不一致）
   for (const f of [...fixes].sort((a, b) => b.pos - a.pos)) {
     const at = segStartCp + f.pos;
@@ -402,9 +427,9 @@ async function typeIntoInput(text) {
   if (settings.simulateTyping) {
     await sleep(randInt(300, 800)); // 初始停顿，模拟人类开始输入前的思考
     let segStartCp = 0;
-    for (const seg of splitSegments(text, settings.segmentLen)) {
+    for (const seg of splitSegments(text, settings.segmentLenMin, settings.segmentLenMax)) {
       await pasteSegment(input, segStartCp, seg);
-      segStartCp += seg.length;
+      segStartCp += [...seg].length; // 码点偏移（length 为 UTF-16 单位，非 BMP 字符会漂移）
       await sleep(randInt(PASTE_GAP_MIN_MS, PASTE_GAP_MAX_MS)); // 段间停顿
     }
   } else {
@@ -647,13 +672,20 @@ async function init() {
   const saved = stored[SETTINGS_KEY];
   if (saved && typeof saved === "object") {
     const { delayMinSec, delayMaxSec } = clampDelay(Number(saved.delayMinSec), Number(saved.delayMaxSec));
+    // 旧版 segmentLen 单值迁移：以旧值 ±20 生成区间
+    const legacy = Number(saved.segmentLen);
+    const { segmentLenMin, segmentLenMax } = clampSegment(
+      Number.isFinite(Number(saved.segmentLenMin)) ? Number(saved.segmentLenMin) : legacy - 20,
+      Number.isFinite(Number(saved.segmentLenMax)) ? Number(saved.segmentLenMax) : legacy + 20,
+    );
     settings = {
       ...defaultSettings,
       ...saved,
       baseUrl: normalizeBaseUrl(saved.baseUrl),
       delayMinSec,
       delayMaxSec,
-      segmentLen: clampSegmentLen(Number(saved.segmentLen)),
+      segmentLenMin,
+      segmentLenMax,
       typoChance: clampTypoChance(Number(saved.typoChance)),
       autoMode: typeof saved.autoMode === "boolean" ? saved.autoMode : defaultSettings.autoMode,
       simulateTyping:
