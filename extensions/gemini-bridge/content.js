@@ -153,35 +153,46 @@ function sleep(ms) {
 
 // ---------- 双向通道 ----------
 async function submit(task, reply) {
-  await chrome.runtime.sendMessage({ type: "submit-result", id: task.id, reply });
+  const resp = await chrome.runtime.sendMessage({ type: "submit-result", id: task.id, reply });
   lastReply = reply;
   pendingTask = null;
   awaitingReply = false;
+  if (resp?.error) {
+    setStatus("回传失败");
+    log(`回传失败：${resp.error}`);
+    return;
+  }
   setStatus("已回传");
   log("已回传回复给 brain");
 }
 
+let polling = false;
 async function poll() {
-  if (pendingTask !== null || awaitingReply) return;
-  const resp = await chrome.runtime.sendMessage({ type: "get-task" });
-  if (!resp?.task) return;
-  pendingTask = resp.task;
-  log(`任务到达：${resp.task.message.slice(0, 100)}${resp.task.message.length > 100 ? "…" : ""}`);
-  if (!setInput(resp.task.message)) {
-    log("未找到输入框，稍后重试");
-    pendingTask = null;
-    return;
-  }
-  if (autoSend) {
-    const delay = SEND_DELAY_MIN + Math.random() * (SEND_DELAY_MAX - SEND_DELAY_MIN);
-    setStatus(`自动发送（${Math.round(delay / 1000)}s 后）`);
-    setTimeout(() => {
-      if (pendingTask === null || awaitingReply) return;
-      if (!clickSend()) log("未找到发送按钮，请手动点击页面发送按钮");
-    }, delay);
-  } else {
-    setStatus("待发送（手动）");
-    log("已填入输入框，请点击页面发送按钮提交");
+  if (polling || pendingTask !== null || awaitingReply) return;
+  polling = true;
+  try {
+    const resp = await chrome.runtime.sendMessage({ type: "get-task" });
+    if (!resp?.task) return;
+    pendingTask = resp.task;
+    log(`任务到达：${resp.task.message.slice(0, 100)}${resp.task.message.length > 100 ? "…" : ""}`);
+    if (!setInput(resp.task.message)) {
+      log("未找到输入框，任务已丢失");
+      pendingTask = null;
+      return;
+    }
+    if (autoSend) {
+      const delay = SEND_DELAY_MIN + Math.random() * (SEND_DELAY_MAX - SEND_DELAY_MIN);
+      setStatus(`自动发送（${Math.round(delay / 1000)}s 后）`);
+      setTimeout(() => {
+        if (pendingTask === null || awaitingReply) return;
+        if (!clickSend()) log("未找到发送按钮，请手动点击页面发送按钮");
+      }, delay);
+    } else {
+      setStatus("待发送（手动）");
+      log("已填入输入框，请点击页面发送按钮提交");
+    }
+  } finally {
+    polling = false;
   }
 }
 
