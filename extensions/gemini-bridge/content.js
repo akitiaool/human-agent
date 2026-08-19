@@ -44,6 +44,8 @@ const defaultSettings = {
   segmentLenMax: 1024, // 分块长度上限（正常文本回填尽量少分块）
   typoChance: 40, // 每段触发「粘贴错字→退格→重打」纠错的概率（%）
   speed: 1, // 回填速度倍率（0.5/1/2/4/10，回填过程中可即时修改）
+  autoApprove: false, // 自动授权危险命令：开=静默放行不弹窗
+  approvalTimeoutSec: 120, // 审批超时（秒），到点自动全部拒绝
 };
 
 let settings = { ...defaultSettings };
@@ -68,6 +70,12 @@ function sleep(ms) {
 function pacedSleep(ms) {
   const rate = settings.speed > 0 ? settings.speed : 1;
   return sleep(ms / rate);
+}
+
+function escapeHtml(text) {
+  const div = document.createElement("div");
+  div.textContent = String(text);
+  return div.innerHTML;
 }
 
 function randInt(min, max) {
@@ -181,6 +189,31 @@ panel.innerHTML = `
 #ha-log::-webkit-scrollbar-track { background: #111827; }
 #ha-log::-webkit-scrollbar-thumb { background: #4b5563; border-radius: 4px; }
 #ha-log::-webkit-scrollbar-thumb:hover { background: #6b7280; }
+.ha-approval-overlay {
+  position: fixed; inset: 0; z-index: 2147483646;
+  background: rgba(0,0,0,.55); display: flex; align-items: center; justify-content: center;
+}
+.ha-approval-box {
+  width: 420px; max-height: 70vh; overflow-y: auto; border-radius: 10px;
+  background: #1f1f1f; color: #e8e8e8; border: 1px solid #4b5563;
+  padding: 12px 14px; font: 13px/1.6 system-ui, sans-serif; color-scheme: dark;
+}
+.ha-approval-title { font-weight: 700; margin-bottom: 8px; }
+.ha-approval-count { font-weight: 400; font-size: 12px; color: #f59e0b; }
+.ha-approval-row { border: 1px solid #374151; border-radius: 6px; padding: 8px; margin: 6px 0; }
+.ha-approval-cmd {
+  font-family: ui-monospace, monospace; background: #111;
+  padding: 4px 8px; border-radius: 4px; word-break: break-all;
+}
+.ha-approval-hint { color: #fca5a5; font-size: 12px; margin: 4px 0; }
+.ha-approval-btns { display: flex; gap: 8px; }
+.ha-approval-btns button, .ha-approval-foot button {
+  background: #111; color: #e8e8e8; border: 1px solid #4b5563;
+  border-radius: 4px; padding: 3px 10px; font: inherit; cursor: pointer;
+}
+.ha-approval-btns .ha-allow, .ha-approval-foot .ha-allow-all { border-color: #166534; color: #86efac; }
+.ha-approval-btns .ha-deny, .ha-approval-foot .ha-deny-all { border-color: #7f1d1d; color: #fca5a5; }
+.ha-approval-foot { display: flex; gap: 8px; margin-top: 8px; justify-content: flex-end; }
 </style>
 <div class="ha-title">
   <span>gemini-bridge<span class="ha-badge">v2 网页对话驱动</span></span>
@@ -192,6 +225,14 @@ panel.innerHTML = `
 <label class="ha-row">
   <input type="checkbox" id="ha-simulate"> 模拟人类逐字输入
 </label>
+<label class="ha-row">
+  <input type="checkbox" id="ha-auto-approve"> 自动授权危险命令
+</label>
+<div class="ha-row">
+  <span>审批超时</span>
+  <input type="number" id="ha-approval-timeout" min="10" max="600" step="10">
+  <span>秒</span>
+</div>
 <div class="ha-row">
   <span>提交延迟</span>
   <input type="number" id="ha-delay-min" min="0" max="600" step="0.5">
@@ -254,6 +295,7 @@ const TONE_CLASSES = [
 function statusTone(text) {
   if (text === "错误") return "ha-tone-err";
   if (text === "桥未连接（重试中）") return "ha-tone-warn";
+  if (text === "等待授权") return "ha-tone-warn";
   if (text.includes("回填中")) return "ha-tone-busy";
   if (text.includes("自动提交")) return "ha-tone-go";
   if (text.includes("等待 Gemini")) return "ha-tone-wait";
@@ -385,6 +427,10 @@ function clampSpeed(v) {
   return [0.5, 1, 2, 4, 10].includes(s) ? s : defaultSettings.speed;
 }
 
+function clampApprovalTimeout(v) {
+  return Number.isFinite(v) ? Math.min(600, Math.max(10, Math.round(v))) : defaultSettings.approvalTimeoutSec;
+}
+
 function applySettingsToPanel() {
   panel.querySelector("#ha-auto-mode").checked = settings.autoMode;
   panel.querySelector("#ha-simulate").checked = settings.simulateTyping;
@@ -395,6 +441,8 @@ function applySettingsToPanel() {
   panel.querySelector("#ha-typo-chance").value = settings.typoChance;
   panel.querySelector("#ha-speed").value = settings.speed;
   panel.querySelector("#ha-base-url").value = settings.baseUrl;
+  panel.querySelector("#ha-auto-approve").checked = settings.autoApprove;
+  panel.querySelector("#ha-approval-timeout").value = settings.approvalTimeoutSec;
 }
 
 function scheduleSaveSettings() {
@@ -453,6 +501,17 @@ function setupPanelEvents() {
     applySettingsToPanel();
     scheduleSaveSettings();
     log(`回填速度：${settings.speed}x（下次节奏立即生效）`);
+  });
+  panel.querySelector("#ha-auto-approve").addEventListener("change", (e) => {
+    settings.autoApprove = e.target.checked;
+    applySettingsToPanel();
+    scheduleSaveSettings();
+    log(`自动授权危险命令：${settings.autoApprove ? "开" : "关"}`);
+  });
+  panel.querySelector("#ha-approval-timeout").addEventListener("change", (e) => {
+    settings.approvalTimeoutSec = clampApprovalTimeout(Number(e.target.value));
+    applySettingsToPanel();
+    scheduleSaveSettings();
   });
   panel.querySelector("#ha-log-clear").addEventListener("click", () => {
     logEl.textContent = "";
@@ -665,6 +724,102 @@ async function clickSendWhenReady() {
   return true;
 }
 
+// ---------- 审批：危险命令授权（弹窗/自动授权）→ POST /approval ----------
+
+async function postApproval(id, allowed) {
+  try {
+    const resp = await chrome.runtime.sendMessage({ type: "approve", id, allowed, baseUrl: settings.baseUrl });
+    if (resp?.ok === true) return true;
+    if (resp?.status === 404) {
+      log("审批请求已过期（桥服务已按超时拒绝），跳过");
+      return true; // 桥已兜底处理并回填拒绝行，流程继续
+    }
+    noteBridgeFailure(resp?.error ?? "POST /approval 失败");
+    return false;
+  } catch (err) {
+    noteBridgeFailure(err instanceof Error ? err.message : String(err));
+    return false;
+  }
+}
+
+async function handleApproval(item) {
+  if (settings.autoApprove) {
+    log(`自动授权已开启：静默放行 ${item.calls.length} 条危险命令`);
+    if (!(await postApproval(item.id, item.calls.map(() => true)))) setStatus("错误");
+    return;
+  }
+  setStatus("等待授权");
+  log(`收到审批请求（${item.calls.length} 条危险命令），等待授权…`);
+  const decision = await showApprovalDialog(item);
+  if (!(await postApproval(item.id, decision.allowed))) setStatus("错误");
+  setStatus("待命");
+}
+
+// 审批弹窗：遮罩 + 居中卡片；逐条 [允许][拒绝] + 全部允许/全部拒绝；
+// 顶部倒计时按面板审批超时配置，到点自动全部拒绝。
+function showApprovalDialog(item) {
+  return new Promise((resolve) => {
+    const overlay = document.createElement("div");
+    overlay.className = "ha-approval-overlay";
+    const box = document.createElement("div");
+    box.className = "ha-approval-box";
+    const secondsLeft = { value: settings.approvalTimeoutSec };
+    const rows = item.calls
+      .map(
+        (call, i) => `
+      <div class="ha-approval-row" data-i="${i}">
+        <div class="ha-approval-cmd">${escapeHtml(call.arguments?.command ?? JSON.stringify(call.arguments))}</div>
+        <div class="ha-approval-hint">该命令可能删除或覆盖数据，请确认后授权</div>
+        <div class="ha-approval-btns">
+          <button class="ha-allow" data-i="${i}">允许</button>
+          <button class="ha-deny" data-i="${i}">拒绝</button>
+        </div>
+      </div>`,
+      )
+      .join("");
+    box.innerHTML = `
+      <div class="ha-approval-title">危险命令授权 <span class="ha-approval-count" id="ha-approval-count"></span></div>
+      ${rows}
+      <div class="ha-approval-foot">
+        <button class="ha-allow-all" id="ha-approval-allow-all">全部允许</button>
+        <button class="ha-deny-all" id="ha-approval-deny-all">全部拒绝</button>
+      </div>`;
+    overlay.appendChild(box);
+    document.documentElement.appendChild(overlay);
+
+    const decisions = item.calls.map(() => false);
+    const countEl = box.querySelector("#ha-approval-count");
+    const finish = (allowed) => {
+      clearInterval(timer);
+      overlay.remove();
+      resolve({ allowed });
+    };
+    const timer = setInterval(() => {
+      secondsLeft.value -= 1;
+      countEl.textContent = `${secondsLeft.value}s 后自动拒绝`;
+      if (secondsLeft.value <= 0) finish(item.calls.map(() => false)); // 超时：全部拒绝
+    }, 1000);
+    countEl.textContent = `${secondsLeft.value}s 后自动拒绝`;
+
+    box.addEventListener("click", (e) => {
+      const btn = e.target.closest("button");
+      if (!btn) return;
+      const i = Number(btn.dataset.i);
+      if (btn.classList.contains("ha-allow")) {
+        decisions[i] = true;
+        finish(decisions);
+      } else if (btn.classList.contains("ha-deny")) {
+        decisions[i] = false;
+        finish(decisions);
+      } else if (btn.id === "ha-approval-allow-all") {
+        finish(item.calls.map(() => true));
+      } else if (btn.id === "ha-approval-deny-all") {
+        finish(item.calls.map(() => false));
+      }
+    });
+  });
+}
+
 // ---------- 投递循环：GET /task → 模拟输入 → 自动/手动提交 ----------
 
 async function deliverMessage(text, source) {
@@ -728,6 +883,10 @@ async function deliveryLoop() {
         continue;
       }
       noteBridgeSuccess();
+      if (resp?.task?.type === "approval") {
+        await handleApproval(resp.task);
+        continue; // 审批处理完立即拉取下一条（执行结果回填消息）
+      }
       if (resp?.task?.message) {
         const msg = resp.task.message;
         if (msg.startsWith(PROTOCOL_PREFIX)) {
@@ -896,6 +1055,8 @@ async function init() {
       autoMode: typeof saved.autoMode === "boolean" ? saved.autoMode : defaultSettings.autoMode,
       simulateTyping:
         typeof saved.simulateTyping === "boolean" ? saved.simulateTyping : defaultSettings.simulateTyping,
+      autoApprove: typeof saved.autoApprove === "boolean" ? saved.autoApprove : defaultSettings.autoApprove,
+      approvalTimeoutSec: clampApprovalTimeout(Number(saved.approvalTimeoutSec)),
     };
   }
   if (typeof stored[PROTOCOL_KEY] === "string" && stored[PROTOCOL_KEY].startsWith(PROTOCOL_PREFIX)) {

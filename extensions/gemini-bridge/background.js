@@ -93,6 +93,41 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
         return;
       }
 
+      if (message.type === "approve") {
+        const id = Number(message?.id);
+        const allowed = Array.isArray(message?.allowed) ? message.allowed.map((v) => v === true) : [];
+        if (!Number.isInteger(id) || allowed.length === 0) {
+          sendResponse({ ok: false, error: "invalid approval" });
+          return;
+        }
+        let res;
+        try {
+          res = await fetch(`${base}/approval`, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ id, allowed }),
+            signal: AbortSignal.timeout(POST_RESULT_TIMEOUT_MS),
+          });
+        } catch (err) {
+          sendResponse({
+            ok: false,
+            error:
+              err?.name === "TimeoutError" || err?.name === "AbortError"
+                ? "POST /approval 超时"
+                : err instanceof Error
+                  ? err.message
+                  : String(err),
+          });
+          return;
+        }
+        if (res.ok) {
+          sendResponse({ ok: true });
+          return;
+        }
+        sendResponse({ ok: false, status: res.status, error: `POST /approval → HTTP ${res.status}` });
+        return;
+      }
+
       sendResponse({ error: `unknown message type: ${message?.type}` });
     } catch (err) {
       sendResponse({ error: err instanceof Error ? err.message : String(err) });
