@@ -112,8 +112,9 @@ panel.innerHTML = `
   color-scheme: dark; /* 原生控件（数字 spinner、select 下拉、滚动条）走暗色绘制 */
 }
 #ha-panel .ha-title {
-  font-weight: 700; margin-bottom: 6px; display: flex;
-  align-items: center; justify-content: space-between; cursor: grab;
+  font-weight: 700; display: flex; align-items: center; justify-content: space-between;
+  cursor: grab; background: #191919; border-bottom: 1px solid #333;
+  margin: -10px -12px 8px; padding: 8px 12px; border-radius: 9px 9px 0 0;
 }
 #ha-panel #ha-collapse {
   background: #111; color: #9ca3af; border: 1px solid #4b5563;
@@ -131,9 +132,13 @@ panel.innerHTML = `
 #ha-ball:hover { border-color: #6b7280; }
 #ha-ball .ha-dot {
   width: 12px; height: 12px; border-radius: 50%;
-  background: #3b82f6; box-shadow: 0 0 6px rgba(59,130,246,.6);
+  background: var(--dot, #3b82f6); box-shadow: 0 0 8px var(--dot, #3b82f6);
+  animation: ha-pulse 1.8s ease-in-out infinite; /* 呼吸律动 */
 }
-#ha-ball .ha-dot.ha-err { background: #ef4444; box-shadow: 0 0 6px rgba(239,68,68,.6); }
+@keyframes ha-pulse {
+  0%, 100% { transform: scale(1); opacity: 1; }
+  50% { transform: scale(1.4); opacity: .7; }
+}
 #ha-panel .ha-badge {
   font-size: 10px; font-weight: 400; color: #9ca3af;
   border: 1px solid #4b5563; border-radius: 4px; padding: 0 4px; margin-left: 4px;
@@ -148,9 +153,17 @@ panel.innerHTML = `
 #ha-panel input[type="checkbox"] { accent-color: #3b82f6; }
 #ha-panel .ha-status {
   margin-top: 6px; padding: 4px 8px; border-radius: 6px;
-  background: #111827; color: #93c5fd; border: 1px solid #374151;
+  background: #111827; border: 1px solid #374151;
+  color: var(--dot, #93c5fd);
 }
-#ha-panel .ha-status.ha-err { color: #fca5a5; border-color: #7f1d1d; }
+/* 状态色调：待命蓝 / 已抓取青 / 回填橙 / 倒计时绿 / 等待紫 / 桥断琥珀 / 错误红 */
+.ha-tone-idle  { --dot: #3b82f6; }
+.ha-tone-ready { --dot: #22d3ee; }
+.ha-tone-busy  { --dot: #f97316; }
+.ha-tone-go    { --dot: #22c55e; }
+.ha-tone-wait  { --dot: #a78bfa; }
+.ha-tone-warn  { --dot: #f59e0b; }
+.ha-tone-err   { --dot: #ef4444; }
 #ha-panel .ha-log-bar {
   margin-top: 6px; display: flex; align-items: center; justify-content: flex-end; gap: 6px;
 }
@@ -232,12 +245,30 @@ const statusEl = panel.querySelector("#ha-status");
 const logEl = panel.querySelector("#ha-log");
 const ballDot = ball.querySelector("#ha-ball-dot");
 
+const TONE_CLASSES = [
+  "ha-tone-idle", "ha-tone-ready", "ha-tone-busy",
+  "ha-tone-go", "ha-tone-wait", "ha-tone-warn", "ha-tone-err",
+];
+
+// 状态 → 色调：面板状态栏与悬浮球圆点共用一套
+function statusTone(text) {
+  if (text === "错误") return "ha-tone-err";
+  if (text === "桥未连接（重试中）") return "ha-tone-warn";
+  if (text.includes("回填中")) return "ha-tone-busy";
+  if (text.includes("自动提交")) return "ha-tone-go";
+  if (text.includes("等待 Gemini")) return "ha-tone-wait";
+  if (text.includes("已抓取")) return "ha-tone-ready";
+  return "ha-tone-idle";
+}
+
 function setStatus(text) {
   currentStatus = text;
   statusEl.textContent = text;
-  const err = text === "错误" || text === "桥未连接（重试中）";
-  statusEl.classList.toggle("ha-err", err);
-  ballDot.classList.toggle("ha-err", err);
+  const tone = statusTone(text);
+  statusEl.classList.remove(...TONE_CLASSES);
+  statusEl.classList.add(tone);
+  ballDot.classList.remove(...TONE_CLASSES);
+  ballDot.classList.add(tone);
 }
 
 // ---------- 面板拖拽与悬浮球 ----------
@@ -655,7 +686,7 @@ async function deliverMessage(text, source) {
     const deadline = Date.now() + delayMs;
     const tick = () => setStatus(`自动提交（${Math.max(0, (deadline - Date.now()) / 1000).toFixed(1)}s 后）`);
     tick();
-    const countdown = setInterval(tick, 200); // 动态倒计时，逐 0.1s 递减
+    const countdown = setInterval(tick, 100); // 动态倒计时，逐 0.1s 递减
     await sleep(delayMs);
     clearInterval(countdown);
     // 竞态守卫：延迟回调触发时开关已关闭 → 跳过点击（A7）
