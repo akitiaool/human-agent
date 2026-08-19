@@ -1652,19 +1652,19 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
 
 - [ ] **Step 3: content.js**
 
-创建 `extensions/gemini-bridge/content.js`：
+创建 `extensions/gemini-bridge/content.js`（双向通道：任务消息填入输入框；发送事件监控——自动点击与用户手动点击页面发送按钮统一走"等待回复 → 回传"路径）：
 
 ```js
-// 浮动面板 + AI Studio 页面收发。选择器随页面结构可能失效，见 README 排查节。
+// 浮动面板 + AI Studio 页面双向收发。选择器随页面结构可能失效，见 README 排查节。
 const POLL_INTERVAL = 5_000;
-const MIN_SEND_INTERVAL = 2_000;
+const SEND_DELAY_MIN = 3_000; // 自动发送随机延迟下限
+const SEND_DELAY_MAX = 8_000; // 自动发送随机延迟上限（防止机器人检测）
 const REPLY_STABLE_SAMPLES = 3;
 
 let autoSend = true;
 let pendingTask = null; // 已取到、尚未回传的任务
-let taskInProgress = false;
+let awaitingReply = false; // 已发送、等待 Gemini 回复中
 let lastReply = ""; // 最近一次回传的回复（「回填」使用）
-let lastSendAt = 0;
 
 // ---------- 面板 ----------
 const panel = document.createElement("div");
@@ -1777,6 +1777,14 @@ function clickSend() {
   return true;
 }
 
+function isSendButton(btn) {
+  return Boolean(
+    btn.matches('button[data-test-id="send-button"]') ||
+      btn.matches('button[aria-label*="发送"]') ||
+      btn.matches('button[aria-label*="Send"]'),
+  );
+}
+
 async function waitReplyReady(timeoutMs = 120_000) {
   const start = Date.now();
   let stable = 0;
@@ -1800,50 +1808,58 @@ function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
-// ---------- 任务处理 ----------
-async function poll() {
-  if (taskInProgress) return;
-  taskInProgress = true;
-  try {
-    if (pendingTask === null) {
-      const resp = await chrome.runtime.sendMessage({ type: "get-task" });
-      if (!resp?.task) return;
-      pendingTask = resp.task;
-      log(`任务到达：${pendingTask.message.slice(0, 100)}${pendingTask.message.length > 100 ? "…" : ""}`);
-    }
-    const task = pendingTask;
-    const inputOk = setInput(task.message);
-    if (!inputOk) {
-      log("未找到输入框，稍后重试");
-      return;
-    }
-    if (!autoSend) {
-      setStatus("待发送（手动）");
-      log("自动发送已关闭，可编辑输入框后点「交给智能体」");
-      return;
-    }
-    const wait = MIN_SEND_INTERVAL - (Date.now() - lastSendAt);
-    if (wait > 0) await sleep(wait);
-    if (!clickSend()) {
-      log("未找到发送按钮，稍后重试");
-      return;
-    }
-    lastSendAt = Date.now();
-    setStatus("等待 Gemini 回复…");
-    const reply = await waitReplyReady();
-    await submit(task, reply);
-  } finally {
-    taskInProgress = false;
-  }
-}
-
+// ---------- 双向通道 ----------
 async function submit(task, reply) {
   await chrome.runtime.sendMessage({ type: "submit-result", id: task.id, reply });
   lastReply = reply;
   pendingTask = null;
+  awaitingReply = false;
   setStatus("已回传");
   log("已回传回复给 brain");
 }
+
+async function poll() {
+  if (pendingTask !== null || awaitingReply) return;
+  const resp = await chrome.runtime.sendMessage({ type: "get-task" });
+  if (!resp?.task) return;
+  pendingTask = resp.task;
+  log(`任务到达：${resp.task.message.slice(0, 100)}${resp.task.message.length > 100 ? "…" : ""}`);
+  if (!setInput(resp.task.message)) {
+    log("未找到输入框，稍后重试");
+    pendingTask = null;
+    return;
+  }
+  if (autoSend) {
+    const delay = SEND_DELAY_MIN + Math.random() * (SEND_DELAY_MAX - SEND_DELAY_MIN);
+    setStatus(`自动发送（${Math.round(delay / 1000)}s 后）`);
+    setTimeout(() => {
+      if (pendingTask === null || awaitingReply) return;
+      if (!clickSend()) log("未找到发送按钮，请手动点击页面发送按钮");
+    }, delay);
+  } else {
+    setStatus("待发送（手动）");
+    log("已填入输入框，请点击页面发送按钮提交");
+  }
+}
+
+// 发送事件监控：自动点击与用户手动点击页面发送按钮统一进入等待回复 → 回传。
+document.addEventListener(
+  "click",
+  (event) => {
+    const btn = event.target.closest("button");
+    if (!btn || !isSendButton(btn) || pendingTask === null || awaitingReply) return;
+    awaitingReply = true;
+    setStatus("等待 Gemini 回复…");
+    const task = pendingTask;
+    waitReplyReady()
+      .then((reply) => submit(task, reply))
+      .catch(() => {
+        awaitingReply = false;
+        log("等待回复超时，可重新发送");
+      });
+  },
+  true,
+);
 
 instructBtn.addEventListener("click", async () => {
   if (pendingTask === null) {
@@ -1879,8 +1895,9 @@ poll();
 ```markdown
 # gemini-bridge 浏览器扩展
 
-human-agent 与网页版 Gemini（AI Studio）之间的桥：brain 发布任务消息，插件在 AI Studio 页面
-自动发送、抓取 Gemini 回复回传。
+human-agent 与网页版 Gemini（AI Studio）之间的**双向通道**：
+brain 的任务消息填入页面输入框（brain → 页面）；Gemini 回复完成后抓取并回传 brain
+（页面 → brain），形成「任务消息 → 页面 → Gemini 回复 → 回传 → 下一轮任务」的双向循环。
 
 ## 前置条件
 
@@ -1896,11 +1913,13 @@ human-agent 与网页版 Gemini（AI Studio）之间的桥：brain 发布任务�
 
 ## 使用
 
-- **自动发送**：开关开启时，brain 的任务消息自动填入输入框并发送，回复稳定后自动回传。
-- **手动模式**（关闭自动发送）：任务消息填入输入框但不发送，可编辑后点「交给智能体」提交。
-- **交给智能体**：把输入框当前内容作为当前任务的回复提交给 brain（等同用户人工干预回复）。
+- **自动发送**（开关开启）：任务消息填入输入框后，隔**随机时间**（约 3–8s，防止机器人检测）
+  自动点击页面发送按钮；回复稳定后自动回传。
+- **手动模式**（关闭自动发送）：任务消息填入输入框但**不自动发送**，由你点击 AI Studio
+  页面自己的发送按钮提交；插件监控到发送后等待回复完成并自动回传。
+- **交给智能体**：把输入框当前内容**不经页面发送**、直接作为当前任务的回复回传 brain
+  （人工干预快速通道——如直接粘贴 tool_call 让智能体执行）。
 - **回填**：把最近一次任务消息/回复粘贴到输入框，可编辑后再发送。
-- 相邻两次自动发送间隔 ≥ 2s，降低风控风险。
 
 ## 端口配置
 
@@ -2078,7 +2097,8 @@ GEMINI_BRIDGE_PORT=8765 pnpm dev
 - 真实联调 → Task 9
 
 **设计决策说明（spec 未完全定死的落点）：**
-1. 「交给智能体」落实为"把输入框当前内容作为当前任务的回复提交（POST /result）"——在不新增协议端点、不改 loop 的前提下实现人工干预；自动发送关闭时任务消息填入输入框，编辑后提交。与 spec"作为指令发给 brain（等同 CLI 输入）"的目标一致（用户干预文本进入推理流）。
-2. `AgentPhase` 删除 `SNIFFING`：嗅探已移入大脑反思层，心脏循环不再有该阶段，类型与注释同步更新。
-3. `OllamaThinking` 构造 `nose`/`mouth` 必填（无默认 no-op），TS 强制组装者注入真实器官。
-4. Gemini 桥任务在交予插件后仍保留在 pending map（按 id 匹配回传），回传超时 60s；`close()` 释放全部 waiter 与 pending，防止进程挂起。
+1. **插件为双向通道**：任务消息填入输入框（brain → 页面）与发送后回复回传（页面 → brain）循环往复。发送路径统一走**发送事件监控**——插件在点击捕获阶段判定发送按钮，自动点击（随机延迟 3–8s，防止机器人检测）与用户手动点击页面发送按钮进入同一"等待回复 → 回传"流程，无需区分发送来源。
+2. 「交给智能体」= 输入框当前草稿**不经页面发送**、直接作为当前任务的回复回传 brain（`POST /result`），是人工干预快速通道（可粘贴 tool_call 直接驱动智能体），不是手动模式的唯一提交路径——手动主路径是用户点页面发送按钮。
+3. `AgentPhase` 删除 `SNIFFING`：嗅探已移入大脑反思层，心脏循环不再有该阶段，类型与注释同步更新。
+4. `OllamaThinking` 构造 `nose`/`mouth` 必填（无默认 no-op），TS 强制组装者注入真实器官。
+5. Gemini 桥任务在交予插件后仍保留在 pending map（按 id 匹配回传），回传超时 60s；`close()` 释放全部 waiter 与 pending，防止进程挂起。
