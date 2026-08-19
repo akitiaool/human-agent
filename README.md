@@ -8,7 +8,7 @@
 - **工具调用**：读文件、列目录、代码检索、写文件、行级 Patch、执行命令、抓取网页转 Markdown
 - **风险拦截**：危险命令（`rm -rf`、`DROP TABLE`、`git push --force` 等）执行前向用户确认
 - **中断优先**：`Ctrl+C` 毫秒级中断，级联停止子进程，会话状态不丢失
-- **双大脑**：默认本地 Ollama（qwen3）；`GEMINI_BRIDGE_PORT=8765` 切换网页版 Gemini（AI Studio + gemini-bridge 浏览器扩展）
+- **双模式**：默认本地 Ollama（qwen3）对话 REPL；`GEMINI_BRIDGE_PORT=8765` 启用桥模式——对话全在网页（AI Studio），智能体不做推理、仅执行工具（经 gemini-bridge 浏览器扩展桥接）
 
 ## 快速开始
 
@@ -40,33 +40,38 @@ pnpm test       # vitest 全量测试（TDD 流程：先写测试并看其失败
 | --- | --- | --- |
 | `OLLAMA_BASE_URL` | `http://localhost:11434` | Ollama 服务地址 |
 | `OLLAMA_MODEL` | `qwen3:4b` | 模型名，如 `qwen3:8b` |
-| `GEMINI_BRIDGE_PORT` | 未设置（用 Ollama） | 设置即启用 Gemini 桥大脑，端口默认 8765，非法值回退 8765 |
+| `GEMINI_BRIDGE_PORT` | 未设置（Ollama REPL 模式） | 设置即把 CLI 切换为**桥模式**（进程模式开关：对话在网页、智能体仅执行工具），端口默认 8765，非法值回退 8765 |
 
-## Gemini 桥（网页版 Gemini 大脑）
+## Gemini 桥（桥模式：网页对话驱动 · 智能体仅执行工具）
 
-Gemini 官方 API 国内不可直连，但网页版 AI Studio 可用。human-agent 通过浏览器扩展
-`extensions/gemini-bridge/` 作为桥，在 AI Studio 页面收发消息，以网页版 Gemini 作为大脑
-（网页版无原生 function calling，工具调用为 ```tool_call``` 结构化输出模拟）。
+Gemini 官方 API 国内不可直连，但网页版 AI Studio 可用。**桥模式下对话全在网页**：用户在
+AI Studio 直接与 Gemini 对话，插件把最新回复推送给智能体；智能体**不做模型推理、只执行工具**——
+解析回复中的 ```tool_call``` 块 → 反思层逐条裁决（危险命令自动拒绝，不打扰终端）→ 共享执行器
+（hands/eyes）执行 → 结果序列化为「工具执行结果」消息回填到网页输入框，由 Gemini 继续
+（网页版无原生 function calling，工具调用为 ```tool_call``` 结构化输出模拟）。无 tool_call 的
+回复不回填，循环自然终止。
 
 ```bash
-GEMINI_BRIDGE_PORT=8765 pnpm dev   # 启用 Gemini 桥大脑（默认 8765）
+GEMINI_BRIDGE_PORT=8765 pnpm dev   # 启用桥模式（默认 8765）：CLI 仅宿主 HTTP 服务，对话在网页
 ```
 
 前置：按 `extensions/gemini-bridge/README.md` 加载扩展，保持 AI Studio 页面打开并登录。
-插件提供自动发送开关、「交给智能体」、「回填」按钮，支持人工干预与风控降频（自动发送为随机 3–8s 延迟）。
+扩展面板为**自动模式开关 + 防检测设置**（回填内容模拟人类逐字输入、提交前随机延迟默认 3–8s）；
+自动模式自动提交，手动模式只回填、由用户点击页面发送按钮。扩展 v2 重写待真实 AI Studio DOM
+落定（阻塞项），当前 `extensions/gemini-bridge/` 仍为 v1 实现。
 
 ## 架构
 
 ```text
 src/
-├── brain/    # 🧠 大脑：knowledge 知识库、思考层（ollama-thinking/gemini-bridge-thinking）、reflection 反思层、会话上下文
-├── heart/    # 🫀 心脏：AgentLoop 生命循环（路由 + 承受力）、AbortController 中断
+├── brain/    # 🧠 大脑：knowledge 知识库、思考层（ollama-thinking 对话 / gemini-bridge-thinking 执行型桥服务）、reflection 反思层、会话上下文
+├── heart/    # 🫀 心脏：AgentLoop 生命循环（承受力）、executor 共享工具执行路由、AbortController 中断
 ├── eyes/     # 👁️ 眼睛：只读——文件读/目录/代码检索、网页抓取
 ├── ears/     # 👂 耳朵：终端输入（单 readline 接口 + 行队列）
 ├── mouth/    # 🗣️ 嘴巴：打字机输出、彩色日志、危险操作确认
 ├── hands/    # ✋ 双手：写文件/行级 Patch、Shell 执行（绑定中断）
 ├── nose/     # 👃 鼻子：危险特征嗅探、环境快照、端口占用探测
-├── agent.ts  # HumanAgent 组装入口（构造注入全部器官）
+├── agent.ts  # 组装入口：HumanAgent（Ollama REPL）与 buildBridgeService（执行型桥服务）
 └── types/    # ActionResult 契约与器官接口
 ```
 

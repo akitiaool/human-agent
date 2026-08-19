@@ -32,15 +32,17 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 - `src/agent.ts`：HumanAgent 组装器，默认组装 OllamaBrain + 全部器官（鼻子组合 RiskChecker+EnvChecker，显式组合而非对象展开——spread 不复制原型方法）；环境变量 `OLLAMA_BASE_URL`/`OLLAMA_MODEL` 覆盖默认大脑配置
 - `bin/cli.ts`：SIGINT/SIGTERM → `agent.interrupt.abort()`；结束后 `ears.close()` 防挂起；退出码 ERROR=1 / INTERRUPTED=130 / IDLE=0
 
-阶段五（Gemini 桥 + 大脑职责模型重构）已完成（TDD）：
-- `src/brain/knowledge.ts`：大脑知识库——7 个工具的 zod schema 与 description 唯一来源；`TOOLS`（parameters 由 `z.toJSONSchema()` 派生，消除 TOOL_SCHEMAS 与 TOOLS.parameters 双写）、`schemas`、`serializeToolProtocol()`（思考层每轮完整注入的工具协议文本）
-- `src/brain/reflection.ts`：反思层（潜意识）——确定性代码不经模型，逐条裁决：存在性（UNKNOWN_TOOL）→ zod 结构（INVALID_ARGS）→ terminal 危险嗅探（调鼻子，DANGEROUS 经嘴巴 confirm，拒绝为 USER_DENIED）
-- `src/brain/`：思考层实现——`ollama-thinking.ts`（OllamaThinking，原 ollama-brain.ts 改名，逻辑不变）、`gemini-bridge-thinking.ts`（GeminiBridgeThinking：内嵌 HTTP 服务默认 127.0.0.1:8765，`GET /task` 长轮询（约 25s 后 204）+ `POST /result` 回传，任务按 id 匹配，`parseToolCalls` 容错解析 ```tool_call``` 代码块，`close()` 关服务）
+阶段五（Gemini 桥 + 大脑职责模型重构）已完成（TDD，v2：网页对话驱动 · 智能体仅执行工具）：
+- `src/brain/knowledge.ts`：大脑知识库——7 个工具的 zod schema 与 description 唯一来源；`TOOLS`（parameters 由 `z.toJSONSchema()` 派生，消除 TOOL_SCHEMAS 与 TOOLS.parameters 双写）、`schemas`、`serializeToolProtocol()`（工具协议文本，桥服务启动即作为首条回填消息注入）
+- `src/brain/reflection.ts`：反思层（潜意识）——确定性代码不经模型，逐条裁决：存在性（UNKNOWN_TOOL）→ zod 结构（INVALID_ARGS）→ terminal 危险嗅探（调鼻子，DANGEROUS 经嘴巴 confirm，拒绝为 USER_DENIED）；桥模式注入"永远拒绝"的嘴巴 → 危险命令自动拒绝、无人值守
+- `src/brain/ollama-thinking.ts`：思考层 Ollama 实现（OllamaThinking，原 ollama-brain.ts 改名，逻辑不变），实现 BrainInference（infer + reflect），CLI 对话模式用
+- `src/brain/gemini-bridge-thinking.ts`：**执行型桥服务（非 BrainInference）**——内嵌 HTTP 服务默认 127.0.0.1:8765：`GET /task` 长轮询（有回填消息立即返回 {message}，无则挂起约 25s 后 204）+ `POST /result`（接收网页最新内容 {reply} → {ok, processed}）；流水线：校验 reply → 与最近一次内容去重（lastContent）→ `parseToolCalls` 容错解析 ```tool_call``` 代码块，无调用不回填（内容自终止）→ 反思裁决（危险/未知/参数非法拦截）→ 放行的经共享执行器 `executeTool` 执行（批级超时 `AbortSignal.timeout` 默认 300s + 全局中断，超时回填「工具执行超时」说明）→ 结果序列化为「工具执行结果」消息入队并唤醒 GET /task；`close()` 释放全部长轮询并关服务
 - `src/brain/llm.ts`：`BrainInference` 增加 `reflect(calls)`（可行性裁决）；`ReflectionVerdict`/`BlockedCall` 契约
-- `src/heart/loop.ts`：净化——TOOL_SCHEMAS/TOOLS/zod 校验/危险嗅探/嘴巴确认迁出；`#execute` = `brain.reflect(calls)` 裁决 → 放行 dispatch / 拦截结果直接反馈；loop 不再依赖 nose/mouth；`AgentPhase` 去掉 SNIFFING（嗅探属大脑反思，不再有心脏阶段）
-- `src/agent.ts`：组装"带反思的大脑"（thinking 构造注入 nose/mouth 构建共享 Reflection）；`GEMINI_BRIDGE_PORT` 环境变量设置即启用 GeminiBridgeThinking（默认 OllamaThinking，非法值回退 8765）
-- `bin/cli.ts`：结束后 `agent.brain.close()`（若为 GeminiBridgeThinking，与 ears.close() 同模式）
-- `extensions/gemini-bridge/`：Chrome/Edge MV3 扩展——background 长轮询桥 + content 浮动面板（自动发送开关、「交给智能体」、「回填」按钮），AI Studio 页面收发，手动 E2E 验证
+- `src/heart/executor.ts`：（新）共享工具执行器——`executeTool(organs, name, args, signal?)` 工具名 → 双手/眼睛方法的映射路由，loop 与桥服务共用（原 loop `#dispatch` 抽取，行为不变）
+- `src/heart/loop.ts`：净化——TOOL_SCHEMAS/TOOLS/zod 校验/危险嗅探/嘴巴确认迁出；`#execute` = `brain.reflect(calls)` 裁决 → 放行 executeTool / 拦截结果直接反馈；loop 不再依赖 nose/mouth；`AgentPhase` 去掉 SNIFFING（嗅探属大脑反思，不再有心脏阶段）
+- `src/agent.ts`：`HumanAgent` **恒为 Ollama 模式**（`GEMINI_BRIDGE_PORT` 不再影响 HumanAgent 的大脑）；新增导出 `buildBridgeService(options?)`——组装真实器官（鼻子 RiskChecker+EnvChecker、眼睛 FileReader/WebCrawler、双手 FileWriter/Terminal）的桥服务，`port` 缺省读 `GEMINI_BRIDGE_PORT`（非法值回退 8765），`signal`/`timeoutMs`/`logger` 可注入
+- `bin/cli.ts`：`GEMINI_BRIDGE_PORT` 已设置 → **桥模式分支**（对话全在网页，CLI 仅宿主 HTTP 服务 + 状态日志）：建服务 → `getPort()`（失败友好报错 exit 1）→ 打印监听地址与使用说明 → 等 SIGINT/SIGTERM（中断级联）→ `close()` → exit 130；未设置 → 原 HumanAgent REPL 路径
+- `extensions/gemini-bridge/`：Chrome/Edge MV3 扩展，v2 设计目标为 content 浮动面板（**自动模式开关 + 防检测设置**：回填后模拟人类逐字输入、提交前随机延迟默认 3–8s）；**v2 重写待真实 AI Studio DOM 落定（Task 13 阻塞项），当前仍为 v1 实现**
 
 **尚未开始**：voice/image/browser 等预留器官（`eyes/image-viewer.ts`、`ears/voice-input.ts`、`mouth/voice-output.ts`、`hands/browser-action.ts`）。
 
@@ -50,15 +52,15 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 顶层模块以人类生物学器官抽象，每层只依赖相邻的神经信号，职责专一：
 
-- 🧠 `src/brain/`（大脑）：知识与思考。`knowledge.ts` 知识库（工具如何使用的知识，未来 RAG 在此聚合）、思考层（模型推理实现：`ollama-thinking.ts` / `gemini-bridge-thinking.ts`，直接位于本目录）、`reflection.ts` 反思层（可行性裁决，确定性代码）、`context.ts` 会话消息队列；`llm.ts` 统一推理接口
-- 🫀 `src/heart/`（心脏）：生命循环。`loop.ts` 推进 `听取指令 → 大脑思考 → 反思裁决 → 手眼执行 → 反馈结果 → 循环/结束`，并承担承受力（任务/单命令超时、maxIterations、中断）；`interrupt.ts` 持有全局 `AbortController`
+- 🧠 `src/brain/`（大脑）：知识与思考。`knowledge.ts` 知识库（工具如何使用的知识，未来 RAG 在此聚合）、思考层（`ollama-thinking.ts` 模型推理 / `gemini-bridge-thinking.ts` 执行型桥服务，直接位于本目录）、`reflection.ts` 反思层（可行性裁决，确定性代码）、`context.ts` 会话消息队列（仅 Ollama 模式用）；`llm.ts` 统一推理接口
+- 🫀 `src/heart/`（心脏）：生命循环。`loop.ts` 推进 `听取指令 → 大脑思考 → 反思裁决 → 手眼执行 → 反馈结果 → 循环/结束`，并承担承受力（任务/单命令超时、maxIterations、中断）；`executor.ts` 共享工具执行路由（loop 与桥服务共用）；`interrupt.ts` 持有全局 `AbortController`
 - 👁️ `src/eyes/`（眼睛）：**只读**。文件读/目录遍历/代码检索、网页抓取转 Clean Markdown。
 - 👂 `src/ears/`（耳朵）：输入。终端 REPL、语音（预留）。
 - 🗣️ `src/mouth/`（嘴巴）：输出。流式 Markdown/彩色终端输出、`confirm(message): Promise<boolean>` 交互确认。
 - ✋ `src/hands/`（双手）：**写/执行**。文件写入与 Patch、基于 `execa` 的 Shell 执行（绑定中断信号、超时强杀）。
 - 👃 `src/nose/`（鼻子）：嗅探预警。危险特征规则库（`rm -rf`、`DROP TABLE`、`git push --force` 等）输出 `SAFE`/`DANGEROUS` 等级；环境快照（OS、CWD、Git 分支、端口占用）。
 
-组装入口：`src/agent.ts` 的 `HumanAgent` 类，通过构造函数依赖注入全部器官（`brain, heart, eyes, hands, mouth, nose, ears`）。
+组装入口：`src/agent.ts`——`HumanAgent` 类通过构造函数依赖注入全部器官（`brain, heart, eyes, hands, mouth, nose, ears`），恒为 Ollama 模式；`buildBridgeService()` 组装执行型桥服务。
 
 ## 不可违反的设计原则
 
@@ -113,4 +115,4 @@ CLI 入口为 `bin/cli.ts`（处理 argv）。
 2. 双手与眼睛（file-reader、terminal、file-writer、risk-checker）✅
 3. 嘴巴与耳朵（text-output、ask-user、text-input）✅
 4. 大脑与心脏（loop 状态机、interrupt、接入具体大模型）✅（OllamaBrain + qwen3，`OLLAMA_MODEL` 可换模型）
-5. Gemini 桥与职责模型重构（knowledge/thinking/reflection、浏览器扩展桥）✅
+5. Gemini 桥与职责模型重构（knowledge/ollama-thinking/gemini-bridge-thinking/reflection + 共享执行器、浏览器扩展桥）✅（扩展 v2 重写待真实 AI Studio DOM）
