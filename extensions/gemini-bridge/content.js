@@ -278,10 +278,23 @@ function findLastModelTurn() {
   return null;
 }
 
-// A2：只取 ms-text-chunk 的 innerText（排除 ms-thought-chunk 思考摘要），拼接为 reply
+// A2：提取模型回复文本（排除 ms-thought-chunk 思考摘要），拼接为 reply。
+// 关键：AI Studio 把 markdown 代码块渲染成 ms-code-block（含 data-test-language 语言标记），
+// innerText 只含代码内容、围栏被渲染器消费——必须把代码块还原为 ```lang 围栏文本，
+// 否则回传给桥服务的内容丢失 ```tool_call 识别信号。
 function extractReply(turn) {
   return [...turn.querySelectorAll("ms-text-chunk")]
-    .map((chunk) => chunk.innerText.trim())
+    .map((chunk) => {
+      const clone = chunk.cloneNode(true); // 克隆后替换，不影响页面
+      for (const block of clone.querySelectorAll("ms-code-block")) {
+        const lang = block.getAttribute("data-test-language") ?? "";
+        const code = block.querySelector("pre code")?.textContent ?? "";
+        const pre = document.createElement("pre");
+        pre.textContent = `\`\`\`${lang}\n${code}\n\`\`\``;
+        block.replaceWith(pre);
+      }
+      return clone.innerText.trim();
+    })
     .filter(Boolean)
     .join("\n");
 }
