@@ -1005,10 +1005,23 @@ async function monitorLoop() {
   let lastText = "";
   let stable = 0;
   let lastContentChangeAt = 0; // 当前内容最后一次变化的时间戳
+  let baselineDone = false; // 历史基线：页面加载时的最后模型回复视为已回传
   while (true) {
     try {
       const turn = findLastModelTurn();
       const text = turn ? extractReply(turn) : "";
+      if (!baselineDone) {
+        baselineDone = true;
+        // 基线化：进已有对话/刷新时，页面上渲染的历史最后回复是"旧内容"而非新指令结果；
+        // 不设基线会被稳定采样回传——桥服务重启后 lastContent 去重表为空，历史含 tool_call 会被重放
+        if (text !== "") {
+          lastPostedReply = text;
+          lastText = text;
+          lastContentChangeAt = Date.now();
+          log(`历史基线：已将当前最后回复（${text.length} 字符）视为已回传，仅新内容会回传`);
+        }
+        continue;
+      }
       if (text !== "" && text === lastText) {
         stable += 1;
         if (announcerReady(lastContentChangeAt)) stable = STABLE_SAMPLES; // 完成信号可提前确认（A3）
