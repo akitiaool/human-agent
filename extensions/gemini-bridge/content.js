@@ -52,6 +52,8 @@ let protocolText = ""; // 已保存的工具协议文本（新对话时重新注
 let lastPostedReply = ""; // 最近一次回传的回复（避免无谓重发，服务侧亦去重）
 let delivering = false; // 投递循环串行占用标志（同一时刻只回填一条消息）
 let reinjectPending = false; // 待投递循环处理的协议重新注入
+let pendingTask = null; // 输入框未就绪时暂存的消息 {text, source}，就绪后补投
+let protocolChecked = false; // 本页是否已完成「对话中无协议 → 自动注入」检查
 let reinjectSuppressUntil = 0; // 新对话触发防抖时间戳
 let currentStatus = "待命";
 let bridgeDown = false; // 桥服务不可达标志（进入置位、成功复位）
@@ -860,8 +862,9 @@ async function deliverMessage(text, source) {
     setStatus(settings.simulateTyping ? "回填中（模拟粘贴）" : "回填中");
     log(`${source === "reinject" ? "重新注入协议文本" : "任务消息到达"}：${truncate(text.replace(/\n/g, " "), 80)}`);
     if (!(await typeIntoInput(text))) {
-      setStatus("错误");
-      log("未找到输入框（ms-prompt-box textarea），消息丢失——请确认页面在 AI Studio 对话页");
+      setStatus("待命");
+      pendingTask = { text, source }; // 输入框未就绪：消息暂存待补投，不丢弃
+      log("输入框未就绪（ms-prompt-box textarea），消息已暂存，页面就绪后自动补投");
       return;
     }
     if (!settings.autoMode) {
@@ -897,9 +900,36 @@ async function deliverMessage(text, source) {
 async function deliveryLoop() {
   while (true) {
     if (!delivering) {
-      // 新对话触发的协议重新注入优先于取任务，走同一投递流程
+      // 待投队列优先：输入框已就绪时补投暂存消息（不丢弃、不插队丢失）
+      if (pendingTask && findInput()) {
+        const task = pendingTask;
+        pendingTask = null;
+        await deliverMessage(task.text, task.source);
+        continue;
+      }
+      // 页面就绪协议补投：进已有对话/刷新后，若对话历史中无协议消息则注入（本页一次）
+      if (!protocolChecked && protocolText && findInput()) {
+        protocolChecked = true;
+        const input = findInput();
+        // 输入框有未提交内容（可能正是协议）时跳过，避免重复注入
+        if (input.value.trim() === "") {
+          const hasProtocol = [...document.querySelectorAll("ms-chat-turn")].some((t) =>
+            t.textContent.includes(PROTOCOL_PREFIX),
+          );
+          if (!hasProtocol) {
+            log("当前对话尚无协议消息，自动注入协议文本");
+            await deliverMessage(protocolText, "reinject");
+            continue;
+          }
+        }
+      }
+      // 新对话触发的协议重新注入（pendingTask 已含协议时跳过，避免重复注入）
       if (reinjectPending) {
         reinjectPending = false;
+        if (pendingTask && pendingTask.text.startsWith(PROTOCOL_PREFIX)) {
+          log("协议文本已在待投队列，跳过重复注入");
+          continue;
+        }
         await deliverMessage(protocolText, "reinject");
         continue;
       }
