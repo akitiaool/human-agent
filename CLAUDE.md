@@ -34,15 +34,23 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 阶段五（Gemini 桥 + 大脑职责模型重构）已完成（TDD，v2：网页对话驱动 · 智能体仅执行工具）：
 - `src/brain/knowledge.ts`：大脑知识库——7 个工具的 zod schema 与 description 唯一来源；`TOOLS`（parameters 由 `z.toJSONSchema()` 派生，消除 TOOL_SCHEMAS 与 TOOLS.parameters 双写）、`schemas`、`serializeToolProtocol()`（工具协议文本，桥服务启动即作为首条回填消息注入）
-- `src/brain/reflection.ts`：反思层（潜意识）——确定性代码不经模型，逐条裁决：存在性（UNKNOWN_TOOL）→ zod 结构（INVALID_ARGS）→ terminal 危险嗅探（调鼻子，DANGEROUS 经嘴巴 confirm，拒绝为 USER_DENIED）；桥模式预筛后反思层仍注入"永远拒绝"的嘴巴（防御未来判定路径）
-- `src/brain/ollama-thinking.ts`：思考层 Ollama 实现（OllamaThinking，原 ollama-brain.ts 改名，逻辑不变），实现 BrainInference（infer + reflect），CLI 对话模式用
-- `src/brain/gemini-bridge-thinking.ts`：**执行型桥服务（非 BrainInference）**——内嵌 HTTP 服务默认 127.0.0.1:8765：`GET /task` 长轮询（有回填消息立即返回 {message}，无则挂起约 25s 后 204）+ `POST /result`（接收网页最新内容 {reply} → {ok, processed}）；流水线：校验 reply → 与最近一次内容去重（lastContent）→ `parseToolCalls` 严格解析 ```tool_call``` 代码块（**不做容错兜底**——围栏丢失由插件提取层负责还原，见 extensions 条目），无调用不回填（内容自终止）→ 反思裁决（未知/参数非法拦截）→ **危险命令批量审批**（预筛摘出 → 审批请求经 GET /task 下发 → POST /approval 逐条裁决 → 允许的执行/拒绝或超时的生成 USER_DENIED 拒绝行，兜底超时 600s）→ 放行的经共享执行器 `executeTool` 执行（批级超时 `AbortSignal.timeout` 默认 300s + 全局中断，超时回填「工具执行超时」说明）→ 结果序列化为「工具执行结果」消息入队并唤醒 GET /task；`close()` 释放全部长轮询并关服务
-- `src/brain/llm.ts`：`BrainInference` 增加 `reflect(calls)`（可行性裁决）；`ReflectionVerdict`/`BlockedCall` 契约
+- `src/brain/reflection.ts`：反思层（潜意识）——确定性代码不经模型，逐条裁决（顺序固定，见阶段六）：权限黑名单（BLACKLIST，两模式一致直接拒）→ 存在性（UNKNOWN_TOOL）→ zod 结构（INVALID_ARGS）→ 白名单命中放行 → 其余标 pending（需授权，审批通道由宿主负责——桥下发 GET /task approval、CLI 走嘴巴三选）；不再经嘴巴 confirm（鼻子 risk-checker 保留为独立嗅探模块，不再参与裁决）
+- `src/brain/ollama-thinking.ts`：思考层 Ollama 实现（OllamaThinking，原 ollama-brain.ts 改名），extends BaseThinking implements BrainInference（infer + 基类 reflect/classify/addWhitelistEntry/workspaceConstraint/toolProtocol），CLI 对话模式用；system prompt 拼装含基类工作区声明
+- `src/brain/gemini-bridge-thinking.ts`：**执行型桥服务（extends BaseThinking，非 BrainInference）**——内嵌 HTTP 服务默认 127.0.0.1:8765：`GET /task` 长轮询（有回填消息立即返回 {message}，无则挂起约 25s 后 204）+ `POST /result`（接收网页最新内容 {reply} → {ok, processed}）；流水线：校验 reply → 与最近一次内容去重（lastContent）→ `parseToolCalls` 严格解析 ```tool_call``` 代码块（**不做容错兜底**——围栏丢失由插件提取层负责还原，见 extensions 条目），无调用不回填（内容自终止）→ `reflect(calls)` 基类统一裁决（BLACKLIST/未知/非法 → 拒绝行；白名单 → 直接执行；pending → 批量审批下发）→ **pending 批量审批**（`GET /task` 下发 `{type:"approval", id, calls}` → `POST /approval` 回 `{allowed, whitelist?}` 逐条裁决，whitelist 条目校验后落盘，拒绝/超时生成 USER_DENIED 拒绝行，兜底超时 600s）→ 放行的经共享执行器 `executeTool` 执行（批级超时 `AbortSignal.timeout` 默认 300s + 全局中断，超时回填「工具执行超时」说明）→ 结果序列化为「工具执行结果」消息入队并唤醒 GET /task；首条协议消息 = 基类 toolProtocol()（工作区声明开头）；`close()` 释放全部长轮询并关服务
+- `src/brain/llm.ts`：`BrainInference` 统一接口——`reflect(calls)`（可行性裁决）、`addWhitelistEntry(entry)`（白名单落盘）、`workspaceConstraint()`（工作区声明）；`ReflectionVerdict`（allowed / pending / blocked，`pending` 为需授权标记）/`BlockedCall` 契约
 - `src/heart/executor.ts`：（新）共享工具执行器——`executeTool(organs, name, args, signal?)` 工具名 → 双手/眼睛方法的映射路由，loop 与桥服务共用（原 loop `#dispatch` 抽取，行为不变）
-- `src/heart/loop.ts`：净化——TOOL_SCHEMAS/TOOLS/zod 校验/危险嗅探/嘴巴确认迁出；`#execute` = `brain.reflect(calls)` 裁决 → 放行 executeTool / 拦截结果直接反馈；loop 不再依赖 nose/mouth；`AgentPhase` 去掉 SNIFFING（嗅探属大脑反思，不再有心脏阶段）
+- `src/heart/loop.ts`：净化——TOOL_SCHEMAS/TOOLS/zod 校验/危险嗅探/嘴巴确认迁出；`#execute` = `brain.reflect(calls)` 基类统一裁决 → BLACKLIST/拦截结果直接反馈；白名单放行 → executeTool；**pending 走嘴巴三选** `mouth.askApproval(prompt)`（允许/拒绝/加入白名单，写类另有「此目录」），whitelist 动作经 `brain.addWhitelistEntry` 落盘；loop 不再直接依赖 nose，mouth 仅承载审批交互；`AgentPhase` 去掉 SNIFFING（嗅探属大脑反思，不再有心脏阶段）
 - `src/agent.ts`：`HumanAgent` **恒为 Ollama 模式**（`GEMINI_BRIDGE_PORT` 不再影响 HumanAgent 的大脑）；新增导出 `buildBridgeService(options?)`——组装真实器官（鼻子 RiskChecker+EnvChecker、眼睛 FileReader/WebCrawler、双手 FileWriter/Terminal）的桥服务，`port` 缺省读 `GEMINI_BRIDGE_PORT`（非法值回退 8765），`signal`/`timeoutMs`/`logger` 可注入
 - `bin/cli.ts`：`GEMINI_BRIDGE_PORT` 已设置 → **桥模式分支**（对话全在网页，CLI 仅宿主 HTTP 服务 + 状态日志）：建服务 → `getPort()`（失败友好报错 exit 1）→ 打印监听地址与使用说明 → 等 SIGINT/SIGTERM（中断级联）→ `close()` → exit 130；未设置 → 原 HumanAgent REPL 路径
-- `extensions/gemini-bridge/`：Chrome/Edge MV3 扩展（v2 已落地，真实 DOM 选择器 2026-08-19 落定）：content 浮动面板（**自动模式开关 + 防检测设置**：模拟人类**分段粘贴 + 错别字纠错**输入——整段粘贴模拟 Ctrl+V、按概率预留错字→退格→逐字重打、段间随机停顿，段长/纠错概率/延迟区间均面板可配，提交前随机延迟默认 3–8s；桥服务地址可编辑）+ 桥不可达「桥未连接（重试中）」指数退避降级；内容监控循环（稳定采样 + announcer 新鲜度判定；**extractReply 还原代码块围栏**——AI Studio 把 markdown 代码块渲染成 `ms-code-block[data-test-language]`，innerText 丢围栏，提取时克隆替换为 ```lang 围栏文本，保证 ```tool_call 识别信号不丢失）、投递循环（长轮询→模拟输入→自动/手动提交）、新对话检测（会话容器重置→协议文本重新注入）；background 全 try/catch 中转（get-task 30s 超时、POST /result 10s 超时）；**危险命令审批**：投递循环识别审批消息 → 面板开关「自动授权危险命令」（默认关）静默放行或弹窗（逐条允许/拒绝 + 全部允许 + 倒计时自动拒绝，超时面板可配默认 120s）；background 中转 POST /approval
+- `extensions/gemini-bridge/`：Chrome/Edge MV3 扩展（v2 已落地，真实 DOM 选择器 2026-08-19 落定）：content 浮动面板（**自动模式开关 + 防检测设置**：模拟人类**分段粘贴 + 错别字纠错**输入——整段粘贴模拟 Ctrl+V、按概率预留错字→退格→逐字重打、段间随机停顿，段长/纠错概率/延迟区间均面板可配，提交前随机延迟默认 3–8s；桥服务地址可编辑）+ 桥不可达「桥未连接（重试中）」指数退避降级；内容监控循环（稳定采样 + announcer 新鲜度判定；**extractReply 还原代码块围栏**——AI Studio 把 markdown 代码块渲染成 `ms-code-block[data-test-language]`，innerText 丢围栏，提取时克隆替换为 ```lang 围栏文本，保证 ```tool_call 识别信号不丢失）、投递循环（长轮询→模拟输入→自动/手动提交）、新对话检测（会话容器重置→协议文本重新注入）；background 全 try/catch 中转（get-task 30s 超时、POST /result 10s 超时）；**权限模型审批**：投递循环识别审批消息 → 面板开关「自动授权危险命令」（默认关）静默放行或弹窗（逐条 允许/拒绝 + 白名单按钮——非写类 exact、写类「此路径」「此目录」+ 全部允许/拒绝 + 倒计时自动拒绝，超时面板可配默认 120s；白名单条目并入 POST /approval 的 whitelist 字段，服务端校验对应 allowed=true 的调用）；background 中转 POST /approval
+
+阶段六（统一权限模型）已完成（TDD）：
+- `src/nose/policy.ts`：`PermissionPolicy`——黑名单判定 + 白名单加载/匹配/冗余清理/持久化（按工作区绝对路径分节）；`classify` 顺序：黑名单 → 白名单 → 未列；归一化（`normalizePath` win32 小写 / `normalizeCommand` 空白折叠+反斜杠转正斜杠）、`matchKeyFor`（terminal → 命令、写类 → path、其余 → 排序参数 JSON）、`buildWhitelistEntry`（exact/path/dir 三粒度，dir 无父目录时降级文件条目）、`ensureWorkspace`（启动 CWD 注册 write_file path-dir 条目，跨工具覆盖 apply_patch）、`addEntry`（去重 + 加父去子/子被父盖跳过，落盘失败不崩溃）；白名单文件 `~/.human-agent/whitelist.json` 损坏/缺失降级空白名单，加载条目级校验（防手改垃圾条目导致 classify 崩溃）
+- `src/nose/blacklist.ts`：黑名单内置模式数组（随版本，用户可手改责任自负）——根/系统盘递归删除、系统目录删除、启动文件、格式化、整盘擦除、块设备直写与重定向、mkfs/分区表、Boot 注册表、必崩进程、权限全毁、**写类工具写系统目录**（path 形态锚定开头 `c:/windows/(system32|boot)` 与 `c:/system volume information`，终结符限定子树——`C:\Windows\Temp` 等可恢复目录不入、裸 `C:\Windows` 根级单文件不入；terminal 命令串不以盘符开头天然不命中）
+- `src/brain/thinking.ts`：`BaseThinking` 通用基类——持有 Reflection + PermissionPolicy + workspace（启动 CWD 规范化路径），构造接受 `workspace`/`whitelistFile` 注入（测试隔离防污染真实白名单）；统一裁决入口 `reflect(calls)`（黑名单 → 未知/非法 → 白名单 → pending）、`classify`、`addWhitelistEntry`（白名单落盘）、`workspaceConstraint()`（工作区声明文本）、`toolProtocol()`（工作区声明 + 工具协议文本）；`OllamaThinking`/`GeminiBridgeThinking` 继承（桥与 CLI 裁决行为必然一致）
+- `src/brain/reflection.ts`：集成 PermissionPolicy——裁决顺序：BLACKLIST（两模式一致）→ UNKNOWN_TOOL → INVALID_ARGS → 白名单放行 → pending（需授权标记，审批通道由宿主负责）
+- `src/mouth/ask-user.ts`：新增 `askApproval(prompt)` 三选审批——`[y] 允许 [n] 拒绝 [w] 加入白名单`，写类另有 `[d] 白名单(此目录)`（父目录段级前缀条目），无效输入循环追问；`MouthContract`/`ApprovalPrompt`/`ApprovalChoice` 契约（types/organ.ts）
+- 接入：loop `#execute` pending 走嘴巴三选；桥 pending 批量审批 + `POST /approval` 可选 `whitelist` 字段（校验：条目必须对应本批 allowed=true 的调用——exact 与匹配键一致、path 为「此路径」文件条目或「此目录」父目录条目，不合法 400）；扩展弹窗白名单按钮（内容见阶段五 extensions 条目）；`src/agent.ts` `HumanAgent`/`buildBridgeService` 透传 `whitelistFile`；CLI 启动 system 消息注入 `workspaceConstraint()`（agent.run 装配）
 
 **尚未开始**：voice/image/browser 等预留器官（`eyes/image-viewer.ts`、`ears/voice-input.ts`、`mouth/voice-output.ts`、`hands/browser-action.ts`）。
 
@@ -52,19 +60,19 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 顶层模块以人类生物学器官抽象，每层只依赖相邻的神经信号，职责专一：
 
-- 🧠 `src/brain/`（大脑）：知识与思考。`knowledge.ts` 知识库（工具如何使用的知识，未来 RAG 在此聚合）、思考层（`ollama-thinking.ts` 模型推理 / `gemini-bridge-thinking.ts` 执行型桥服务，直接位于本目录）、`reflection.ts` 反思层（可行性裁决，确定性代码）、`context.ts` 会话消息队列（仅 Ollama 模式用）；`llm.ts` 统一推理接口
+- 🧠 `src/brain/`（大脑）：知识与思考。`knowledge.ts` 知识库（工具如何使用的知识，未来 RAG 在此聚合）、`thinking.ts` 通用基类（BaseThinking：权限 + 反思 + 工作区，桥与 CLI 共用的确定性层）、思考层（`ollama-thinking.ts` 模型推理 / `gemini-bridge-thinking.ts` 执行型桥服务，均继承 BaseThinking）、`reflection.ts` 反思层（可行性裁决，确定性代码）、`context.ts` 会话消息队列（仅 Ollama 模式用）；`llm.ts` 统一推理接口
 - 🫀 `src/heart/`（心脏）：生命循环。`loop.ts` 推进 `听取指令 → 大脑思考 → 反思裁决 → 手眼执行 → 反馈结果 → 循环/结束`，并承担承受力（任务/单命令超时、maxIterations、中断）；`executor.ts` 共享工具执行路由（loop 与桥服务共用）；`interrupt.ts` 持有全局 `AbortController`
 - 👁️ `src/eyes/`（眼睛）：**只读**。文件读/目录遍历/代码检索、网页抓取转 Clean Markdown。
 - 👂 `src/ears/`（耳朵）：输入。终端 REPL、语音（预留）。
-- 🗣️ `src/mouth/`（嘴巴）：输出。流式 Markdown/彩色终端输出、`confirm(message): Promise<boolean>` 交互确认。
+- 🗣️ `src/mouth/`（嘴巴）：输出。流式 Markdown/彩色终端输出、`confirm(message): Promise<boolean>` 交互确认、`askApproval(prompt)` 三选审批（允许/拒绝/加入白名单，写类另有「此目录」）。
 - ✋ `src/hands/`（双手）：**写/执行**。文件写入与 Patch、基于 `execa` 的 Shell 执行（绑定中断信号、超时强杀）。
-- 👃 `src/nose/`（鼻子）：嗅探预警。危险特征规则库（`rm -rf`、`DROP TABLE`、`git push --force` 等）输出 `SAFE`/`DANGEROUS` 等级；环境快照（OS、CWD、Git 分支、端口占用）。
+- 👃 `src/nose/`（鼻子）：权限与嗅探。`policy.ts`（PermissionPolicy：黑名单 + 白名单统一裁决）、`blacklist.ts`（内置黑名单规则库，随版本）、`risk-checker.ts`（独立危险特征嗅探，输出 `SAFE`/`DANGEROUS`，保留为观察模块、不再参与裁决）；环境快照（OS、CWD、Git 分支、端口占用）。
 
 组装入口：`src/agent.ts`——`HumanAgent` 类通过构造函数依赖注入全部器官（`brain, heart, eyes, hands, mouth, nose, ears`），恒为 Ollama 模式；`buildBridgeService()` 组装执行型桥服务。
 
 ## 不可违反的设计原则
 
-1. **动静绝对分离**：眼睛只读、无副作用、无需安全审批；双手是破坏性操作必须受控；双手行动前由鼻子嗅探，检出危险则嘴巴向用户发起确认。
+1. **动静绝对分离**：眼睛只读、无副作用、无需安全审批；双手是破坏性操作必须受控；双手行动前经权限模型裁决——黑名单（确定性系统破坏）直接拒绝、白名单（用户信任）静默执行、未列入的向用户审批（CLI 终端三选 / 桥扩展弹窗），审批通过可加入白名单。
 2. **异常即反馈，永不崩溃**：双手/眼睛执行失败（退出码非 0、文件不存在、超时等）**严禁抛出未捕获异常**，必须包装成 `ActionResult` 返回给大脑在下一循环中自我修复。
 3. **中断第一公民**：`Ctrl+C` 由心脏毫秒级捕获，级联向所有器官下发 `AbortSignal`，停止子进程、取消网络流、保护现场；器官检测到 `signal.aborted` 后迅速退出并将生命体状态置为 `INTERRUPTED`，会话历史不丢失。
 4. **轻量起步**：只装基础设施依赖（chalk、commander、execa、zod），大模型 SDK、TTS/ASR 等重度依赖在具体阶段按需引入。
@@ -116,3 +124,4 @@ CLI 入口为 `bin/cli.ts`（处理 argv）。
 3. 嘴巴与耳朵（text-output、ask-user、text-input）✅
 4. 大脑与心脏（loop 状态机、interrupt、接入具体大模型）✅（OllamaBrain + qwen3，`OLLAMA_MODEL` 可换模型）
 5. Gemini 桥与职责模型重构（knowledge/ollama-thinking/gemini-bridge-thinking/reflection + 共享执行器、浏览器扩展桥）✅（扩展 v2 重写待真实 AI Studio DOM）
+6. 统一权限模型（thinking/policy/blacklist + Reflection 集成 + CLI/桥 pending 审批 + 扩展白名单按钮）✅

@@ -205,6 +205,9 @@ GeminiBridgeThinking extends BaseThinking
 | 块设备直写 | `dd ... of=\\.\PhysicalDrive0`、`of=\\.\C:` |
 | Boot 关键注册表 | `reg delete HKLM\SYSTEM`、`reg delete HKLM\SOFTWARE\Microsoft\Windows NT\CurrentVersion`、`Remove-Item HKLM:\SYSTEM` |
 | 系统关键进程强杀 | `taskkill /f /im lsass.exe`、`...csrss.exe`、`...wininit.exe`、`...winlogon.exe` |
+| 写类工具写系统目录（path 匹配） | `write_file C:\Windows\System32\...`、`write_file C:\Windows\Boot\...`、`write_file ...\System Volume Information\...` |
+
+「写类工具写系统目录」按 path 匹配（实现为锚定开头的两条形态：`c:/windows/(system32|boot)` 与 `c:/system volume information`，各跟终结符 `\/` 或 `$`）：只拦 system32/boot 子树（含裸目录本身），**不**拦 `C:\Windows\Temp` 等可恢复目录；裸 `C:\Windows` 根级单文件（非 system32/boot 子树）不入。terminal 命令串不以盘符开头，天然不命中该类别（该形态只对写类工具生效）。
 
 ### Linux / macOS
 
