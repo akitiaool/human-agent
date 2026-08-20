@@ -96,6 +96,9 @@ describe("路径穿越折叠（.. 段解析）", () => {
   it("路径穿越折叠：.. 段解析（黑名单锚定不被绕过、工作区边界不被穿透）", () => {
     expect(normalizePath("c:/users/me/project/../../../windows/system32/drivers/hosts")).toBe("c:/windows/system32/drivers/hosts");
     expect(classify(call("write_file", { path: "C:/users/me/project/../../../windows/system32/drivers/hosts", content: "x" }))).toBe("blacklist");
+    // Fix J：大写盘符深度穿越（修复前 isDrive 不命中 → 盘符段被 pop → 锚定失效）
+    expect(normalizePath("C:/ws/../../windows/system32/drivers/hosts")).toBe("c:/windows/system32/drivers/hosts");
+    expect(classify(call("write_file", { path: "C:/ws/../../windows/system32/drivers/hosts", content: "x" }))).toBe("blacklist");
     expect(classify(call("write_file", { path: "/ws/../secret.txt", content: "x" }))).toBe("unlisted");
     const p = new PermissionPolicy({
       workspace: "/ws",

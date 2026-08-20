@@ -784,7 +784,7 @@ function normalizeKey(call, granularity) {
       .replace(/\/+/g, "/");
     // 段级解析：折叠 . 与 ..（与服务端 normalizePath 一致——防 c:/ws/../../windows 穿越绕过黑名单锚定/工作区边界）
     const isAbs = p.startsWith("/");
-    const isDrive = /^[a-z]:\//.test(p);
+    const isDrive = /^[a-z]:\//i.test(p);
     const out = [];
     for (const s of p.split("/")) {
       if (s === "" || s === ".") continue;

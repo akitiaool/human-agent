@@ -14,7 +14,7 @@ const WRITE_TOOLS = new Set(["write_file", "apply_patch"]);
 /** 段级解析：折叠 . 与 ..（盘符根/根之上不可越）——防 c:/ws/../../windows 穿越绕过黑名单锚定/工作区边界。 */
 function resolvePathSegments(p: string): string {
   const isAbs = p.startsWith("/");
-  const isDrive = /^[a-z]:\//.test(p);
+  const isDrive = /^[a-z]:\//i.test(p);
   const out: string[] = [];
   for (const s of p.split("/")) {
     if (s === "" || s === ".") continue;
