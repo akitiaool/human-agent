@@ -164,12 +164,28 @@ function covers(parentKey: string, childKey: string): boolean {
   return parentKey.endsWith("/") && (childKey === parentKey || childKey.startsWith(parentKey));
 }
 
+/** 条目结构校验：tool/key 为 string、kind 为合法值；垃圾条目过滤（防手改文件导致 classify 崩溃）。 */
+function isEntry(item: unknown): item is WhitelistEntry {
+  if (typeof item !== "object" || item === null) return false;
+  const w = item as Record<string, unknown>;
+  return (
+    typeof w.tool === "string" &&
+    typeof w.key === "string" &&
+    (w.kind === "exact" || w.kind === "path")
+  );
+}
+
 function loadSections(file: string): Record<string, WhitelistEntry[]> {
   try {
     const raw = readFileSync(file, "utf8");
     const parsed = JSON.parse(raw) as unknown;
     if (typeof parsed === "object" && parsed !== null) {
-      return parsed as Record<string, WhitelistEntry[]>;
+      const out: Record<string, WhitelistEntry[]> = {};
+      for (const [workspace, entries] of Object.entries(parsed as Record<string, unknown>)) {
+        if (!Array.isArray(entries)) continue;
+        out[workspace] = entries.filter(isEntry);
+      }
+      return out;
     }
   } catch {
     // 损坏/不存在 → 空白名单（默认模式全弹窗、自动模式黑名单外全放行，不崩溃）

@@ -1,5 +1,5 @@
 // tests/policy.test.ts
-import { mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterAll, beforeEach, describe, expect, it } from "vitest";
@@ -243,5 +243,27 @@ describe("PermissionPolicy 持久化与清理", () => {
     expect(p.entries()).toHaveLength(1);
     expect(p.classify({ name: "write_file", arguments: { path: "/home/u/proj/src/a.ts", content: "x" } })).toBe("whitelist");
     expect(p.classify({ name: "write_file", arguments: { path: "/home/u/elsewhere/a.ts", content: "x" } })).toBe("unlisted");
+  });
+
+  it("内容损坏（非 JSON）降级为空白名单", () => {
+    const bad = join(tempDir, "corrupt.json");
+    writeFileSync(bad, "{ not json", "utf8");
+    const p = new PermissionPolicy({ file: bad, workspace: "/ws" });
+    expect(p.entries()).toEqual([]);
+  });
+
+  it("垃圾条目（缺 key/非法 kind/非数组分节）被过滤，classify 不崩溃", () => {
+    const bad = join(tempDir, "junk.json");
+    writeFileSync(
+      bad,
+      JSON.stringify({
+        "/ws": [{ tool: "write_file" }, { tool: "terminal", key: "ls", kind: "exact" }, { tool: "write_file", key: "x" }],
+        "/ws2": "not-array",
+      }),
+      "utf8",
+    );
+    const p = new PermissionPolicy({ file: bad, workspace: "/ws" });
+    expect(p.entries()).toEqual([{ tool: "terminal", key: "ls", kind: "exact" }]);
+    expect(p.classify({ name: "terminal", arguments: { command: "ls" } })).toBe("whitelist");
   });
 });
