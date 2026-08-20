@@ -62,7 +62,7 @@ export class HumanAgent {
     this.context = options.context ?? new ConversationContext({ maxTokens: 8000 });
     this.maxIterations = options.maxIterations ?? 10;
     this.timeoutMs = options.timeoutMs;
-    this.brain = options.brain ?? buildDefaultBrain(this.nose, this.mouth);
+    this.brain = options.brain ?? buildDefaultBrain();
   }
 
   async run(): Promise<AgentStatus> {
@@ -82,10 +82,8 @@ export class HumanAgent {
   }
 }
 
-function buildDefaultBrain(nose: NoseContract, mouth: MouthContract): BrainInference {
+function buildDefaultBrain(): BrainInference {
   return new OllamaThinking({
-    nose,
-    mouth,
     ...(process.env.OLLAMA_BASE_URL !== undefined ? { baseUrl: process.env.OLLAMA_BASE_URL } : {}),
     ...(process.env.OLLAMA_MODEL !== undefined ? { model: process.env.OLLAMA_MODEL } : {}),
   });
@@ -100,7 +98,6 @@ export interface BridgeServiceOptions {
 
 /** 桥模式组装：网页对话 + 智能体仅执行工具。port 缺省读 GEMINI_BRIDGE_PORT（非法回退 8765）。 */
 export function buildBridgeService(options: BridgeServiceOptions = {}): GeminiBridgeThinking {
-  const nose = buildDefaultNose();
   const hands = buildDefaultHands();
   const eyes = buildDefaultEyes();
   const port = options.port ?? (() => {
@@ -111,7 +108,6 @@ export function buildBridgeService(options: BridgeServiceOptions = {}): GeminiBr
   })();
   return new GeminiBridgeThinking({
     port,
-    nose,
     hands,
     eyes,
     ...(options.signal !== undefined ? { signal: options.signal } : {}),

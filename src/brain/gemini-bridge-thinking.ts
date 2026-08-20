@@ -6,16 +6,14 @@
 import http from "node:http";
 import type { AddressInfo } from "node:net";
 import { executeTool, type ToolOrgans } from "../heart/executor.js";
-import type { ActionResult, EyesContract, HandsContract, NoseContract } from "../types/index.js";
+import type { ActionResult, EyesContract, HandsContract } from "../types/index.js";
 import { fail } from "../types/index.js";
-import { schemas, serializeToolProtocol } from "./knowledge.js";
 import type { BrainInferenceResult, ToolCall } from "./llm.js";
-import { Reflection } from "./reflection.js";
+import { BaseThinking, type BaseThinkingOptions } from "./thinking.js";
 
-export interface GeminiBridgeThinkingOptions {
+export interface GeminiBridgeThinkingOptions extends BaseThinkingOptions {
   port?: number;
   host?: string;
-  nose: NoseContract;
   hands: HandsContract;
   eyes: EyesContract;
   /** 全局中断 AbortSignal（Ctrl+C 级联）；缺省为永不中断的控制器。 */
@@ -63,10 +61,9 @@ function isToolCall(value: unknown): value is ToolCall {
 }
 
 /** 回填消息队列（outbox）+ 长轮询 waiter 的唤醒协议。 */
-export class GeminiBridgeThinking {
+export class GeminiBridgeThinking extends BaseThinking {
   readonly #server: http.Server;
   readonly #portPromise: Promise<number>;
-  readonly #reflection: Reflection;
   readonly #organs: ToolOrgans;
   readonly #signal: AbortSignal;
   readonly #timeoutMs: number;
@@ -75,7 +72,6 @@ export class GeminiBridgeThinking {
   readonly #waiters: Array<() => void> = [];
   readonly #approvals = new Map<number, { settle: (decision: ApprovalDecision) => void; count: number }>();
   #nextApprovalId = 1;
-  readonly #nose: NoseContract;
   readonly #approvalTimeoutMs: number;
   /** 单批串行队列：一次只处理一批，避免并发批交错。 */
   #busy: Promise<void> = Promise.resolve();
@@ -85,9 +81,7 @@ export class GeminiBridgeThinking {
   #closed = false;
 
   constructor(options: GeminiBridgeThinkingOptions) {
-    // 桥模式注入"永远拒绝"的嘴巴：反思层兜底（危险命令改走扩展审批，不经嘴巴）
-    this.#reflection = new Reflection(options.nose, { confirm: async () => false });
-    this.#nose = options.nose;
+    super(options); // 内部建 policy + ensureWorkspace + Reflection
     this.#approvalTimeoutMs = options.approvalTimeoutMs ?? 600_000;
     this.#organs = { eyes: options.eyes, hands: options.hands };
     this.#signal = options.signal ?? new AbortController().signal;
@@ -101,8 +95,8 @@ export class GeminiBridgeThinking {
         resolve(address.port);
       });
     });
-    // 启动即入队工具协议：让网页 Gemini 一开始就知道 ```tool_call``` 格式
-    this.#outbox.push({ type: "message", message: serializeToolProtocol() });
+    // 首条协议消息：工作区声明 + 工具协议（toolProtocol）
+    this.#outbox.push({ type: "message", message: this.toolProtocol() });
   }
 
   async getPort(): Promise<number> {
@@ -217,22 +211,9 @@ export class GeminiBridgeThinking {
         ? AbortSignal.any([this.#signal, AbortSignal.timeout(this.#timeoutMs)])
         : this.#signal;
 
-    // 预筛：参数合法且鼻子判定危险的 terminal 摘出；参数非法的危险命令留给 Reflection 以 INVALID_ARGS 拒绝
+    // 预筛：危险判定已移交统一 reflect（BLACKLIST 绝对拒绝）；危险命令审批通道待 Task 6 经 pending 接入
     const dangerous: ToolCall[] = [];
-    const rest: ToolCall[] = [];
-    for (const call of calls) {
-      if (call.name === "terminal") {
-        const parsed = schemas.terminal.safeParse(call.arguments);
-        if (parsed.success) {
-          const { command } = parsed.data as { command: string };
-          if (this.#nose.checkRisk(command) === "DANGEROUS") {
-            dangerous.push(call);
-            continue;
-          }
-        }
-      }
-      rest.push(call);
-    }
+    const rest: readonly ToolCall[] = calls;
 
     // 批量审批：一条请求含全部危险命令；批中止时作废审批条目并清除兜底定时器
     let decision: ApprovalDecision | undefined;
@@ -248,7 +229,7 @@ export class GeminiBridgeThinking {
       }
     }
 
-    const verdict = await this.#reflection.reflect(rest);
+    const verdict = await this.reflect(rest);
     const dangerSet = new Set(dangerous);
     const allowedSet = new Set(verdict.allowed);
     const blockedMap = new Map(verdict.blocked.map((item) => [item.call, item.result] as const));
