@@ -1,15 +1,19 @@
 import { ConversationContext } from "../brain/context.js";
 import { TOOLS } from "../brain/knowledge.js";
 import type { BrainInference, BrainInferenceResult, ToolCall } from "../brain/llm.js";
+import { matchKeyFor } from "../nose/policy.js";
 import type {
   ActionResult,
   AgentOutput,
   AgentPhase,
   AgentStatus,
+  ApprovalPrompt,
   EarsContract,
   EyesContract,
   HandsContract,
+  MouthContract,
 } from "../types/index.js";
+import { fail } from "../types/index.js";
 import { executeTool } from "./executor.js";
 
 export interface AgentLoopOptions {
@@ -17,6 +21,7 @@ export interface AgentLoopOptions {
   ears: EarsContract;
   eyes: EyesContract;
   hands: HandsContract;
+  mouth: MouthContract;
   output: AgentOutput;
   signal: AbortSignal;
   context?: ConversationContext;
@@ -46,6 +51,7 @@ export class AgentLoop {
   readonly #ears: EarsContract;
   readonly #eyes: EyesContract;
   readonly #hands: HandsContract;
+  readonly #mouth: MouthContract;
   readonly #output: AgentOutput;
   readonly #signal: AbortSignal;
   readonly #context: ConversationContext;
@@ -61,6 +67,7 @@ export class AgentLoop {
     this.#ears = options.ears;
     this.#eyes = options.eyes;
     this.#hands = options.hands;
+    this.#mouth = options.mouth;
     this.#output = options.output;
     this.#signal = options.signal;
     this.#context = options.context ?? new ConversationContext({ maxTokens: 8000 });
@@ -222,6 +229,42 @@ export class AgentLoop {
       if (this.#turnTimedOut) {
         this.#output.warn("任务超时，已终止本轮。");
         return;
+      }
+      this.#emit("ACTING", call.name);
+      const result = await executeTool(
+        { eyes: this.#eyes, hands: this.#hands },
+        call.name,
+        call.arguments,
+        turnSignal,
+      );
+      this.#finish(call.name, result);
+      this.#context.add({ role: "tool", name: call.name, content: JSON.stringify(result) });
+    }
+    for (const call of verdict.pending) {
+      if (this.#signal.aborted) {
+        this.#status = "INTERRUPTED";
+        return;
+      }
+      if (this.#turnTimedOut) {
+        this.#output.warn("任务超时，已终止本轮。");
+        return;
+      }
+      const isWrite = call.name === "write_file" || call.name === "apply_patch";
+      const prompt: ApprovalPrompt = {
+        tool: call.name,
+        key: matchKeyFor(call) ?? "",
+        kind: isWrite ? "path" : "exact",
+      };
+      const choice = await this.#mouth.askApproval(prompt);
+      if (choice.action === "deny") {
+        const denied = fail("USER_DENIED", `用户拒绝了工具调用: ${call.name}`);
+        this.#finish(call.name, denied);
+        this.#context.add({ role: "tool", name: call.name, content: JSON.stringify(denied) });
+        continue;
+      }
+      if (choice.action === "whitelist") {
+        await this.#brain.addWhitelistEntry(choice.entry);
+        this.#output.info(`已加入白名单：${choice.entry.tool} ${choice.entry.key}`);
       }
       this.#emit("ACTING", call.name);
       const result = await executeTool(

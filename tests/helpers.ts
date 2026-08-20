@@ -18,6 +18,7 @@ import type {
   MouthContract,
   NoseContract,
   RiskLevel,
+  WhitelistEntry,
 } from "../src/types/index.js";
 
 /** 类方法在 prototype 上，对象展开不会复制，必须显式组合（agent.ts 组装时同理）。 */
@@ -103,8 +104,18 @@ export class ScriptedBrain implements BrainInference {
   }
 
   async reflect(calls: readonly ToolCall[]): Promise<ReflectionVerdict> {
-    return this.reflectVerdict ?? { allowed: [...calls], blocked: [] };
+    return this.reflectVerdict ?? { allowed: [...calls], pending: [], blocked: [] };
   }
+
+  async addWhitelistEntry(entry: WhitelistEntry): Promise<void> {
+    this.addedWhitelist.push(entry);
+  }
+
+  workspaceConstraint(): string {
+    return "你的工作区是 /ws-test（测试）";
+  }
+
+  public readonly addedWhitelist: WhitelistEntry[] = [];
 
   callCount(): number {
     return this.calls.length;

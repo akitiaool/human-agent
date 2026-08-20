@@ -68,11 +68,15 @@ export class HumanAgent {
   }
 
   async run(): Promise<AgentStatus> {
+    if (!this.context.getAll().some((message) => message.role === "system")) {
+      this.context.add({ role: "system", content: this.brain.workspaceConstraint() });
+    }
     const loop = new AgentLoop({
       brain: this.brain,
       ears: this.ears,
       eyes: this.eyes,
       hands: this.hands,
+      mouth: this.mouth,
       output: this.output,
       signal: this.interrupt.getSignal(),
       context: this.context,

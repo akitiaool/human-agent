@@ -126,6 +126,33 @@ describe("HumanAgent", () => {
     }
   });
 
+  it("运行前向上下文注入工作区 system 消息（brain 提供 workspaceConstraint）", async () => {
+    const brain = new ScriptedBrain([{ result: { text: "回答" } }]);
+    const agent = new HumanAgent({
+      brain,
+      ears: new FakeEars(["hi", "/exit"]),
+      output: new FakeOutput(),
+    });
+    await agent.run();
+    const system = brain.messagesOf(0).find((m) => m.role === "system");
+    expect(system?.content).toContain("工作区是");
+  });
+
+  it("上下文已有 system 消息时不重复注入", async () => {
+    const brain = new ScriptedBrain([{ result: { text: "回答" } }]);
+    const agent = new HumanAgent({
+      brain,
+      ears: new FakeEars(["hi", "/exit"]),
+      output: new FakeOutput(),
+      context: new ConversationContext({ maxTokens: 8000 }),
+    });
+    agent.context.add({ role: "system", content: "自定义系统提示" });
+    await agent.run();
+    const systems = brain.messagesOf(0).filter((m) => m.role === "system");
+    expect(systems).toHaveLength(1);
+    expect(systems[0]!.content).toBe("自定义系统提示");
+  });
+
 });
 
 it("buildBridgeService 返回可监听的桥服务", async () => {

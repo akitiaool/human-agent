@@ -1,8 +1,10 @@
+import { rmSync } from "node:fs";
 import { describe, expect, it, vi } from "vitest";
 import { ConversationContext } from "../src/brain/context.js";
 import { AgentLoop } from "../src/heart/loop.js";
 import { TextOutput } from "../src/mouth/text-output.js";
-import { fail, type AgentPhase, type EarsContract } from "../src/types/index.js";
+import { fail, type AgentPhase, type EarsContract, type MouthContract } from "../src/types/index.js";
+import type { ApprovalChoice, ApprovalPrompt, WhitelistEntry } from "../src/types/index.js";
 import type { BrainInference, BrainInferenceResult, ReflectionVerdict, ToolCall, ToolInfo } from "../src/brain/llm.js";
 import {
   FakeEars,
@@ -11,6 +13,12 @@ import {
   buildEyes,
   buildHands,
 } from "./helpers.js";
+
+/** 共享嘴巴替身：confirm 一律放行、审批一律允许。 */
+const autoAllowMouth: MouthContract = {
+  confirm: async () => true,
+  askApproval: async () => ({ action: "allow" }),
+};
 
 class HangingEars implements EarsContract {
   public promptCalls = 0;
@@ -44,6 +52,12 @@ class AbortableBrain implements BrainInference {
   async reflect(calls: readonly ToolCall[]): Promise<ReflectionVerdict> {
     return { allowed: [...calls], blocked: [] };
   }
+
+  async addWhitelistEntry(): Promise<void> {}
+
+  workspaceConstraint(): string {
+    return "test";
+  }
 }
 
 /** 第一轮 infer 挂起（等待超时取消），之后正常回答。 */
@@ -69,12 +83,19 @@ class TimeoutThenAnswerBrain implements BrainInference {
   async reflect(calls: readonly ToolCall[]): Promise<ReflectionVerdict> {
     return { allowed: [...calls], blocked: [] };
   }
+
+  async addWhitelistEntry(): Promise<void> {}
+
+  workspaceConstraint(): string {
+    return "test";
+  }
 }
 
 function makeLoop(options: {
   brain: BrainInference;
   ears: EarsContract;
   signal: AbortSignal;
+  mouth?: MouthContract;
   maxIterations?: number;
   timeoutMs?: number;
   onPhase?: (phase: AgentPhase, detail?: string) => void;
@@ -86,10 +107,22 @@ function makeLoop(options: {
     hands: buildHands(),
     output: new TextOutput({ stdout: new FakeWritable(), intervalMs: 0 }),
     signal: options.signal,
+    mouth: options.mouth ?? autoAllowMouth,
     maxIterations: options.maxIterations,
     timeoutMs: options.timeoutMs,
     onPhase: options.onPhase,
   });
+}
+
+/** 反思裁决：调用挂起（结构合法且未命中白名单），由嘴巴三选裁决。 */
+function pendingBrain(call: ToolCall) {
+  return new ScriptedBrain(
+    [
+      { result: { text: "", toolCalls: [call] } },
+      { result: { text: "结束" } },
+    ],
+    { allowed: [], pending: [call], blocked: [] },
+  );
 }
 
 describe("AgentLoop", () => {
@@ -144,6 +177,7 @@ describe("AgentLoop", () => {
       hands: buildHands(),
       output: new TextOutput({ stdout: new FakeWritable(), intervalMs: 0 }),
       signal,
+      mouth: autoAllowMouth,
     });
     await loop.run();
     const toolMessage = brain.messagesOf(1).find((m) => m.role === "tool");
@@ -184,7 +218,11 @@ describe("AgentLoop", () => {
         { result: { text: "", toolCalls: [call] } },
         { result: { text: "已跳过" } },
       ],
-      { allowed: [], blocked: [{ call, result: fail("USER_DENIED", "用户拒绝了命令") }] },
+      {
+        allowed: [],
+        pending: [],
+        blocked: [{ call, result: fail("USER_DENIED", "用户拒绝了命令") }],
+      },
     );
     const signal = new AbortController().signal;
     const loop = makeLoop({ brain, ears: new FakeEars(["删除它", "/exit"]), signal });
@@ -236,6 +274,7 @@ describe("AgentLoop", () => {
       hands: buildHands(),
       output: new TextOutput({ stdout: stream, intervalMs: 0 }),
       signal,
+      mouth: autoAllowMouth,
       timeoutMs: 300_000,
     });
     await loop.run();
@@ -255,6 +294,7 @@ describe("AgentLoop", () => {
       hands: buildHands(),
       output: new TextOutput({ stdout: stream, intervalMs: 0 }),
       signal,
+      mouth: autoAllowMouth,
     });
     await loop.run();
     expect(stream.output).toContain("无法解析超时时长");
@@ -271,6 +311,7 @@ describe("AgentLoop", () => {
       hands: buildHands(),
       output: new TextOutput({ stdout: stream, intervalMs: 0 }),
       signal,
+      mouth: autoAllowMouth,
       timeoutMs: 20,
     });
     await loop.run();
@@ -322,6 +363,7 @@ describe("AgentLoop", () => {
       hands: buildHands(),
       output,
       signal,
+      mouth: autoAllowMouth,
     });
     await loop.run();
     expect(loop.getStatus()).toBe("ERROR");
@@ -342,6 +384,7 @@ describe("AgentLoop", () => {
       hands: buildHands(),
       output,
       signal,
+      mouth: autoAllowMouth,
       maxIterations: 2,
     });
     await loop.run();
@@ -422,6 +465,7 @@ describe("AgentLoop", () => {
       hands: buildHands(),
       output,
       signal,
+      mouth: autoAllowMouth,
       context,
     });
     await loop.run();
@@ -443,6 +487,11 @@ describe("AgentLoop", () => {
       async reflect(): Promise<ReflectionVerdict> {
         throw new Error("reflect boom");
       }
+      async addWhitelistEntry(): Promise<void> {}
+
+      workspaceConstraint(): string {
+        return "test";
+      }
     }
     const signal = new AbortController().signal;
     const stream = new FakeWritable();
@@ -454,10 +503,82 @@ describe("AgentLoop", () => {
       hands: buildHands(),
       output,
       signal,
+      mouth: autoAllowMouth,
     });
     await loop.run();
     expect(loop.getStatus()).toBe("ERROR");
     expect(stream.output).toContain("执行阶段失败");
     expect(stream.output).toContain("reflect boom");
+  });
+
+  it("pending 允许：嘴巴三选 allow → 执行并反馈 tool 消息", async () => {
+    const call = { name: "terminal", arguments: { command: "ls -la" } };
+    const brain = pendingBrain(call);
+    const prompts: ApprovalPrompt[] = [];
+    const loop = new AgentLoop({
+      brain,
+      ears: new FakeEars(["任务", "/exit"]),
+      eyes: buildEyes(),
+      hands: buildHands(),
+      output: new TextOutput({ stdout: new FakeWritable(), intervalMs: 0 }),
+      signal: new AbortController().signal,
+      mouth: {
+        confirm: async () => true,
+        askApproval: async (prompt) => {
+          prompts.push(prompt);
+          return { action: "allow" };
+        },
+      },
+    });
+    await loop.run();
+    expect(prompts).toEqual([{ tool: "terminal", key: "ls -la", kind: "exact" }]);
+    const toolMessage = brain.messagesOf(1).find((m) => m.role === "tool");
+    expect(JSON.parse(toolMessage!.content) as { success: boolean }).toMatchObject({ success: true });
+  });
+
+  it("pending 拒绝：USER_DENIED 反馈，不执行", async () => {
+    const call = { name: "terminal", arguments: { command: "ls -la" } };
+    const brain = pendingBrain(call);
+    const loop = new AgentLoop({
+      brain,
+      ears: new FakeEars(["任务", "/exit"]),
+      eyes: buildEyes(),
+      hands: buildHands(),
+      output: new TextOutput({ stdout: new FakeWritable(), intervalMs: 0 }),
+      signal: new AbortController().signal,
+      mouth: { confirm: async () => true, askApproval: async () => ({ action: "deny" }) },
+    });
+    await loop.run();
+    const toolMessage = brain.messagesOf(1).find((m) => m.role === "tool");
+    const parsed = JSON.parse(toolMessage!.content) as { success: boolean; error?: { code: string } };
+    expect(parsed.success).toBe(false);
+    expect(parsed.error?.code).toBe("USER_DENIED");
+  });
+
+  it("pending 加入白名单：条目落盘后执行", async () => {
+    const call = { name: "write_file", arguments: { path: "src/a.ts", content: "x" } };
+    const brain = pendingBrain(call);
+    const entry: WhitelistEntry = { tool: "write_file", key: "src/a.ts", kind: "path" };
+    const loop = new AgentLoop({
+      brain,
+      ears: new FakeEars(["任务", "/exit"]),
+      eyes: buildEyes(),
+      hands: buildHands(),
+      output: new TextOutput({ stdout: new FakeWritable(), intervalMs: 0 }),
+      signal: new AbortController().signal,
+      mouth: {
+        confirm: async () => true,
+        askApproval: async (prompt: ApprovalPrompt) =>
+          prompt.kind === "path" ? { action: "whitelist", entry } : { action: "allow" },
+      },
+    });
+    await loop.run();
+    try {
+      expect(brain.addedWhitelist).toEqual([entry]);
+      expect(brain.messagesOf(1).find((m) => m.role === "tool")).toBeDefined();
+    } finally {
+      // 清理真实写入（CWD 相对路径），防止测试产物污染 src/ 导致 tsc 失败
+      rmSync("src/a.ts", { force: true });
+    }
   });
 });
