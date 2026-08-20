@@ -1,5 +1,8 @@
 // 权限裁决模块：黑名单（绝对禁止）+ 白名单（用户信任）统一匹配。
 // 只做文本匹配，不做命令分类/路径分析；白名单条目跨写类工具生效。
+import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { homedir } from "node:os";
+import { dirname, join } from "node:path";
 import type { ToolCall } from "../brain/llm.js";
 import type { WhitelistEntry } from "../types/index.js";
 import { BLACKLIST_PATTERNS } from "./blacklist.js";
@@ -83,23 +86,30 @@ export function classify(call: ToolCall): "blacklist" | "unlisted" {
 }
 
 export interface PermissionPolicyOptions {
+  /** 白名单文件；缺省 ~/.human-agent/whitelist.json */
+  file?: string;
   /** 工作区（CWD）；缺省 process.cwd()，仅用于分节键。 */
   workspace?: string;
-  /** 测试注入条目；缺省空。文件加载在 Task 2 加入。 */
+  /** 测试注入条目；缺省从文件加载。 */
   entries?: WhitelistEntry[];
 }
 
-/** 白名单匹配（内存版）：黑名单 → 白名单 → 未列。文件持久化与冗余清理在 Task 2。 */
+/** 白名单按工作区分节的单文件存储；同步读写（启动期小文件，构造函数保持同步）。 */
 export class PermissionPolicy {
+  readonly #file: string;
   readonly #workspaceKey: string;
   #sections: Record<string, WhitelistEntry[]>;
 
   constructor(options: PermissionPolicyOptions = {}) {
     this.#workspaceKey = normalizePath(options.workspace ?? process.cwd());
+    this.#file = options.file ?? join(homedir(), ".human-agent", "whitelist.json");
     this.#sections =
-      options.entries === undefined ? {} : { [this.#workspaceKey]: [...options.entries] };
+      options.entries === undefined
+        ? loadSections(this.#file)
+        : { [this.#workspaceKey]: [...options.entries] };
   }
 
+  /** 分类：黑名单 → 白名单 → 未列。匹配键缺失（参数不合法）视为未列。 */
   classify(call: ToolCall): Classification {
     const key = matchKeyFor(call);
     if (key === undefined) return "unlisted";
@@ -113,4 +123,56 @@ export class PermissionPolicy {
   entries(): WhitelistEntry[] {
     return this.#sections[this.#workspaceKey] ?? [];
   }
+
+  /** 加条目（去重 + 冗余清理后落盘）；返回是否新增。 */
+  addEntry(entry: WhitelistEntry): boolean {
+    const current = this.entries();
+    if (current.some((e) => e.tool === entry.tool && e.kind === entry.kind && e.key === entry.key)) {
+      return false;
+    }
+    if (entry.kind === "path" && current.some((e) => e.kind === "path" && covers(e.key, entry.key))) {
+      return false; // 子被父盖：跳过（跨工具同判——path 是写权限概念，不按工具拆分）
+    }
+    const kept =
+      entry.kind === "path"
+        ? current.filter((e) => !(e.kind === "path" && covers(entry.key, e.key))) // 加父去子
+        : current;
+    this.#sections[this.#workspaceKey] = [...kept, entry];
+    this.#save();
+    return true;
+  }
+
+  /** 启动时注册工作区写白名单（write_file path-dir，跨工具覆盖 apply_patch）；幂等。 */
+  ensureWorkspace(): void {
+    const root = `${this.#workspaceKey}/`;
+    if (this.entries().some((e) => e.kind === "path" && e.key === root)) return;
+    this.addEntry({ tool: "write_file", key: root, kind: "path" });
+  }
+
+  #save(): void {
+    try {
+      mkdirSync(dirname(this.#file), { recursive: true });
+      writeFileSync(this.#file, JSON.stringify(this.#sections, null, 2), "utf8");
+    } catch {
+      // 落盘失败不崩溃（内存条目仍生效）
+    }
+  }
+}
+
+/** 目录条目是否覆盖子键（父以 / 结尾，段级前缀）。 */
+function covers(parentKey: string, childKey: string): boolean {
+  return parentKey.endsWith("/") && (childKey === parentKey || childKey.startsWith(parentKey));
+}
+
+function loadSections(file: string): Record<string, WhitelistEntry[]> {
+  try {
+    const raw = readFileSync(file, "utf8");
+    const parsed = JSON.parse(raw) as unknown;
+    if (typeof parsed === "object" && parsed !== null) {
+      return parsed as Record<string, WhitelistEntry[]>;
+    }
+  } catch {
+    // 损坏/不存在 → 空白名单（默认模式全弹窗、自动模式黑名单外全放行，不崩溃）
+  }
+  return {};
 }

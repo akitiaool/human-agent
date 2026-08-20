@@ -1,6 +1,10 @@
 // tests/policy.test.ts
-import { describe, expect, it } from "vitest";
+import { mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { afterAll, beforeEach, describe, expect, it } from "vitest";
 import type { ToolCall } from "../src/brain/llm.js";
+import type { WhitelistEntry } from "../src/types/index.js";
 import {
   PermissionPolicy,
   buildWhitelistEntry,
@@ -171,5 +175,73 @@ describe("工具辅助", () => {
       key: "src/",
       kind: "path",
     });
+  });
+});
+
+describe("PermissionPolicy 持久化与清理", () => {
+  const tempDir = mkdtempSync(join(tmpdir(), "policy-test-"));
+  const file = join(tempDir, "whitelist.json");
+  afterAll(() => rmSync(tempDir, { recursive: true, force: true }));
+  // 用例共享同一文件：每例先清空，防跨用例条目泄漏
+  beforeEach(() => rmSync(file, { force: true }));
+
+  it("addEntry 落盘；重新构造可加载", () => {
+    const p1 = new PermissionPolicy({ file, workspace: "/ws" });
+    expect(p1.addEntry({ tool: "terminal", key: "git status", kind: "exact" })).toBe(true);
+    const p2 = new PermissionPolicy({ file, workspace: "/ws" });
+    expect(p2.entries()).toEqual([{ tool: "terminal", key: "git status", kind: "exact" }]);
+  });
+
+  it("按工作区分节：不同 workspace 互不可见", () => {
+    const a = new PermissionPolicy({ file, workspace: "/wsA" });
+    a.addEntry({ tool: "terminal", key: "ls -la", kind: "exact" });
+    const b = new PermissionPolicy({ file, workspace: "/wsB" });
+    expect(b.entries()).toEqual([]);
+    expect(b.classify({ name: "terminal", arguments: { command: "ls -la" } })).toBe("unlisted");
+  });
+
+  it("加父去子：新增目录条目删除被覆盖子条目", () => {
+    const p = new PermissionPolicy({ file, workspace: "/ws" });
+    p.addEntry({ tool: "write_file", key: "src/utils.ts", kind: "path" });
+    p.addEntry({ tool: "write_file", key: "src/components/", kind: "path" });
+    expect(p.addEntry({ tool: "write_file", key: "src/", kind: "path" })).toBe(true);
+    expect(p.entries()).toEqual([{ tool: "write_file", key: "src/", kind: "path" }]);
+  });
+
+  it("加子被父盖：已有父目录则跳过", () => {
+    const p = new PermissionPolicy({ file, workspace: "/ws" });
+    p.addEntry({ tool: "write_file", key: "src/", kind: "path" });
+    expect(p.addEntry({ tool: "write_file", key: "src/utils.ts", kind: "path" })).toBe(false);
+    expect(p.entries()).toEqual([{ tool: "write_file", key: "src/", kind: "path" }]);
+  });
+
+  it("跨工具父目录去重：apply_patch 的目录条目覆盖 write_file 子条目", () => {
+    const p = new PermissionPolicy({ file, workspace: "/ws" });
+    p.addEntry({ tool: "write_file", key: "src/utils.ts", kind: "path" });
+    expect(p.addEntry({ tool: "apply_patch", key: "src/", kind: "path" })).toBe(true);
+    expect(p.entries()).toEqual([{ tool: "apply_patch", key: "src/", kind: "path" }]);
+  });
+
+  it("精确重复条目跳过", () => {
+    const p = new PermissionPolicy({ file, workspace: "/ws" });
+    p.addEntry({ tool: "terminal", key: "git status", kind: "exact" });
+    expect(p.addEntry({ tool: "terminal", key: "git status", kind: "exact" })).toBe(false);
+  });
+
+  it("文件损坏/不存在降级为空白名单（不崩溃）", () => {
+    const bad = join(tempDir, "bad.json");
+    const p = new PermissionPolicy({ file: bad, workspace: "/ws" });
+    expect(p.entries()).toEqual([]);
+    expect(p.classify({ name: "terminal", arguments: { command: "anything" } })).toBe("unlisted");
+  });
+
+  it("ensureWorkspace：注册工作区目录条目（写类 path-dir）且幂等", () => {
+    const p = new PermissionPolicy({ file, workspace: "/home/u/proj" });
+    p.ensureWorkspace();
+    expect(p.entries()).toEqual([{ tool: "write_file", key: "/home/u/proj/", kind: "path" }]);
+    p.ensureWorkspace();
+    expect(p.entries()).toHaveLength(1);
+    expect(p.classify({ name: "write_file", arguments: { path: "/home/u/proj/src/a.ts", content: "x" } })).toBe("whitelist");
+    expect(p.classify({ name: "write_file", arguments: { path: "/home/u/elsewhere/a.ts", content: "x" } })).toBe("unlisted");
   });
 });
