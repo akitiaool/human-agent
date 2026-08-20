@@ -104,38 +104,64 @@
 - `GET /task` 下发 approval 已携带完整 ToolCall（不变）。
 - `POST /approval` 请求扩展可选字段：`whitelist?: { tool, key, kind }[]`。桥侧校验：条目必须对应本批中 `allowed=true` 的调用——`exact` 条目的 tool/key 必须与该调用的匹配串完全一致；`path` 条目分两粒度——「此路径」key = 该写调用的 path 自身（文件条目），「此目录」key = 该 path 的父目录 + `/`（目录条目）；校验通过才写入白名单文件。
 
-**自动授权模式**：维持现状架构——桥侧仍下发审批，扩展按面板开关决定弹窗或静默回全部允许；桥侧黑名单命中直接拒绝回填（`已拒绝（BLACKLIST：系统破坏操作，禁止执行）`），**不下发**审批。扩展开关语义不变。
+**自动授权模式**：桥侧对判「需授权」的调用仍下发审批，扩展按面板开关决定弹窗或静默回全部允许；黑名单命中桥侧直接拒绝回填（`已拒绝（BLACKLIST：系统破坏操作，禁止执行）`），**不下发**审批。扩展开关语义不变。
 
-## 8. 桥服务裁决链改造（gemini-bridge-thinking）
+## 8. 通用 Thinking 基类（架构）
 
-`#process` 改造：
+确定性层收敛为单一实现，桥与 CLI 行为必然一致：
 
-1. **黑名单拦截**：对批内每个调用先过黑名单，命中 → 生成拒绝行（黑名单文案），不参与后续。
-2. **白名单判定**：未命黑名单的调用过白名单，命中 → 直接执行（静默，不弹窗）。
-3. **剩余调用**（未命中白名单）→ 批量审批下发（现状流程）。
-4. 审批返回后：allowed → 执行；拒绝 → 拒绝行（USER_DENIED）。
-5. 执行顺序保持原调用顺序。
+```
+src/brain/thinking.ts（新）
+abstract class BaseThinking
+  ├─ 持有：Reflection + PermissionPolicy + workspace（启动时 CWD 规范化路径）
+  ├─ reflect(calls)：统一裁决入口，顺序——
+  │   ① 黑名单命中 → 拒绝（BLACKLIST，两模式一致）
+  │   ② 白名单命中 → 放行（静默）
+  │   ③ 未知工具 / 参数非法 → 拦截（沿用现有 UNKNOWN_TOOL / INVALID_ARGS）
+  │   ④ 其余（未命中白名单）→ 需授权（NEEDS_APPROVAL）
+  ├─ classify(call)：单调用权限分类（blacklist / whitelist / unlisted，reflect 内部复用）
+  └─ toolProtocol()：工具协议文本（含工作区声明行）
 
-现状的「鼻子 DANGEROUS 预筛摘出」逻辑移除——不再有「危险清单」概念，未命中白名单一律审批。`RiskChecker` 保留（黑名单模式的来源模块）。
+OllamaThinking extends BaseThinking implements BrainInference
+  ├─ infer()：Ollama /api/chat（现有实现不动）
+  └─ system prompt 拼装使用基类工作区声明
 
-## 9. CLI 模式接入（Ollama REPL）
+GeminiBridgeThinking extends BaseThinking
+  ├─ HTTP 服务 / outbox / 审批协议（现有实现不动）
+  ├─ #process 改为：parse → 去重 → reflect 裁决 → 按裁决执行/拦截/下发审批
+  └─ 首条协议消息 = 基类 toolProtocol()
+```
 
-同一矩阵接入心脏循环：
+**反射裁决契约扩展**：`ReflectionVerdict` 增加拒绝原因 `BLACKLIST` 与需授权标记 `NEEDS_APPROVAL`（现有 UNKNOWN_TOOL / INVALID_ARGS / USER_DENIED 沿用）；裁决后的「审批通道」由宿主负责——桥下发 GET /task approval，CLI 走嘴巴三选。
 
-- `loop.ts #execute`：先过黑名单（命中 → 拦截结果反馈）→ 白名单（命中 → 直接 executeTool）→ 未命中 → 嘴巴交互。
+**构造**：两子类构造函数均接受 `workspace`（缺省 `process.cwd()`）与白名单文件路径选项（缺省 `~/.human-agent/whitelist.json`），测试可注入。
+
+## 9. 桥服务裁决链改造（gemini-bridge-thinking）
+
+`#process` 简化为：
+
+1. `parseToolCalls` + 去重（现状不动）。
+2. `this.reflect(calls)`（基类统一裁决）。
+3. 按裁决分发：`BLACKLIST` / 拦截 → 生成拒绝行回填；白名单放行 → 直接执行；`NEEDS_APPROVAL` → 批量审批下发（现状流程）。
+4. 审批返回：allowed → 执行；拒绝 → `USER_DENIED` 拒绝行。
+5. 执行顺序保持原调用顺序；执行仍走共享 `executeTool`。
+
+现状的「鼻子 DANGEROUS 预筛摘出」逻辑删除——不再有「危险清单」概念，未命中白名单一律进审批通道。`RiskChecker` 保留（黑名单模式的来源模块）。
+
+## 10. CLI 模式接入（Ollama REPL）
+
+- `loop.ts #execute`：`brain.reflect(calls)`（基类统一裁决）→ `BLACKLIST`/拦截直接反馈；白名单放行 → `executeTool`；`NEEDS_APPROVAL` → 嘴巴三选交互。
 - `mouth/ask-user.ts` 升级：`confirm` 扩展为三选（允许 / 拒绝 / 加入白名单），写类调用提供路径/目录两粒度。返回裁决 + 可选白名单条目，写入白名单文件。
-- 工作区声明加入 system prompt。
+- 工作区声明加入 system prompt（基类提供文本）。
 
-## 10. 共享裁决模块
+## 11. 共享裁决模块
 
-新增 `src/nose/policy.ts`：`PermissionPolicy` 类（确定性裁决，桥与 loop 共用）：
+- `src/nose/policy.ts`（新）：`PermissionPolicy` 类——黑名单判定（正则规则集）+ 白名单加载/匹配/冗余清理/持久化（按工作区分节）。纯函数、可注入文件路径与规则集（测试友好），无单例。
+- `src/nose/blacklist.ts`（新）：黑名单模式数组（随版本内置）。
+- `src/brain/thinking.ts`（新）：`BaseThinking`（见 §8）——桥与 loop 共用。
+- `Reflection` 扩展（reflection.ts）：集成 PermissionPolicy 层，裁决顺序见 §8。
 
-- `classify(call: ToolCall): "blacklist" | "whitelist" | "unlisted"`——黑名单判定（blacklist 模式）+ 白名单匹配。
-- 加载/保存白名单文件（按工作区分节）。
-- 纯函数、可注入文件路径与规则集（测试友好），无单例。
-- 黑名单规则集由 `blacklist.ts` 导出（正则数组）。
-
-## 11. 文件存储与加载
+## 12. 文件存储与加载
 
 | 项 | 位置 | 内容 | 变更方式 |
 |---|---|---|---|
@@ -145,19 +171,21 @@
 
 白名单文件不存在时静默创建；读写失败降级为「空白名单」（默认模式全弹窗、自动模式黑名单外全放行），不崩溃。
 
-## 12. 测试策略
+## 13. 测试策略
 
-- `policy.test.ts`：黑名单命中（含变体：`rm -rf C:\Windows`、`rm -rf C:\Windows\Temp` 不命中）、exact 匹配（空白归一、键序无关）、path 匹配（段级前缀、`src-evil` 反例、目录/文件条目）、冗余清理（加父去子、加子被父盖跳过）、持久化（加载/保存/损坏降级）。
-- 桥流程测试：黑名单拦截回填文案（不审批）、白名单命中静默执行（不下发）、未命中下发审批、审批带回 whitelist 校验写入。
+- `policy.test.ts`：黑名单命中（含变体：`rm -rf C:\Windows` 命中、`rm -rf C:\Windows\Temp` 不命中）、exact 匹配（空白归一、键序无关）、path 匹配（段级前缀、`src-evil` 反例、目录/文件条目、跨工具生效）、冗余清理（加父去子、加子被父盖跳过）、持久化（加载/保存/损坏降级）。
+- `thinking.test.ts`：BaseThinking reflect 裁决顺序（黑名单 → 白名单 → 未知/非法 → NEEDS_APPROVAL）、toolProtocol 含工作区声明。
+- 桥流程测试：黑名单拦截回填文案（不审批）、白名单命中静默执行（不下发）、NEEDS_APPROVAL 下发审批、审批带回 whitelist 校验写入、自动模式（黑名单外全放行）。
+- CLI 流程测试：嘴巴三选（允许/拒绝/白名单写入）。
 - 扩展（content.js）：弹窗按钮形态、白名单 payload 构造——手动 E2E 验证（无测试框架）。
 
-## 13. 文档更新
+## 14. 文档更新
 
 - `extensions/gemini-bridge/README.md`：审批节改为权限模型说明（矩阵、白名单、黑名单、弹窗按钮）。
-- 根 `README.md` / `CLAUDE.md`：架构与裁决链描述更新。
+- 根 `README.md` / `CLAUDE.md`：架构与裁决链描述更新（含 BaseThinking 章节）。
 - v2 spec：审批机制章节修订。
 
-## 14. 已知限制
+## 15. 已知限制
 
 - **无 OS 沙箱**（Windows 无原生沙箱，Claude Code 亦然）：匹配只作用于文本层面，`bash -c '...'`、PowerShell 混淆等可绕过文本分析。需要真隔离的 Windows 用户应走 WSL2——那是用户侧选择，不在本设计范围。
 - 默认模式弹窗噪音是**设计选择**（默认从严），白名单成长后自然安静。
