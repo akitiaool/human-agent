@@ -1,22 +1,30 @@
-// 反思层（潜意识）：决策后再想"可行吗"。确定性代码，不经过模型，
-// 所有大脑共享同一套实现：存在性 → 结构 → 危险嗅探，逐条裁决。
+// 反思层（潜意识）：决策后再想"可行吗"。确定性代码，不经过模型。
+// 裁决顺序：权限黑名单 → 存在性 → 结构 → 白名单放行 → 其余需授权。
+// 权限层注入 PermissionPolicy；"需授权"仅作标记，审批通道由宿主（桥/loop）负责。
 import { schemas } from "./knowledge.js";
+import { matchKeyFor, type PermissionPolicy } from "../nose/policy.js";
 import type { ReflectionVerdict, ToolCall } from "./llm.js";
-import { fail, type MouthContract, type NoseContract } from "../types/index.js";
+import { fail } from "../types/index.js";
 
 export class Reflection {
-  readonly #nose: NoseContract;
-  readonly #mouth: MouthContract;
+  readonly #policy: PermissionPolicy;
 
-  constructor(nose: NoseContract, mouth: MouthContract) {
-    this.#nose = nose;
-    this.#mouth = mouth;
+  constructor(policy: PermissionPolicy) {
+    this.#policy = policy;
   }
 
   async reflect(calls: readonly ToolCall[]): Promise<ReflectionVerdict> {
     const allowed: ToolCall[] = [];
+    const pending: ToolCall[] = [];
     const blocked: ReflectionVerdict["blocked"] = [];
     for (const call of calls) {
+      if (this.#policy.classify(call) === "blacklist") {
+        blocked.push({
+          call,
+          result: fail("BLACKLIST", `系统破坏操作，禁止执行：${matchKeyFor(call) ?? call.name}`),
+        });
+        continue;
+      }
       const schema = schemas[call.name as keyof typeof schemas];
       if (schema === undefined) {
         blocked.push({ call, result: fail("UNKNOWN_TOOL", `未知工具: ${call.name}`) });
@@ -33,18 +41,9 @@ export class Reflection {
         });
         continue;
       }
-      if (call.name === "terminal") {
-        const { command } = parsed.data as { command: string };
-        if (this.#nose.checkRisk(command) === "DANGEROUS") {
-          const approved = await this.#mouth.confirm(`命令存在风险，是否执行？\n  ${command}`);
-          if (!approved) {
-            blocked.push({ call, result: fail("USER_DENIED", `用户拒绝了命令: ${command}`) });
-            continue;
-          }
-        }
-      }
-      allowed.push(call);
+      if (this.#policy.classify(call) === "whitelist") allowed.push(call);
+      else pending.push(call);
     }
-    return { allowed, blocked };
+    return { allowed, pending, blocked };
   }
 }

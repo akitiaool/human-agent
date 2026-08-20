@@ -25,7 +25,10 @@ export interface BlockedCall {
 }
 
 export interface ReflectionVerdict {
+  /** 白名单放行，直接执行。 */
   allowed: ToolCall[];
+  /** 需授权（结构合法且未命中白名单）：由宿主走审批通道。 */
+  pending: ToolCall[];
   blocked: BlockedCall[];
 }
 

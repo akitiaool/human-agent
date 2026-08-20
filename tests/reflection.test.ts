@@ -1,65 +1,54 @@
-import { describe, expect, it, vi } from "vitest";
+import { describe, expect, it } from "vitest";
+import { PermissionPolicy } from "../src/nose/policy.js";
 import { Reflection } from "../src/brain/reflection.js";
-import type { MouthContract, NoseContract, RiskLevel } from "../src/types/index.js";
 
-function makeNose(risk: RiskLevel): NoseContract {
-  return {
-    checkRisk: () => risk,
-    getEnvSnapshot: () => ({ os: "test", cwd: "/tmp" }),
-    checkPorts: async () => [],
-  };
+function policy(entries = []) {
+  return new PermissionPolicy({ workspace: "/ws", entries });
 }
 
-function makeMouth(approve: boolean): MouthContract {
-  return { confirm: async () => approve };
-}
+describe("Reflection 权限集成裁决", () => {
+  it("黑名单命中 → BLACKLIST 拦截（无审批无白名单）", async () => {
+    const verdict = await new Reflection(policy()).reflect([
+      { name: "terminal", arguments: { command: "rm -rf /" } },
+    ]);
+    expect(verdict.allowed).toEqual([]);
+    expect(verdict.pending).toEqual([]);
+    expect(verdict.blocked).toHaveLength(1);
+    expect(verdict.blocked[0]!.result.error?.code).toBe("BLACKLIST");
+  });
 
-describe("Reflection", () => {
-  it("安全命令放行", async () => {
-    const reflection = new Reflection(makeNose("SAFE"), makeMouth(true));
-    const call = { name: "terminal", arguments: { command: "echo hi" } };
-    const verdict = await reflection.reflect([call]);
-    expect(verdict.allowed).toEqual([call]);
+  it("白名单命中 → 放行（不进 pending）", async () => {
+    const verdict = await new Reflection(
+      policy([{ tool: "terminal", key: "git status", kind: "exact" }]),
+    ).reflect([{ name: "terminal", arguments: { command: "git status" } }]);
+    expect(verdict.allowed).toHaveLength(1);
+    expect(verdict.pending).toEqual([]);
     expect(verdict.blocked).toEqual([]);
   });
 
-  it("未知工具拦截为 UNKNOWN_TOOL", async () => {
-    const reflection = new Reflection(makeNose("SAFE"), makeMouth(true));
-    const call = { name: "hack_the_planet", arguments: {} };
-    const verdict = await reflection.reflect([call]);
+  it("未命中白名单（结构合法）→ pending（需授权）", async () => {
+    const verdict = await new Reflection(policy()).reflect([
+      { name: "terminal", arguments: { command: "ls -la" } },
+      { name: "read_file", arguments: { path: "src/a.ts" } },
+    ]);
+    expect(verdict.pending).toHaveLength(2);
     expect(verdict.allowed).toEqual([]);
-    expect(verdict.blocked[0]?.result.error?.code).toBe("UNKNOWN_TOOL");
+    expect(verdict.blocked).toEqual([]);
   });
 
-  it("参数不合法拦截为 INVALID_ARGS", async () => {
-    const reflection = new Reflection(makeNose("SAFE"), makeMouth(true));
-    const call = { name: "read_file", arguments: {} };
-    const verdict = await reflection.reflect([call]);
-    expect(verdict.blocked[0]?.result.error?.code).toBe("INVALID_ARGS");
+  it("未知工具 / 参数非法 → 拦截（无论白名单）", async () => {
+    const verdict = await new Reflection(policy()).reflect([
+      { name: "ghost_tool", arguments: {} },
+      { name: "terminal", arguments: {} },
+    ]);
+    expect(verdict.blocked.map((b) => b.result.error?.code)).toEqual(["UNKNOWN_TOOL", "INVALID_ARGS"]);
+    expect(verdict.pending).toEqual([]);
   });
 
-  it("危险命令经用户拒绝后拦截为 USER_DENIED", async () => {
-    const confirm = vi.fn().mockResolvedValue(false);
-    const reflection = new Reflection(makeNose("DANGEROUS"), { confirm });
-    const call = { name: "terminal", arguments: { command: "rm -rf /" } };
-    const verdict = await reflection.reflect([call]);
-    expect(verdict.blocked[0]?.result.error?.code).toBe("USER_DENIED");
-    expect(confirm).toHaveBeenCalledWith(expect.stringContaining("rm -rf /"));
-  });
-
-  it("危险命令经用户确认后放行", async () => {
-    const reflection = new Reflection(makeNose("DANGEROUS"), makeMouth(true));
-    const call = { name: "terminal", arguments: { command: "rm -rf /tmp/test" } };
-    const verdict = await reflection.reflect([call]);
-    expect(verdict.allowed).toEqual([call]);
-  });
-
-  it("混合调用逐条裁决", async () => {
-    const reflection = new Reflection(makeNose("SAFE"), makeMouth(true));
-    const good = { name: "read_file", arguments: { path: "a.txt" } };
-    const bad = { name: "read_file", arguments: {} };
-    const verdict = await reflection.reflect([good, bad]);
-    expect(verdict.allowed).toEqual([good]);
-    expect(verdict.blocked).toHaveLength(1);
+  it("危险但未入黑名单的命令 → pending（不再嘴巴确认）", async () => {
+    const verdict = await new Reflection(policy()).reflect([
+      { name: "terminal", arguments: { command: "git push --force origin main" } },
+    ]);
+    expect(verdict.pending).toHaveLength(1);
   });
 });
