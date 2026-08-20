@@ -1,6 +1,7 @@
 import { PassThrough, Readable } from "node:stream";
 import { describe, expect, it } from "vitest";
 import { AskUser } from "../src/mouth/ask-user.js";
+import type { ApprovalPrompt, ApprovalChoice } from "../src/types/index.js";
 
 function inputFrom(text: string): Readable {
   return new Readable({
@@ -60,5 +61,42 @@ describe("AskUser", () => {
     await ask.confirm("真的要删除吗");
     expect(collected.join("")).toContain("真的要删除吗");
     expect(collected.join("")).toContain("[Y/n]");
+  });
+});
+
+describe("askApproval 三选", () => {
+  it("y → allow", async () => {
+    const ask = new AskUser({ input: inputFrom("y\n") });
+    const choice = await ask.askApproval({ tool: "terminal", key: "ls -la", kind: "exact" });
+    expect(choice).toEqual({ action: "allow" });
+  });
+  it("n → deny", async () => {
+    const ask = new AskUser({ input: inputFrom("n\n") });
+    const choice = await ask.askApproval({ tool: "terminal", key: "ls -la", kind: "exact" });
+    expect(choice).toEqual({ action: "deny" });
+  });
+  it("w → whitelist（exact 条目）", async () => {
+    const ask = new AskUser({ input: inputFrom("w\n") });
+    const choice = await ask.askApproval({ tool: "terminal", key: "ls -la", kind: "exact" });
+    expect(choice).toEqual({ action: "whitelist", entry: { tool: "terminal", key: "ls -la", kind: "exact" } });
+  });
+  it("写类：w → 此路径；d → 此目录", async () => {
+    const ask1 = new AskUser({ input: inputFrom("w\n") });
+    const pathChoice = await ask1.askApproval({ tool: "write_file", key: "src/utils.ts", kind: "path" });
+    expect(pathChoice).toEqual({
+      action: "whitelist",
+      entry: { tool: "write_file", key: "src/utils.ts", kind: "path" },
+    });
+    const ask2 = new AskUser({ input: inputFrom("d\n") });
+    const dirChoice = await ask2.askApproval({ tool: "write_file", key: "src/utils.ts", kind: "path" });
+    expect(dirChoice).toEqual({
+      action: "whitelist",
+      entry: { tool: "write_file", key: "src/", kind: "path" },
+    });
+  });
+  it("非法输入循环追问（x 后 y 生效）", async () => {
+    const ask = new AskUser({ input: inputFrom("x\ny\n") });
+    const choice = await ask.askApproval({ tool: "terminal", key: "ls", kind: "exact" });
+    expect(choice).toEqual({ action: "allow" });
   });
 });

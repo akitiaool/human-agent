@@ -4,6 +4,8 @@ export type {
   AgentOutput,
   AgentPhase,
   AgentStatus,
+  ApprovalChoice,
+  ApprovalPrompt,
   EnvSnapshot,
   EarsContract,
   EyesContract,

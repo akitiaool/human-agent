@@ -72,8 +72,22 @@ export interface WhitelistEntry {
   kind: "exact" | "path";
 }
 
+/** 审批提示：工具名 + 匹配键 + 条目类型（写类为 path，其余 exact）。 */
+export interface ApprovalPrompt {
+  tool: string;
+  key: string;
+  kind: "exact" | "path";
+}
+
+export type ApprovalChoice =
+  | { action: "allow" }
+  | { action: "deny" }
+  | { action: "whitelist"; entry: WhitelistEntry };
+
 export interface MouthContract {
   confirm(message: string): Promise<boolean>;
+  /** 需授权调用的人工三选：允许 / 拒绝 / 加入白名单（写类另有「此目录」）。 */
+  askApproval(prompt: ApprovalPrompt): Promise<ApprovalChoice>;
 }
 
 /** 嘴巴输出契约（TextOutput 的结构化视图，便于测试注入）。 */

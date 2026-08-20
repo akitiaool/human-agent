@@ -127,5 +127,8 @@ export function buildStubNose(risk: RiskLevel = "SAFE"): NoseContract {
 }
 
 export function buildStubMouth(approve = true): MouthContract {
-  return { confirm: async () => approve };
+  return {
+    confirm: async () => approve,
+    askApproval: async () => ({ action: "allow" }),
+  };
 }
