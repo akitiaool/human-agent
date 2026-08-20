@@ -12,6 +12,7 @@ export type {
   NoseContract,
   PortStatus,
   RiskLevel,
+  WhitelistEntry,
 } from "./organ.js";
 
 export { fail, ok } from "./organ.js";

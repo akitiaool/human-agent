@@ -65,6 +65,13 @@ export interface EarsContract {
   prompt(question: string): Promise<string>;
 }
 
+/** 白名单条目：exact 精确整串 / path 写类路径（目录条目 key 以 / 结尾）。 */
+export interface WhitelistEntry {
+  tool: string;
+  key: string;
+  kind: "exact" | "path";
+}
+
 export interface MouthContract {
   confirm(message: string): Promise<boolean>;
 }
