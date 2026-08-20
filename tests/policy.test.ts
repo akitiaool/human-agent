@@ -69,6 +69,11 @@ describe("黑名单（系统破坏目标锚定）", () => {
     expect(classify(call("terminal", { command: "kill -9 1234" }))).toBe("unlisted");
     expect(classify(call("terminal", { command: "echo hi > /dev/null" }))).toBe("unlisted");
   });
+  it("不命中：黑名单误杀防护（任意 boot 文件/Format-Table）", () => {
+    expect(classify(call("terminal", { command: "del boot.txt" }))).toBe("unlisted");
+    expect(classify(call("terminal", { command: "del C:\\proj\\boot" }))).toBe("unlisted");
+    expect(classify(call("terminal", { command: "Get-Volume | Format-Table DriveLetter, Size" }))).toBe("unlisted");
+  });
   it("dd 写 /dev/null 不命中（非物理盘）", () => {
     expect(classify(call("terminal", { command: "dd if=/dev/zero of=/dev/null" }))).toBe("unlisted");
   });

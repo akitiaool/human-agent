@@ -17,11 +17,11 @@ export const BLACKLIST_PATTERNS: readonly RegExp[] = [
   // del /f（可 /s）跟盘符
   /\bdel\s+\/f(?:\s+\/s)?\b[^\n|;]*[a-z]:\/[^\n|;]*/i,
   // 启动文件删除：bootmgr / boot.ini / boot 目录（磁盘根级）
-  /\bdel\b[^\n|;]*(?:bootmgr|boot\.ini|\bboot\b)/i,
+  /\bdel\b[^\n|;]*(?:bootmgr|boot\.ini|[a-z]:\/boot(?:\s|$|\/))/i,
   // PowerShell Remove-Item 跟盘符 / HKLM 关键注册表（HKLM: 冒号可选——归一化只转反斜杠不删冒号）
   /\bRemove-Item\b[^\n|;]*(?:-[^\n|;]*[a-z]:\/|HKLM:?\/)/i,
   // 系统盘格式化
-  /\b(?:format|Format-Volume)\b[^\n|;]*(?:[a-z]:|SystemDrive|DriveLetter)/i,
+  /\b(?:format\b[^\n|;]*(?:[a-z]:|SystemDrive)|Format-Volume\b[^\n|;]*(?:[a-z]:|SystemDrive|DriveLetter))/i,
   // 整盘擦除
   /\bdiskpart\b[^\n|;]*clean/i,
   /\bClear-Disk\b/i,
