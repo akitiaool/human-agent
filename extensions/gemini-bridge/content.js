@@ -222,6 +222,9 @@ panel.innerHTML = `
 }
 .ha-approval-btns .ha-allow, .ha-approval-foot .ha-allow-all { border-color: #166534; color: #86efac; }
 .ha-approval-btns .ha-deny, .ha-approval-foot .ha-deny-all { border-color: #7f1d1d; color: #fca5a5; }
+.ha-approval-btns .ha-btn-wl { border-color: #1d4ed8; color: #93c5fd; }
+.ha-approval-row.ha-approval-wl { border-color: #166534; }
+.ha-approval-row.ha-approval-wl .ha-approval-hint { color: #86efac; }
 .ha-approval-foot { display: flex; gap: 8px; margin-top: 8px; justify-content: flex-end; }
 </style>
 <div class="ha-title">
@@ -756,9 +759,55 @@ async function clickSendWhenReady() {
 
 // ---------- 审批：危险命令授权（弹窗/自动授权）→ POST /approval ----------
 
-async function postApproval(id, allowed) {
+// 白名单键归一化：与服务端 src/nose/policy.ts 对齐——写类路径反斜杠转正斜杠 + 斜杠折叠 + win32 小写；
+// terminal 命令空白折叠（无斜杠折叠）；其余工具完整参数深归一 + 键排序（exact 键必须与桥侧 serializeArgs 一致）
+function deepNorm(value) {
+  if (typeof value === "string") {
+    return value.trim().replace(/\s+/g, " ").replace(/\\/g, "/");
+  }
+  if (Array.isArray(value)) return value.map(deepNorm);
+  if (value !== null && typeof value === "object") {
+    const out = {};
+    for (const k of Object.keys(value).sort()) out[k] = deepNorm(value[k]);
+    return out;
+  }
+  return value;
+}
+
+function normalizeKey(call, granularity) {
+  const args = call.arguments ?? {};
+  if (call.name === "write_file" || call.name === "apply_patch") {
+    const p = String(args.path ?? "")
+      .trim()
+      .replace(/\s+/g, " ")
+      .replace(/\\/g, "/")
+      .replace(/\/+/g, "/");
+    const lower = /^win/i.test(navigator.platform) ? p.toLowerCase() : p;
+    if (granularity === "dir") {
+      const i = lower.lastIndexOf("/");
+      // 根级/盘符根：dir 条目=全部绝对路径/整盘超授权，降级为文件条目（与 buildWhitelistEntry 一致）
+      if (i <= 0 || (i === 2 && lower[1] === ":")) return { key: lower, kind: "path" };
+      return { key: `${lower.slice(0, i)}/`, kind: "path" };
+    }
+    return { key: lower, kind: "path" };
+  }
+  if (call.name === "terminal") {
+    return {
+      key: String(args.command ?? "").trim().replace(/\s+/g, " ").replace(/\\/g, "/"),
+      kind: "exact",
+    };
+  }
+  return { key: JSON.stringify(deepNorm(args)), kind: "exact" };
+}
+
+function buildEntry(call, granularity) {
+  const { key, kind } = normalizeKey(call, granularity);
+  return { tool: call.name, key, kind };
+}
+
+async function postApproval(payload) {
   try {
-    const resp = await chrome.runtime.sendMessage({ type: "approve", id, allowed, baseUrl: settings.baseUrl });
+    const resp = await chrome.runtime.sendMessage({ type: "approve", ...payload, baseUrl: settings.baseUrl });
     if (resp?.ok === true) return true;
     if (resp?.status === 404) {
       log("审批请求已过期（桥服务已按超时拒绝），跳过");
@@ -775,13 +824,16 @@ async function postApproval(id, allowed) {
 async function handleApproval(item) {
   if (settings.autoApprove) {
     log(`自动授权已开启：静默放行 ${item.calls.length} 条危险命令`);
-    if (!(await postApproval(item.id, item.calls.map(() => true)))) setStatus("错误");
+    if (!(await postApproval({ id: item.id, allowed: item.calls.map(() => true) }))) setStatus("错误");
     return;
   }
   setStatus("等待授权");
   log(`收到审批请求（${item.calls.length} 条危险命令），等待授权…`);
   const decision = await showApprovalDialog(item);
-  if (!(await postApproval(item.id, decision.allowed))) {
+  const payload = { id: item.id, allowed: decision.allowed };
+  const wl = decision.whitelist ?? [];
+  if (wl.length > 0) payload.whitelist = wl;
+  if (!(await postApproval(payload))) {
     setStatus("错误");
     log("审批结果提交失败——桥服务将在审批超时后按拒绝兜底");
     return;
@@ -789,8 +841,9 @@ async function handleApproval(item) {
   setStatus("待命");
 }
 
-// 审批弹窗：遮罩 + 居中卡片；逐条 [允许][拒绝] + 全部允许/全部拒绝；
-// 顶部倒计时按面板审批超时配置，到点自动全部拒绝。
+// 审批弹窗：遮罩 + 居中卡片；逐条 [允许][拒绝][白名单] + 全部允许/全部拒绝；
+// 白名单按钮是显式动作：条目并入本次提交的 whitelist 数组并自动勾选该条允许（弹窗保持打开，可继续处理其余行）；
+// 顶部倒计时按面板审批超时配置，到点自动全部拒绝（白名单条目一并撤销，保证载荷与 allowed 一致）。
 function showApprovalDialog(item) {
   return new Promise((resolve) => {
     const overlay = document.createElement("div");
@@ -821,19 +874,56 @@ function showApprovalDialog(item) {
     overlay.appendChild(box);
     document.documentElement.appendChild(overlay);
 
-    const decisions = item.calls.map(() => false);
+    const decisions = item.calls.map(() => false); // 逐条允许标记（白名单点击即视为允许）
+    const whitelist = []; // 逐条白名单条目（按调用 index 记录；仅显式按钮动作填充）
     const countEl = box.querySelector("#ha-approval-count");
-    const finish = (allowed) => {
+    const refreshRow = (row, index) => {
+      row.classList.add("ha-approval-wl");
+      const hint = row.querySelector(".ha-approval-hint");
+      if (hint) hint.textContent = "已加入白名单（允许执行），后续同类调用自动放行";
+    };
+    const finish = () => {
       clearInterval(timer);
       overlay.remove();
-      resolve({ allowed });
+      resolve({ allowed: decisions, whitelist: Object.values(whitelist).filter(Boolean) });
     };
     const timer = setInterval(() => {
       secondsLeft.value -= 1;
       countEl.textContent = `${secondsLeft.value}s 后自动拒绝`;
-      if (secondsLeft.value <= 0) finish(item.calls.map(() => false)); // 超时：全部拒绝
+      if (secondsLeft.value <= 0) {
+        decisions.fill(false); // 超时：全部拒绝（白名单条目同步撤销，提交载荷才不会 400）
+        whitelist.length = 0;
+        finish();
+      }
     }, 1000);
     countEl.textContent = `${secondsLeft.value}s 后自动拒绝`;
+
+    // 每行追加白名单按钮：非写类 [白名单]；写类（write_file/apply_patch）额外 [白名单(此目录)]
+    [...box.querySelectorAll(".ha-approval-row")].forEach((row, index) => {
+      const call = item.calls[index];
+      const rowActions = row.querySelector(".ha-approval-btns");
+      const isWrite = call.name === "write_file" || call.name === "apply_patch";
+      const wlBtn = document.createElement("button");
+      wlBtn.textContent = isWrite ? "白名单(此路径)" : "白名单";
+      wlBtn.className = "ha-btn ha-btn-wl";
+      wlBtn.onclick = () => {
+        decisions[index] = true; // 白名单即允许
+        whitelist[index] = buildEntry(call, isWrite ? "path" : "exact");
+        refreshRow(row, index);
+      };
+      if (isWrite) {
+        const dirBtn = document.createElement("button");
+        dirBtn.textContent = "白名单(此目录)";
+        dirBtn.className = "ha-btn ha-btn-wl";
+        dirBtn.onclick = () => {
+          decisions[index] = true;
+          whitelist[index] = buildEntry(call, "dir");
+          refreshRow(row, index);
+        };
+        rowActions.appendChild(dirBtn);
+      }
+      rowActions.appendChild(wlBtn);
+    });
 
     box.addEventListener("click", (e) => {
       const btn = e.target.closest("button");
@@ -841,14 +931,18 @@ function showApprovalDialog(item) {
       const i = Number(btn.dataset.i);
       if (btn.classList.contains("ha-allow")) {
         decisions[i] = true;
-        finish(decisions);
+        finish();
       } else if (btn.classList.contains("ha-deny")) {
         decisions[i] = false;
-        finish(decisions);
+        whitelist[i] = undefined; // 拒绝撤销同条白名单（服务端校验：条目必须对应 allowed=true 的调用）
+        finish();
       } else if (btn.id === "ha-approval-allow-all") {
-        finish(item.calls.map(() => true));
+        decisions.fill(true); // 全部允许不自动填 whitelist——白名单始终是显式按钮动作
+        finish();
       } else if (btn.id === "ha-approval-deny-all") {
-        finish(item.calls.map(() => false));
+        decisions.fill(false);
+        whitelist.length = 0; // 全部拒绝撤销全部白名单条目
+        finish();
       }
     });
   });
