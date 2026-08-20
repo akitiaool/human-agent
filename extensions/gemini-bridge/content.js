@@ -12,8 +12,7 @@ const PROTOCOL_PREFIX = "【human-agent 工具协议】";
 const STABLE_SAMPLES = 3; // 稳定采样次数（连续 2–3 次，取 3）
 const SAMPLE_INTERVAL_MS = 700; // 采样间隔（500ms–1s 区间）
 const TASK_RETRY_MS = 1_000; // GET /task 无消息后的重试间隔
-const BRIDGE_RETRY_MIN_MS = 1_000; // 桥不可达时的初始重试间隔
-const BRIDGE_RETRY_MAX_MS = 30_000; // 桥不可达时的重试间隔上限（指数退避）
+const BRIDGE_RETRY_ATTEMPTS = 5; // 桥不可达自动重试次数；第 N 次失败后等 N 秒（1/2/3/4/5s），全部失败转手动重试
 const TYPING_MIN_MS = 200; // 纠错重打每字符延时下限（真人键入节奏 200–500ms/字）
 const TYPING_MAX_MS = 500;
 const TYPO_MAX = 2; // 每段最多错字数（模拟粘贴后纠错）
@@ -56,7 +55,8 @@ let reinjectPending = false; // 待投递循环处理的协议重新注入
 let reinjectSuppressUntil = 0; // 新对话触发防抖时间戳
 let currentStatus = "待命";
 let bridgeDown = false; // 桥服务不可达标志（进入置位、成功复位）
-let bridgeRetryMs = BRIDGE_RETRY_MIN_MS; // 当前退避间隔
+let bridgeFailCount = 0; // 连续失败次数（5 次后转手动重试）
+let manualRetryResolve = null; // 手动重试按钮的唤醒函数（挂起投递循环时非空）
 let settingsTimer = null; // 面板设置保存防抖
 
 // ---------- 工具函数 ----------
@@ -164,6 +164,13 @@ panel.innerHTML = `
   background: #111827; border: 1px solid #374151;
   color: var(--dot, #93c5fd);
 }
+#ha-panel #ha-retry {
+  margin-top: 6px; width: 100%; background: #111; color: #fca5a5;
+  border: 1px solid #7f1d1d; border-radius: 4px; padding: 4px 0;
+  font: inherit; cursor: pointer;
+}
+#ha-panel #ha-retry:hover { border-color: #b91c1c; color: #fecaca; }
+}
 /* 状态色调：待命蓝 / 已抓取青 / 回填橙 / 倒计时绿 / 等待紫 / 桥断琥珀 / 错误红 */
 .ha-tone-idle  { --dot: #3b82f6; }
 .ha-tone-ready { --dot: #22d3ee; }
@@ -267,6 +274,7 @@ panel.innerHTML = `
   <input type="text" id="ha-base-url" spellcheck="false" placeholder="http://127.0.0.1:8765">
 </div>
 <div class="ha-status" id="ha-status">待命</div>
+<button id="ha-retry" hidden>手动重试</button>
 <div class="ha-log-bar">
   <button id="ha-log-export" title="导出日志为文本文件">导出</button>
   <button id="ha-log-clear" title="清除日志">清除</button>
@@ -285,6 +293,20 @@ document.documentElement.appendChild(ball);
 const statusEl = panel.querySelector("#ha-status");
 const logEl = panel.querySelector("#ha-log");
 const ballDot = ball.querySelector("#ha-ball-dot");
+const retryBtn = panel.querySelector("#ha-retry");
+
+// 手动重试：重置计数并唤醒挂起的投递循环
+retryBtn.addEventListener("click", () => {
+  retryBtn.hidden = true;
+  bridgeFailCount = 0;
+  bridgeDown = false;
+  setStatus("待命");
+  log("手动重试：重新连接桥服务…");
+  if (manualRetryResolve) {
+    manualRetryResolve();
+    manualRetryResolve = null;
+  }
+});
 
 const TONE_CLASSES = [
   "ha-tone-idle", "ha-tone-ready", "ha-tone-busy",
@@ -294,7 +316,7 @@ const TONE_CLASSES = [
 // 状态 → 色调：面板状态栏与悬浮球圆点共用一套
 function statusTone(text) {
   if (text === "错误") return "ha-tone-err";
-  if (text === "桥未连接（重试中）") return "ha-tone-warn";
+  if (text === "桥未连接" || text === "桥未连接（重试中）") return "ha-tone-warn";
   if (text === "等待授权") return "ha-tone-warn";
   if (text.includes("回填中")) return "ha-tone-busy";
   if (text.includes("自动提交")) return "ha-tone-go";
@@ -383,23 +405,29 @@ ball.addEventListener("click", () => {
   lastBallClick = now;
 });
 
-// 桥不可达降级：进入时状态切「桥未连接」并只记一条日志；返回本次退避间隔（调用方 sleep 后翻倍）
-function noteBridgeFailure(errText) {
+// 桥不可达降级：进入时状态切「桥未连接（重试中）」；每次失败都记一条日志（重试进度由调用方经 detail 给出）
+function noteBridgeFailure(errText, detail = "") {
   if (!bridgeDown) {
     bridgeDown = true;
     setStatus("桥未连接（重试中）");
-    log(`桥服务不可达：${errText}（${bridgeRetryMs / 1000}s 后重试）`);
   }
-  return bridgeRetryMs;
+  log(`桥服务不可达：${errText}${detail ? `（${detail}）` : ""}`);
 }
 
 function noteBridgeSuccess() {
-  bridgeRetryMs = BRIDGE_RETRY_MIN_MS;
+  bridgeFailCount = 0;
   if (bridgeDown) {
     bridgeDown = false;
     setStatus("待命");
     log("桥服务已连接");
   }
+}
+
+// 挂起投递循环直到手动重试按钮被点击
+function waitForManualRetry() {
+  return new Promise((resolve) => {
+    manualRetryResolve = resolve;
+  });
 }
 
 function log(text) {
@@ -882,8 +910,16 @@ async function deliveryLoop() {
         resp = { error: err instanceof Error ? err.message : String(err) };
       }
       if (resp?.error) {
-        await sleep(noteBridgeFailure(resp.error));
-        bridgeRetryMs = Math.min(bridgeRetryMs * 2, BRIDGE_RETRY_MAX_MS); // 指数退避
+        bridgeFailCount += 1;
+        if (bridgeFailCount <= BRIDGE_RETRY_ATTEMPTS) {
+          noteBridgeFailure(resp.error, `第 ${bridgeFailCount}/${BRIDGE_RETRY_ATTEMPTS} 次失败，${bridgeFailCount}s 后重试`);
+          await sleep(bridgeFailCount * 1000);
+          continue;
+        }
+        noteBridgeFailure(resp.error, "5 次重试均失败，请点击面板「手动重试」");
+        setStatus("桥未连接");
+        retryBtn.hidden = false;
+        await waitForManualRetry();
         continue;
       }
       noteBridgeSuccess();
