@@ -100,12 +100,15 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
           sendResponse({ ok: false, error: "invalid approval" });
           return;
         }
+        const body = { id, allowed };
+        const whitelist = Array.isArray(message?.whitelist) ? message.whitelist : [];
+        if (whitelist.length > 0) body.whitelist = whitelist;
         let res;
         try {
           res = await fetch(`${base}/approval`, {
             method: "POST",
             headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({ id, allowed }),
+            body: JSON.stringify(body),
             signal: AbortSignal.timeout(POST_RESULT_TIMEOUT_MS),
           });
         } catch (err) {

@@ -1,12 +1,14 @@
 // 执行型桥服务（v3）：网页驱动对话，智能体只执行。
-// 接收网页内容（POST /result）→ 解析 ```tool_call``` → 预筛摘出危险命令
-// → 反思层裁决其余 → 危险命令经审批协议（GET /task 下发 approval + POST /approval 回裁决）
-// → 共享执行器执行 → 序列化回填消息入队；插件经长轮询（GET /task）取回填。
+// 接收网页内容（POST /result）→ 解析 ```tool_call``` → 统一 reflect 裁决
+// （黑名单绝对拒绝 / 未知与参数非法拦截 / 白名单放行 / 其余 pending）
+// → pending 经审批协议批量下发（GET /task 下发 approval + POST /approval 回裁决，
+//   可携带 whitelist 条目落盘）→ 共享执行器执行 → 序列化回填消息入队；插件经长轮询（GET /task）取回填。
 // 不再实现 BrainInference（无模型推理，不运行心脏循环）。
 import http from "node:http";
 import type { AddressInfo } from "node:net";
 import { executeTool, type ToolOrgans } from "../heart/executor.js";
-import type { ActionResult, EyesContract, HandsContract } from "../types/index.js";
+import { matchKeyFor, normalizePath, toolMatches } from "../nose/policy.js";
+import type { ActionResult, EyesContract, HandsContract, WhitelistEntry } from "../types/index.js";
 import { fail } from "../types/index.js";
 import type { BrainInferenceResult, ToolCall } from "./llm.js";
 import { BaseThinking, type BaseThinkingOptions } from "./thinking.js";
@@ -70,7 +72,7 @@ export class GeminiBridgeThinking extends BaseThinking {
   readonly #logger: ((message: string) => void) | undefined;
   readonly #outbox: OutboxItem[] = [];
   readonly #waiters: Array<() => void> = [];
-  readonly #approvals = new Map<number, { settle: (decision: ApprovalDecision) => void; count: number }>();
+  readonly #approvals = new Map<number, { settle: (decision: ApprovalDecision) => void; count: number; calls: ToolCall[] }>();
   #nextApprovalId = 1;
   readonly #approvalTimeoutMs: number;
   /** 单批串行队列：一次只处理一批，避免并发批交错。 */
@@ -203,7 +205,7 @@ export class GeminiBridgeThinking extends BaseThinking {
     return true;
   }
 
-  /** 单批流水线：预筛摘出危险命令 → 批量审批（await 裁决）→ 反思裁决其余 → 按原 calls 顺序执行/拒绝 → 回填。 */
+  /** 单批流水线：统一裁决（黑名单/未知/非法/白名单/需授权）→ 需授权的批量审批 → 按原 calls 顺序执行/拒绝 → 回填。 */
   async #process(calls: readonly ToolCall[]): Promise<void> {
     if (this.#signal.aborted) return; // 全局中断：丢弃批次
     const batchSignal =
@@ -211,47 +213,45 @@ export class GeminiBridgeThinking extends BaseThinking {
         ? AbortSignal.any([this.#signal, AbortSignal.timeout(this.#timeoutMs)])
         : this.#signal;
 
-    // 预筛：危险判定已移交统一 reflect（BLACKLIST 绝对拒绝）；危险命令审批通道待 Task 6 经 pending 接入
-    const dangerous: ToolCall[] = [];
-    const rest: readonly ToolCall[] = calls;
+    const verdict = await this.reflect(calls);
+    const pending = verdict.pending;
 
-    // 批量审批：一条请求含全部危险命令；批中止时作废审批条目并清除兜底定时器
+    // 批量审批：一条请求含全部待授权调用；批中止时作废审批条目并清除兜底定时器
     let decision: ApprovalDecision | undefined;
-    if (dangerous.length > 0) {
-      const { id, promise, cancel } = this.#requestApproval(dangerous);
+    if (pending.length > 0) {
+      const { id, promise, cancel } = this.#requestApproval(pending);
       try {
         decision = await Promise.race([promise, abortSignalPromise(batchSignal)]);
       } catch {
-        cancel(); // 批中止：作废审批条目并清除兜底定时器（否则 CLI 退出被 timer 拖延）
+        cancel();
         if (this.#signal.aborted) return; // 全局中断：丢弃批次
         this.#pushMessage(`⚠️ 工具执行超时（超过 ${this.#timeoutMs}ms），已终止`);
         return;
       }
     }
 
-    const verdict = await this.reflect(rest);
-    const dangerSet = new Set(dangerous);
     const allowedSet = new Set(verdict.allowed);
+    const pendingSet = new Set(pending);
     const blockedMap = new Map(verdict.blocked.map((item) => [item.call, item.result] as const));
     const decisions = decision?.allowed ?? [];
     const lines: string[] = [];
     let index = 0;
-    let dangerIndex = 0;
+    let pendingIndex = 0;
     for (const call of calls) {
       // 原 calls 顺序执行与输出（执行顺序 = 原顺序，逐条串行）
       let toRun: ToolCall | undefined;
       let blockedResult: ActionResult<unknown> | undefined;
-      if (dangerSet.has(call)) {
-        const allowed = decisions[dangerIndex++] ?? false;
+      if (blockedMap.has(call)) {
+        blockedResult = blockedMap.get(call);
+      } else if (allowedSet.has(call)) {
+        toRun = call;
+      } else if (pendingSet.has(call)) {
+        const allowed = decisions[pendingIndex++] ?? false;
         if (allowed) {
           toRun = call;
         } else {
           blockedResult = fail("USER_DENIED", decision?.timedOut === true ? "审批超时，未执行" : "用户未授权，未执行");
         }
-      } else if (allowedSet.has(call)) {
-        toRun = call;
-      } else {
-        blockedResult = blockedMap.get(call);
       }
       if (toRun !== undefined) {
         index++;
@@ -307,9 +307,9 @@ export class GeminiBridgeThinking extends BaseThinking {
         resolve(decision);
       };
     });
-    this.#approvals.set(id, { settle, count: calls.length });
+    this.#approvals.set(id, { settle, count: calls.length, calls: [...calls] });
     this.#outbox.push({ type: "approval", id, calls: [...calls] });
-    this.#logger?.(`审批请求已入队（id ${id}，${calls.length} 条危险命令）`);
+    this.#logger?.(`审批请求已入队（id ${id}，${calls.length} 条待授权调用）`);
     this.#wakeWaiter();
     return {
       id,
@@ -321,18 +321,32 @@ export class GeminiBridgeThinking extends BaseThinking {
     };
   }
 
-  /** 收扩展审批结果：已知且未处理的 id → 逐条放行；未知 id（已超时/已处理）→ 404。 */
+  /** 收扩展审批结果：校验 allowed 与 whitelist → 放行（whitelist 条目落盘）→ settle；未知 id（已超时/已处理）→ 404。 */
   #handleApprovalRequest(req: http.IncomingMessage, res: http.ServerResponse): void {
     readJsonBody(req).then(
       (body) => {
         const record = (typeof body === "object" && body !== null ? body : {}) as Record<string, unknown>;
         const id = typeof record.id === "number" ? record.id : NaN;
-        const allowed = (Array.isArray(record.allowed) ? record.allowed : []).map((v) => v === true);
         const entry = this.#approvals.get(id);
-        if (entry === undefined || allowed.length === 0) {
+        if (entry === undefined) {
           res.writeHead(404, { "Content-Type": "application/json" });
-          res.end(JSON.stringify({ error: "unknown approval" }));
+          res.end(JSON.stringify({ error: "审批不存在或已过期" }));
           return;
+        }
+        const allowed = (Array.isArray(record.allowed) ? record.allowed : []).map((v) => v === true);
+        if (allowed.length !== entry.calls.length) {
+          res.writeHead(400, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ error: "allowed 必须与调用数一致" }));
+          return;
+        }
+        if (record.whitelist !== undefined) {
+          const entries = Array.isArray(record.whitelist) ? record.whitelist : null;
+          if (entries === null || !this.#isValidWhitelist(entries, entry.calls, allowed)) {
+            res.writeHead(400, { "Content-Type": "application/json" });
+            res.end(JSON.stringify({ error: "whitelist 条目不合法" }));
+            return;
+          }
+          for (const w of entries) void this.addWhitelistEntry(w as WhitelistEntry);
         }
         this.#approvals.delete(id);
         entry.settle({ allowed, timedOut: false });
@@ -344,6 +358,30 @@ export class GeminiBridgeThinking extends BaseThinking {
         res.end(JSON.stringify({ error: "请求体必须为合法 JSON" }));
       },
     );
+  }
+
+  /** 校验：每条目必须对应本批中 allowed=true 的调用（exact：tool+key 与匹配键完全一致；path：此路径或此目录）。 */
+  #isValidWhitelist(raw: unknown[], calls: readonly ToolCall[], allowed: boolean[]): boolean {
+    const allowedCalls = calls.filter((_, i) => allowed[i] === true);
+    return raw.every((item) => {
+      if (typeof item !== "object" || item === null) return false;
+      const w = item as Record<string, unknown>;
+      if (typeof w.tool !== "string" || typeof w.key !== "string") return false;
+      if (w.kind !== "exact" && w.kind !== "path") return false;
+      const entry: WhitelistEntry = { tool: w.tool, key: w.key, kind: w.kind };
+      return allowedCalls.some((call) => {
+        if (entry.kind === "exact") {
+          return toolMatches(entry.tool, call.name) && entry.key === matchKeyFor(call);
+        }
+        if (call.name !== "write_file" && call.name !== "apply_patch") return false;
+        const path = typeof call.arguments.path === "string" ? normalizePath(call.arguments.path) : "";
+        if (!toolMatches(entry.tool, call.name)) return false;
+        if (entry.key === path) return true; // 文件条目
+        const i = path.lastIndexOf("/");
+        if (i <= 0 || (i === 2 && path[1] === ":")) return false; // 根级/盘符根：仅文件条目，dir 条目拒绝
+        return entry.key === `${path.slice(0, i)}/`;
+      });
+    });
   }
 }
 

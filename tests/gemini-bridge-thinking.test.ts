@@ -1,7 +1,19 @@
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { afterAll, afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { GeminiBridgeThinking, parseToolCalls } from "../src/brain/gemini-bridge-thinking.js";
-import type { ActionResult, EyesContract, HandsContract, NoseContract, RiskLevel } from "../src/types/index.js";
-import { buildStubNose } from "./helpers.js";
+import type { ActionResult, EyesContract, HandsContract, WhitelistEntry } from "../src/types/index.js";
+
+const tmpDir = mkdtempSync(join(tmpdir(), "bridge-wl-"));
+const tmpFile = join(tmpDir, "whitelist.json");
+afterAll(() => rmSync(tmpDir, { recursive: true, force: true }));
+beforeEach(() => rmSync(tmpFile, { force: true }));
+
+/** 预置白名单（构造前写入；桥构造时加载）。 */
+function seedWhitelist(workspace: string, entries: WhitelistEntry[]): void {
+  writeFileSync(tmpFile, JSON.stringify({ [workspace]: entries }), "utf8");
+}
 
 // 记录型 stub 器官：断言"执行了哪些工具"而不真跑命令
 function makeRecordingOrgans() {
@@ -29,11 +41,18 @@ function ok<T>(data: T): ActionResult<T> { return { success: true, data }; }
 const openBridges: GeminiBridgeThinking[] = [];
 afterEach(() => { for (const bridge of openBridges.splice(0)) bridge.close(); });
 
-async function makeBridge(options: { nose?: NoseContract; timeoutMs?: number; signal?: AbortSignal; approvalTimeoutMs?: number } = {}) {
+async function makeBridge(options: {
+  workspace?: string;
+  whitelistFile?: string;
+  timeoutMs?: number;
+  signal?: AbortSignal;
+  approvalTimeoutMs?: number;
+} = {}) {
   const organs = makeRecordingOrgans();
   const bridge = new GeminiBridgeThinking({
     port: 0,
-    nose: options.nose ?? buildStubNose(),
+    workspace: options.workspace ?? "/ws-test",
+    whitelistFile: options.whitelistFile ?? tmpFile,
     hands: organs.hands,
     eyes: organs.eyes,
     ...(options.timeoutMs !== undefined ? { timeoutMs: options.timeoutMs } : {}),
@@ -56,6 +75,14 @@ async function getMessage(port: number): Promise<OutboxBody | null> {
   return (await res.json()) as OutboxBody;
 }
 
+/** 限时取一条出队消息；超时返回 null（挂起的 GET /task 由 afterEach bridge.close() 释放）。 */
+async function tryGetMessage(port: number, ms: number): Promise<OutboxBody | null> {
+  return Promise.race([
+    getMessage(port),
+    new Promise<null>((resolve) => setTimeout(() => resolve(null), ms)),
+  ]);
+}
+
 /** 取回填文本消息（非审批类型时抛错）。 */
 async function getMessageText(port: number): Promise<string> {
   const body = await getMessage(port);
@@ -64,12 +91,14 @@ async function getMessageText(port: number): Promise<string> {
   return body.message;
 }
 
-/** 提交审批结果，返回 HTTP 状态码。 */
-async function postApproval(port: number, id: number, allowed: boolean[]): Promise<number> {
+/** 提交审批结果（可携带 whitelist 条目），返回 HTTP 状态码。 */
+async function postApproval(port: number, id: number, allowed: boolean[], whitelist?: WhitelistEntry[]): Promise<number> {
+  const body: Record<string, unknown> = { id, allowed };
+  if (whitelist !== undefined && whitelist.length > 0) body.whitelist = whitelist;
   const res = await fetch(`http://127.0.0.1:${port}/approval`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ id, allowed }),
+    body: JSON.stringify(body),
   });
   await res.json().catch(() => undefined);
   return res.status;
@@ -134,6 +163,7 @@ describe("GeminiBridgeThinking 执行型桥服务", () => {
   });
 
   it("含 tool_call 的内容执行后回填结果消息", async () => {
+    seedWhitelist("/ws-test", [{ tool: "read_file", key: '{"path":"a.txt"}', kind: "exact" }]);
     const { port, organs } = await makeBridge();
     await getMessageText(port); // 排空协议首条
     const res = await postReply(port, toolCall("read_file", { path: "a.txt" }));
@@ -153,6 +183,10 @@ describe("GeminiBridgeThinking 执行型桥服务", () => {
   });
 
   it("多个 tool_call 汇总为一条消息并全部执行", async () => {
+    seedWhitelist("/ws-test", [
+      { tool: "read_file", key: '{"path":"a.txt"}', kind: "exact" },
+      { tool: "terminal", key: "echo hi", kind: "exact" },
+    ]);
     const { port, organs } = await makeBridge();
     await getMessageText(port);
     const reply = [
@@ -167,22 +201,22 @@ describe("GeminiBridgeThinking 执行型桥服务", () => {
     expect(organs.calls).toHaveLength(2);
   });
 
-  it("危险命令需审批，未授权不执行", async () => {
-    const { port, organs } = await makeBridge({ nose: buildStubNose("DANGEROUS") });
+  it("未列入白名单的调用下发审批，未授权不执行", async () => {
+    const { port, organs } = await makeBridge({ workspace: "/ws-test" });
     await getMessage(port);
-    const res = await postReply(port, toolCall("terminal", { command: "rm -rf /" }));
+    const res = await postReply(port, toolCall("terminal", { command: "echo hi" }));
     expect(res.processed).toBe(true);
     const body = await getMessage(port);
-    expect(body?.type).toBe("approval"); // 审批请求而非自动拒绝
+    expect(body?.type).toBe("approval"); // 审批请求而非自动执行
     expect(organs.calls).toEqual([]); // 未授权前不执行
   });
 
-  it("多个危险命令合并为一条审批请求", async () => {
-    const { port } = await makeBridge({ nose: buildStubNose("DANGEROUS") });
+  it("多个未列调用合并为一条审批请求", async () => {
+    const { port } = await makeBridge({ workspace: "/ws-test" });
     await getMessage(port);
     const reply = [
-      toolCall("terminal", { command: "rm -rf /" }),
-      toolCall("terminal", { command: "git push --force" }),
+      toolCall("terminal", { command: "git push --force origin main" }),
+      toolCall("terminal", { command: "echo hi" }),
     ].join("\n");
     const res = await postReply(port, reply);
     expect(res.processed).toBe(true);
@@ -190,13 +224,13 @@ describe("GeminiBridgeThinking 执行型桥服务", () => {
     expect(body?.type).toBe("approval");
     if (body?.type === "approval") {
       expect(body.calls).toHaveLength(2);
-      expect(body.calls[0]!.arguments).toEqual({ command: "rm -rf /" });
-      expect(body.calls[1]!.arguments).toEqual({ command: "git push --force" });
+      expect(body.calls[0]!.arguments).toEqual({ command: "git push --force origin main" });
+      expect(body.calls[1]!.arguments).toEqual({ command: "echo hi" });
     }
   });
 
   it("审批允许后执行并回填结果", async () => {
-    const { port, organs } = await makeBridge({ nose: buildStubNose("DANGEROUS") });
+    const { port, organs } = await makeBridge({ workspace: "/ws-test" });
     await getMessage(port);
     await postReply(port, toolCall("terminal", { command: "echo hi" }));
     const body = await getMessage(port);
@@ -210,10 +244,10 @@ describe("GeminiBridgeThinking 执行型桥服务", () => {
   });
 
   it("审批逐条裁决：允许的执行、拒绝的生成拒绝行", async () => {
-    const { port, organs } = await makeBridge({ nose: buildStubNose("DANGEROUS") });
+    const { port, organs } = await makeBridge({ workspace: "/ws-test" });
     await getMessage(port);
     const reply = [
-      toolCall("terminal", { command: "rm -rf /" }),
+      toolCall("terminal", { command: "ls -la" }),
       toolCall("terminal", { command: "echo ok" }),
     ].join("\n");
     await postReply(port, reply);
@@ -225,7 +259,7 @@ describe("GeminiBridgeThinking 执行型桥服务", () => {
     expect(message).toContain("已拒绝");
     expect(message).toContain("用户未授权");
     expect(message).toContain("echo ok");
-    expect(organs.calls.some((c) => c.args.command === "rm -rf /")).toBe(false);
+    expect(organs.calls.some((c) => c.args.command === "ls -la")).toBe(false);
     expect(organs.calls.some((c) => c.args.command === "echo ok")).toBe(true);
   });
 
@@ -235,9 +269,9 @@ describe("GeminiBridgeThinking 执行型桥服务", () => {
   });
 
   it("审批兜底超时全部拒绝", async () => {
-    const { port, organs } = await makeBridge({ nose: buildStubNose("DANGEROUS"), approvalTimeoutMs: 50 });
+    const { port, organs } = await makeBridge({ workspace: "/ws-test", approvalTimeoutMs: 50 });
     await getMessage(port);
-    await postReply(port, toolCall("terminal", { command: "rm -rf /" }));
+    await postReply(port, toolCall("terminal", { command: "echo hi" }));
     const body = await getMessage(port);
     expect(body?.type).toBe("approval");
     const message = await getMessageText(port); // 50ms 兜底超时后回填拒绝行
@@ -247,9 +281,9 @@ describe("GeminiBridgeThinking 执行型桥服务", () => {
   });
 
   it("close 释放挂起审批", async () => {
-    const { bridge, port, organs } = await makeBridge({ nose: buildStubNose("DANGEROUS"), approvalTimeoutMs: 1000 });
+    const { bridge, port, organs } = await makeBridge({ workspace: "/ws-test", approvalTimeoutMs: 1000 });
     await getMessage(port);
-    await postReply(port, toolCall("terminal", { command: "rm -rf /" }));
+    await postReply(port, toolCall("terminal", { command: "echo hi" }));
     const body = await getMessage(port);
     expect(body?.type).toBe("approval");
     bridge.close();
@@ -259,9 +293,9 @@ describe("GeminiBridgeThinking 执行型桥服务", () => {
 
   it("全局中断作废审批并丢弃批次", async () => {
     const controller = new AbortController();
-    const { port, organs } = await makeBridge({ nose: buildStubNose("DANGEROUS"), signal: controller.signal });
+    const { port, organs } = await makeBridge({ workspace: "/ws-test", signal: controller.signal });
     await getMessage(port);
-    await postReply(port, toolCall("terminal", { command: "rm -rf /" }));
+    await postReply(port, toolCall("terminal", { command: "echo hi" }));
     const body = await getMessage(port);
     expect(body?.type).toBe("approval");
     const id = (body as { id: number }).id;
@@ -272,7 +306,7 @@ describe("GeminiBridgeThinking 执行型桥服务", () => {
   });
 
   it("参数非法的危险命令不进审批，直接 INVALID_ARGS 拒绝", async () => {
-    const { port } = await makeBridge({ nose: buildStubNose("DANGEROUS") });
+    const { port } = await makeBridge();
     await getMessage(port);
     const res = await postReply(port, toolCall("terminal", {}));
     expect(res.processed).toBe(true);
@@ -280,12 +314,80 @@ describe("GeminiBridgeThinking 执行型桥服务", () => {
     expect(message).toContain("参数不合法");
   });
 
-  it("安全命令批不产生审批消息", async () => {
-    const { port } = await makeBridge(); // SAFE nose
-    await getMessage(port);
-    await postReply(port, toolCall("read_file", { path: "a.txt" }));
+  it("黑名单命中直接回填拒绝，不下发审批", async () => {
+    const { port, organs } = await makeBridge();
+    await getMessageText(port); // 排空协议首条
+    await postReply(port, toolCall("terminal", { command: "rm -rf /" }));
+    const message = await getMessageText(port);
+    expect(message).toContain("BLACKLIST");
+    expect(message).toContain("系统破坏操作，禁止执行");
+    expect(await tryGetMessage(port, 300)).toBeNull(); // 无审批请求
+    expect(organs.calls).toEqual([]);
+  });
+
+  it("白名单命中静默执行（不下发审批）", async () => {
+    seedWhitelist("/ws-test", [{ tool: "terminal", key: "git status", kind: "exact" }]);
+    const { port, organs } = await makeBridge();
+    await getMessageText(port);
+    await postReply(port, toolCall("terminal", { command: "git status" }));
+    const message = await getMessageText(port);
+    expect(message).toContain("工具执行结果");
+    expect(message).toContain("成功");
+    expect(organs.calls.some((c) => c.args.command === "git status")).toBe(true);
+  });
+
+  it("审批带回 whitelist 条目 → 落盘后生效", async () => {
+    const { port } = await makeBridge({ workspace: "/ws-test" });
+    await getMessageText(port);
+    await postReply(port, toolCall("terminal", { command: "ls -la" }));
     const body = await getMessage(port);
-    expect(body?.type).toBe("message");
+    expect(body?.type).toBe("approval");
+    const id = (body as { id: number }).id;
+    expect(await postApproval(port, id, [true], [{ tool: "terminal", key: "ls -la", kind: "exact" }])).toBe(200);
+    await getMessageText(port); // 执行结果
+    const raw = JSON.parse(readFileSync(tmpFile, "utf8")) as Record<string, WhitelistEntry[]>;
+    expect(raw["/ws-test"]).toContainEqual({ tool: "terminal", key: "ls -la", kind: "exact" });
+  });
+
+  it("非法 whitelist 条目 → 400 拒绝（不落盘不执行）", async () => {
+    const { port, organs } = await makeBridge({ workspace: "/ws-test" });
+    await getMessageText(port);
+    await postReply(port, toolCall("terminal", { command: "ls -la" }));
+    const body = await getMessage(port);
+    expect(body?.type).toBe("approval");
+    const id = (body as { id: number }).id;
+    const res = await postApproval(port, id, [true], [{ tool: "write_file", key: "/etc/passwd", kind: "path" }]);
+    expect(res).toBe(400);
+    expect(organs.calls).toEqual([]); // 未执行
+  });
+
+  it("根级路径不接受 dir 条目：write_file /x.txt + key / → 400 且不执行", async () => {
+    const { port, organs } = await makeBridge({ workspace: "/ws-test" });
+    await getMessageText(port);
+    await postReply(port, toolCall("write_file", { path: "/x.txt", content: "x" }));
+    const body = await getMessage(port);
+    expect(body?.type).toBe("approval");
+    const id = (body as { id: number }).id;
+    const res = await postApproval(port, id, [true], [{ tool: "write_file", key: "/", kind: "path" }]);
+    expect(res).toBe(400); // 根级/盘符根：仅文件条目，dir 条目拒绝
+    expect(organs.calls).toEqual([]); // 未执行
+  });
+
+  it("工作区启动即注册：界内写入静默执行（apply_patch 同样命中）", async () => {
+    const { port, organs } = await makeBridge({ workspace: "/ws" });
+    await getMessageText(port);
+    await postReply(port, toolCall("write_file", { path: "/ws/a.txt", content: "hi" }));
+    const message = await getMessageText(port);
+    expect(message).toContain("成功");
+    expect(organs.calls.some((c) => c.name === "write_file")).toBe(true);
+  });
+
+  it("界外写入未入白名单 → 下发审批", async () => {
+    const { port } = await makeBridge({ workspace: "/ws" });
+    await getMessageText(port);
+    await postReply(port, toolCall("write_file", { path: "/tmp/evil.txt", content: "x" }));
+    const body = await getMessage(port);
+    expect(body?.type).toBe("approval");
   });
 
   it("未知工具与参数非法拒绝", async () => {
@@ -300,6 +402,7 @@ describe("GeminiBridgeThinking 执行型桥服务", () => {
   });
 
   it("相同内容重复提交只处理一次", async () => {
+    seedWhitelist("/ws-test", [{ tool: "read_file", key: '{"path":"a.txt"}', kind: "exact" }]);
     const { port, organs } = await makeBridge();
     await getMessageText(port);
     const reply = toolCall("read_file", { path: "a.txt" });
@@ -312,6 +415,7 @@ describe("GeminiBridgeThinking 执行型桥服务", () => {
   });
 
   it("批超时队列执行超时说明", async () => {
+    seedWhitelist("/ws-test", [{ tool: "terminal", key: "slow", kind: "exact" }]);
     const { port, organs } = await makeBridge({ timeoutMs: 100 });
     await getMessageText(port);
     const res = await postReply(port, toolCall("terminal", { command: "slow" }));
