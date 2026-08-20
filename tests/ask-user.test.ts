@@ -94,6 +94,18 @@ describe("askApproval 三选", () => {
       entry: { tool: "write_file", key: "src/", kind: "path" },
     });
   });
+  it("d 分支根级/盘符根降级为文件条目（防整盘/全路径超授权）", async () => {
+    const ask1 = new AskUser({ input: inputFrom("d\n") });
+    expect(await ask1.askApproval({ tool: "write_file", key: "c:/x.txt", kind: "path" })).toEqual({
+      action: "whitelist",
+      entry: { tool: "write_file", key: "c:/x.txt", kind: "path" },
+    });
+    const ask2 = new AskUser({ input: inputFrom("d\n") });
+    expect(await ask2.askApproval({ tool: "write_file", key: "/x", kind: "path" })).toEqual({
+      action: "whitelist",
+      entry: { tool: "write_file", key: "/x", kind: "path" },
+    });
+  });
   it("非法输入循环追问（x 后 y 生效）", async () => {
     const ask = new AskUser({ input: inputFrom("x\ny\n") });
     const choice = await ask.askApproval({ tool: "terminal", key: "ls", kind: "exact" });

@@ -782,7 +782,20 @@ function normalizeKey(call, granularity) {
       .replace(/\s+/g, " ")
       .replace(/\\/g, "/")
       .replace(/\/+/g, "/");
-    const lower = /^win/i.test(navigator.platform) ? p.toLowerCase() : p;
+    // 段级解析：折叠 . 与 ..（与服务端 normalizePath 一致——防 c:/ws/../../windows 穿越绕过黑名单锚定/工作区边界）
+    const isAbs = p.startsWith("/");
+    const isDrive = /^[a-z]:\//.test(p);
+    const out = [];
+    for (const s of p.split("/")) {
+      if (s === "" || s === ".") continue;
+      if (s === "..") {
+        if (out.length > (isDrive ? 1 : 0)) out.pop();
+        continue;
+      }
+      out.push(s);
+    }
+    const resolved = (isAbs ? "/" : "") + out.join("/");
+    const lower = /^win/i.test(navigator.platform) ? resolved.toLowerCase() : resolved;
     if (granularity === "dir") {
       const i = lower.lastIndexOf("/");
       // 根级/盘符根：dir 条目=全部绝对路径/整盘超授权，降级为文件条目（与 buildWhitelistEntry 一致）

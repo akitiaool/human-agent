@@ -11,10 +11,27 @@ export type Classification = "blacklist" | "whitelist" | "unlisted";
 
 const WRITE_TOOLS = new Set(["write_file", "apply_patch"]);
 
-/** 归一化：空白折叠 + 反斜杠转正斜杠；win32 额外小写（路径键用）。 */
+/** 段级解析：折叠 . 与 ..（盘符根/根之上不可越）——防 c:/ws/../../windows 穿越绕过黑名单锚定/工作区边界。 */
+function resolvePathSegments(p: string): string {
+  const isAbs = p.startsWith("/");
+  const isDrive = /^[a-z]:\//.test(p);
+  const out: string[] = [];
+  for (const s of p.split("/")) {
+    if (s === "" || s === ".") continue;
+    if (s === "..") {
+      if (out.length > (isDrive ? 1 : 0)) out.pop(); // 盘符根/根之上不可越
+      continue;
+    }
+    out.push(s);
+  }
+  return (isAbs ? "/" : "") + out.join("/");
+}
+
+/** 归一化：空白折叠 + 反斜杠转正斜杠 + 段级解析；win32 额外小写（路径键用）。 */
 export function normalizePath(input: string): string {
   const out = input.trim().replace(/\s+/g, " ").replace(/\\/g, "/").replace(/\/+/g, "/");
-  return process.platform === "win32" ? out.toLowerCase() : out;
+  const resolved = resolvePathSegments(out);
+  return process.platform === "win32" ? resolved.toLowerCase() : resolved;
 }
 
 export function normalizeCommand(input: string): string {

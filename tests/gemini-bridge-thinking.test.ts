@@ -373,6 +373,18 @@ describe("GeminiBridgeThinking 执行型桥服务", () => {
     expect(organs.calls).toEqual([]); // 未执行
   });
 
+  it("盘符根 dir 条目 → 400（整盘放行拒绝）", async () => {
+    const { port, organs } = await makeBridge({ workspace: "/ws" });
+    await getMessageText(port);
+    await postReply(port, toolCall("write_file", { path: "c:/x.txt", content: "x" }));
+    const body = await getMessage(port);
+    expect(body?.type).toBe("approval");
+    const id = (body as { id: number }).id;
+    const res = await postApproval(port, id, [true], [{ tool: "write_file", key: "c:/", kind: "path" }]);
+    expect(res).toBe(400);
+    expect(organs.calls).toEqual([]);
+  });
+
   it("工作区启动即注册：界内写入静默执行（apply_patch 同样命中）", async () => {
     const { port, organs } = await makeBridge({ workspace: "/ws" });
     await getMessageText(port);

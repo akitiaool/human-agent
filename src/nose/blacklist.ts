@@ -7,7 +7,7 @@ export const BLACKLIST_PATTERNS: readonly RegExp[] = [
   /\brm\s+-[^\s]*(?:r[^\s]*f|f[^\s]*r)[^\s]*\s+[a-z]:\/(?:\s|$)/i,
   // rm -rf 跟 Windows 系统目录：windows[/system32|/boot] 或裸 windows 结尾；
   // 注意终结符——"c:/windows/temp" 不命中（temp 可恢复，走审批）
-  /\brm\s+-[^\s]*(?:r[^\s]*f|f[^\s]*r)[^\s]*\s+[a-z]:\/windows(?:\/(?:system32|boot)(?:\s|$|\/)|\s|$)/i,
+  /\brm\s+-[^\s]*(?:r[^\s]*f|f[^\s]*r)[^\s]*\s+[a-z]:\/windows(?:\/(?:system32|boot)(?:\s|$|\/)|\/(?=\s|$)|\s|$)/i,
   // rm -rf 跟 System Volume Information（系统还原区）
   /\brm\s+-[^\s]*(?:r[^\s]*f|f[^\s]*r)[^\s]*\s+[a-z]:\/system\s+volume\s+information(?:\s|$|\/)/i,
   // rm -rf 跟 Unix 系统目录（/boot /etc /usr /bin /sbin /lib /lib64）
@@ -41,7 +41,7 @@ export const BLACKLIST_PATTERNS: readonly RegExp[] = [
   /\breg\s+delete\b[^\n|;]*(?:HKLM\/SYSTEM|Windows NT\/CurrentVersion)/i,
   /\btaskkill\b[^\n|;]*\/f[^\n|;]*(?:lsass|csrss|wininit|winlogon)/i,
   // 权限全毁（chmod -R 000 跟 / 或系统目录）
-  /\bchmod\s+-R\s+000\s+\/(?:\s|$|(?:etc|usr|bin|sbin|lib(?:64)?)(?:\s|$|\/))/i,
+  /\bchmod\s+-R\s+000\s+\/(?:\s|$|\*|(?:etc|usr|bin|sbin|lib(?:64)?)(?:\s|$|\/))/i,
   // 写类工具写系统目录（path 形态锚定开头——terminal 命令串不以盘符开头，天然只命中写类）
   /^[a-z]:\/windows\/(?:system32|boot)(?:\/|$)/i,
   /^[a-z]:\/system\s+volume\s+information(?:\/|$)/i,

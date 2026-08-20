@@ -59,6 +59,11 @@ describe("黑名单（系统破坏目标锚定）", () => {
     expect(classify(call("terminal", { command: "fdisk /dev/sda delete" }))).toBe("blacklist");
     expect(classify(call("terminal", { command: "chmod -R 000 /usr" }))).toBe("blacklist");
   });
+  it("命中：rm 系统目录尾斜杠形态 + chmod 权限全毁 /* 形态", () => {
+    expect(classify(call("terminal", { command: "rm -rf C:\\Windows\\" }))).toBe("blacklist");
+    expect(classify(call("terminal", { command: "chmod -R 000 /*" }))).toBe("blacklist");
+    expect(classify(call("terminal", { command: "rm -rf C:\\Windows\\Temp" }))).toBe("unlisted");
+  });
   it("命中：启动文件删除与块设备重定向", () => {
     expect(classify(call("terminal", { command: "del bootmgr" }))).toBe("blacklist");
     expect(classify(call("terminal", { command: "bcdedit /delete {bootmgr}" }))).toBe("blacklist");
@@ -84,6 +89,19 @@ describe("黑名单（系统破坏目标锚定）", () => {
   it("写类工具按 path 匹配系统目标", () => {
     expect(classify(call("write_file", { path: "C:\\Windows\\System32\\drivers\\hosts", content: "x" }))).toBe("blacklist");
     expect(classify(call("write_file", { path: "src/a.ts", content: "x" }))).toBe("unlisted");
+  });
+});
+
+describe("路径穿越折叠（.. 段解析）", () => {
+  it("路径穿越折叠：.. 段解析（黑名单锚定不被绕过、工作区边界不被穿透）", () => {
+    expect(normalizePath("c:/users/me/project/../../../windows/system32/drivers/hosts")).toBe("c:/windows/system32/drivers/hosts");
+    expect(classify(call("write_file", { path: "C:/users/me/project/../../../windows/system32/drivers/hosts", content: "x" }))).toBe("blacklist");
+    expect(classify(call("write_file", { path: "/ws/../secret.txt", content: "x" }))).toBe("unlisted");
+    const p = new PermissionPolicy({
+      workspace: "/ws",
+      entries: [{ tool: "write_file", key: "/ws/", kind: "path" }],
+    });
+    expect(p.classify(call("write_file", { path: "/ws/a/../b.txt", content: "x" }))).toBe("whitelist");
   });
 });
 

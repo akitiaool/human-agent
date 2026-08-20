@@ -51,10 +51,17 @@ export class AskUser {
           return { action: "whitelist", entry: { tool: prompt.tool, key: prompt.key, kind: prompt.kind } };
         }
         if (answer === "d" && isPath) {
-          const parent = prompt.key.slice(0, prompt.key.lastIndexOf("/"));
+          const i = prompt.key.lastIndexOf("/");
+          // 根级/盘符根：dir 条目=全部绝对路径/整盘超授权，降级为文件条目（与 buildWhitelistEntry 一致）
+          if (i <= 0 || (i === 2 && prompt.key[1] === ":")) {
+            return {
+              action: "whitelist",
+              entry: { tool: prompt.tool, key: prompt.key, kind: "path" },
+            };
+          }
           return {
             action: "whitelist",
-            entry: { tool: prompt.tool, key: `${parent}/`, kind: "path" },
+            entry: { tool: prompt.tool, key: `${prompt.key.slice(0, i)}/`, kind: "path" },
           };
         }
         this.#output?.write(`请输入 y / n / w${isPath ? " / d" : ""}。\n`);
