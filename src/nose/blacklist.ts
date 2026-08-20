@@ -16,31 +16,32 @@ export const BLACKLIST_PATTERNS: readonly RegExp[] = [
   /\b(?:rd|rmdir)\s+\/s\b[^\n|;]*[a-z]:\/[^\n|;]*/i,
   // del /f（可 /s）跟盘符
   /\bdel\s+\/f(?:\s+\/s)?\b[^\n|;]*[a-z]:\/[^\n|;]*/i,
-  // 启动文件删除：bootmgr / boot.ini（磁盘根级）
-  /\bdel\b[^\n|;]*(?:bootmgr|boot\.ini)/i,
-  // PowerShell Remove-Item 跟盘符
-  /\bRemove-Item\b[^\n|;]*-[^\n|;]*[a-z]:\/[^\n|;]*/i,
+  // 启动文件删除：bootmgr / boot.ini / boot 目录（磁盘根级）
+  /\bdel\b[^\n|;]*(?:bootmgr|boot\.ini|\bboot\b)/i,
+  // PowerShell Remove-Item 跟盘符 / HKLM 关键注册表（HKLM: 冒号可选——归一化只转反斜杠不删冒号）
+  /\bRemove-Item\b[^\n|;]*(?:-[^\n|;]*[a-z]:\/|HKLM:?\/)/i,
   // 系统盘格式化
-  /\b(?:format|Format-Volume)\b[^\n|;]*(?:[a-z]:|SystemDrive)/i,
+  /\b(?:format|Format-Volume)\b[^\n|;]*(?:[a-z]:|SystemDrive|DriveLetter)/i,
   // 整盘擦除
   /\bdiskpart\b[^\n|;]*clean/i,
   /\bClear-Disk\b/i,
   /\bcipher\s+\/w\b[^\n|;]*[a-z]:/i,
   // 块设备直写：dd of= 物理盘（归一化后 \\ 已是 /，物理盘为 //./ 前缀）
-  /\bdd\b[^\n|;]*of=(?:\/\/\.\/|\/dev\/)/i,
+  /\bdd\b[^\n|;]*of=(?:\/\/\.\/|\/dev\/(?:sd[a-z]+\d*|nvme\d+n\d+))/i,
   // 块设备重定向：> /dev/sdX、/dev/nvme*（不含 /dev/null、/dev/shm）
   />\s*\/dev\/(?:sd[a-z]+\d*|nvme\d+n\d+)/i,
   // 文件系统重建 / 分区表 / 磁盘擦除
-  /\bmkfs(?:\.[a-z0-9]+)?\b[^\n|;]*(?:\/dev\/|[a-z]:)/i,
+  /\b(?:mkfs(?:\.[a-z0-9]+)?|mke2fs)\b[^\n|;]*(?:\/dev\/|[a-z]:)/i,
   /\bparted\b[^\n|;]*mklabel/i,
   /\bdiskutil\b[^\n|;]*erase/i,
+  /\bfdisk\b[^\n|;]*delete/i,
   /\bshred\b[^\n|;]*\s+(?:\/dev\/|[a-z]:)/i,
   // 启动配置删除 / Boot 关键注册表删除 / 杀之必崩进程
   /\bbcdedit\b[^\n|;]*\/delete/i,
   /\breg\s+delete\b[^\n|;]*(?:HKLM\/SYSTEM|Windows NT\/CurrentVersion)/i,
   /\btaskkill\b[^\n|;]*\/f[^\n|;]*(?:lsass|csrss|wininit|winlogon)/i,
-  // 权限全毁（chmod -R 000 跟 / 或 /etc）
-  /\bchmod\s+-R\s+000\s+\/(?:\s|$|etc)/i,
+  // 权限全毁（chmod -R 000 跟 / 或系统目录）
+  /\bchmod\s+-R\s+000\s+\/(?:\s|$|(?:etc|usr|bin|sbin|lib(?:64)?)(?:\s|$|\/))/i,
   // 写类工具写系统目录（path 形态锚定开头——terminal 命令串不以盘符开头，天然只命中写类）
   /^[a-z]:\/windows\/(?:system32|boot)(?:\/|$)/i,
   /^[a-z]:\/system\s+volume\s+information(?:\/|$)/i,

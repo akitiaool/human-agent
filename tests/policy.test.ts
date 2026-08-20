@@ -47,6 +47,14 @@ describe("黑名单（系统破坏目标锚定）", () => {
     expect(classify(call("terminal", { command: "taskkill /f /im lsass.exe" }))).toBe("blacklist");
     expect(classify(call("terminal", { command: "reg delete HKLM\\SYSTEM" }))).toBe("blacklist");
   });
+  it("命中：附录 A 补全（Format-Volume/Remove-Item HKLM/mke2fs/fdisk/chmod 系统目录）", () => {
+    expect(classify(call("terminal", { command: "del C:\\boot" }))).toBe("blacklist");
+    expect(classify(call("terminal", { command: "Format-Volume -DriveLetter C" }))).toBe("blacklist");
+    expect(classify(call("terminal", { command: "Remove-Item HKLM:\\SYSTEM" }))).toBe("blacklist");
+    expect(classify(call("terminal", { command: "mke2fs /dev/sda" }))).toBe("blacklist");
+    expect(classify(call("terminal", { command: "fdisk /dev/sda delete" }))).toBe("blacklist");
+    expect(classify(call("terminal", { command: "chmod -R 000 /usr" }))).toBe("blacklist");
+  });
   it("命中：启动文件删除与块设备重定向", () => {
     expect(classify(call("terminal", { command: "del bootmgr" }))).toBe("blacklist");
     expect(classify(call("terminal", { command: "bcdedit /delete {bootmgr}" }))).toBe("blacklist");
@@ -60,6 +68,9 @@ describe("黑名单（系统破坏目标锚定）", () => {
     expect(classify(call("terminal", { command: "shutdown /s" }))).toBe("unlisted");
     expect(classify(call("terminal", { command: "kill -9 1234" }))).toBe("unlisted");
     expect(classify(call("terminal", { command: "echo hi > /dev/null" }))).toBe("unlisted");
+  });
+  it("dd 写 /dev/null 不命中（非物理盘）", () => {
+    expect(classify(call("terminal", { command: "dd if=/dev/zero of=/dev/null" }))).toBe("unlisted");
   });
   it("写类工具按 path 匹配系统目标", () => {
     expect(classify(call("write_file", { path: "C:\\Windows\\System32\\drivers\\hosts", content: "x" }))).toBe("blacklist");
@@ -131,6 +142,23 @@ describe("工具辅助", () => {
     expect(buildWhitelistEntry(call("write_file", { path: "src/utils.ts", content: "x" }), "path")).toEqual({
       tool: "write_file",
       key: "src/utils.ts",
+      kind: "path",
+    });
+    expect(buildWhitelistEntry(call("write_file", { path: "src/utils.ts", content: "x" }), "dir")).toEqual({
+      tool: "write_file",
+      key: "src/",
+      kind: "path",
+    });
+  });
+  it("buildWhitelistEntry dir：根级/盘符根降级为文件条目", () => {
+    expect(buildWhitelistEntry(call("write_file", { path: "README.md", content: "x" }), "dir")).toEqual({
+      tool: "write_file",
+      key: "readme.md",
+      kind: "path",
+    });
+    expect(buildWhitelistEntry(call("write_file", { path: "C:\\x.txt", content: "x" }), "dir")).toEqual({
+      tool: "write_file",
+      key: "c:/x.txt",
       kind: "path",
     });
     expect(buildWhitelistEntry(call("write_file", { path: "src/utils.ts", content: "x" }), "dir")).toEqual({

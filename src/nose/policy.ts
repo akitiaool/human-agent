@@ -63,8 +63,12 @@ export function buildWhitelistEntry(call: ToolCall, granularity: "exact" | "path
   if (WRITE_TOOLS.has(call.name)) {
     const path = typeof call.arguments.path === "string" ? normalizePath(call.arguments.path) : "";
     if (granularity === "dir") {
-      const parent = path.slice(0, path.lastIndexOf("/"));
-      return { tool: call.name, key: `${parent}/`, kind: "path" };
+      const i = path.lastIndexOf("/");
+      // 无父目录（相对根级）或父目录为盘符根：dir 条目=全部绝对路径/整盘超授权，降级为文件条目
+      if (i <= 0 || (i === 2 && path[1] === ":")) {
+        return { tool: call.name, key: path, kind: "path" };
+      }
+      return { tool: call.name, key: `${path.slice(0, i)}/`, kind: "path" };
     }
     return { tool: call.name, key: path, kind: "path" };
   }
