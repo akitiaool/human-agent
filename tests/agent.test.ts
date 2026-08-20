@@ -1,4 +1,7 @@
-import { describe, expect, it } from "vitest";
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { afterAll, describe, expect, it } from "vitest";
 import { buildBridgeService, HumanAgent } from "../src/agent.js";
 import { ConversationContext } from "../src/brain/context.js";
 import { GeminiBridgeThinking } from "../src/brain/gemini-bridge-thinking.js";
@@ -6,6 +9,10 @@ import { OllamaThinking } from "../src/brain/ollama-thinking.js";
 import { TextOutput } from "../src/mouth/text-output.js";
 import type { AgentOutput } from "../src/types/index.js";
 import { FakeEars, FakeWritable, ScriptedBrain } from "./helpers.js";
+
+const tempDir = mkdtempSync(join(tmpdir(), "agent-test-"));
+const whitelistFile = join(tempDir, "whitelist.json");
+afterAll(() => rmSync(tempDir, { recursive: true, force: true }));
 
 class FakeOutput implements AgentOutput {
   public spoken: string[] = [];
@@ -105,7 +112,11 @@ describe("HumanAgent", () => {
   it("默认组装的大脑为 OllamaThinking", async () => {
     const savedBridgePort = process.env.GEMINI_BRIDGE_PORT;
     delete process.env.GEMINI_BRIDGE_PORT;
-    const agent = new HumanAgent({ ears: new FakeEars(["/exit"]), output: new FakeOutput() });
+    const agent = new HumanAgent({
+      ears: new FakeEars(["/exit"]),
+      output: new FakeOutput(),
+      whitelistFile,
+    });
     try {
       expect(agent.brain).toBeInstanceOf(OllamaThinking);
       await agent.run();
@@ -118,7 +129,7 @@ describe("HumanAgent", () => {
 });
 
 it("buildBridgeService 返回可监听的桥服务", async () => {
-  const service = buildBridgeService({ port: 0 });
+  const service = buildBridgeService({ port: 0, whitelistFile });
   try {
     expect(service).toBeInstanceOf(GeminiBridgeThinking);
     const port = await service.getPort();
@@ -131,7 +142,7 @@ it("buildBridgeService 返回可监听的桥服务", async () => {
 it("buildBridgeService 未指定端口时读 GEMINI_BRIDGE_PORT，非法值回退 8765", async () => {
   process.env.GEMINI_BRIDGE_PORT = "not-a-port";
   try {
-    const service = buildBridgeService({ port: 0 }); // 显式 0 优先，避免真实绑定 8765
+    const service = buildBridgeService({ port: 0, whitelistFile }); // 显式 0 优先，避免真实绑定 8765
     expect(service).toBeInstanceOf(GeminiBridgeThinking);
     service.close();
   } finally {

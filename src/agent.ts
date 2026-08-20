@@ -35,6 +35,8 @@ export interface HumanAgentOptions {
   maxIterations?: number;
   /** 单轮任务超时（毫秒），0 表示禁用；会话中可用 /timeout 动态调整。 */
   timeoutMs?: number;
+  /** 白名单文件；缺省 ~/.human-agent/whitelist.json（注入隔离测试/多实例用） */
+  whitelistFile?: string;
 }
 
 /** 人体合一组装类：构造注入各器官（设计文档 §5.3），默认提供完整默认组装。 */
@@ -62,7 +64,7 @@ export class HumanAgent {
     this.context = options.context ?? new ConversationContext({ maxTokens: 8000 });
     this.maxIterations = options.maxIterations ?? 10;
     this.timeoutMs = options.timeoutMs;
-    this.brain = options.brain ?? buildDefaultBrain();
+    this.brain = options.brain ?? buildDefaultBrain(options.whitelistFile);
   }
 
   async run(): Promise<AgentStatus> {
@@ -82,10 +84,11 @@ export class HumanAgent {
   }
 }
 
-function buildDefaultBrain(): BrainInference {
+function buildDefaultBrain(whitelistFile?: string): BrainInference {
   return new OllamaThinking({
     ...(process.env.OLLAMA_BASE_URL !== undefined ? { baseUrl: process.env.OLLAMA_BASE_URL } : {}),
     ...(process.env.OLLAMA_MODEL !== undefined ? { model: process.env.OLLAMA_MODEL } : {}),
+    ...(whitelistFile !== undefined ? { whitelistFile } : {}),
   });
 }
 
@@ -94,6 +97,8 @@ export interface BridgeServiceOptions {
   signal?: AbortSignal;
   timeoutMs?: number;
   logger?: (text: string) => void;
+  /** 白名单文件；缺省 ~/.human-agent/whitelist.json（注入隔离测试/多实例用） */
+  whitelistFile?: string;
 }
 
 /** 桥模式组装：网页对话 + 智能体仅执行工具。port 缺省读 GEMINI_BRIDGE_PORT（非法回退 8765）。 */
@@ -113,6 +118,7 @@ export function buildBridgeService(options: BridgeServiceOptions = {}): GeminiBr
     ...(options.signal !== undefined ? { signal: options.signal } : {}),
     ...(options.timeoutMs !== undefined ? { timeoutMs: options.timeoutMs } : {}),
     ...(options.logger !== undefined ? { logger: options.logger } : {}),
+    ...(options.whitelistFile !== undefined ? { whitelistFile: options.whitelistFile } : {}),
   });
 }
 
