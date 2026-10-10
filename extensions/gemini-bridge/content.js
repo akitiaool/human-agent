@@ -1001,10 +1001,10 @@ async function deliveryLoop() {
       }
       // 页面就绪协议补投：进已有对话/刷新后，若对话历史中无协议消息则注入（本页一次）
       if (!protocolChecked && protocolText && findInput()) {
-        protocolChecked = true;
         const input = findInput();
-        // 输入框有未提交内容（可能正是协议）时跳过，避免重复注入
+        // 输入框有未提交内容（可能正是协议）时跳过，避免重复注入；本轮不销记，草稿清空后下轮再查
         if (input.value.trim() === "") {
+          protocolChecked = true; // 亲自确认过（无论是否注入）才销记，防止草稿占位永久吞掉本页补投
           const hasProtocol = [...document.querySelectorAll("ms-chat-turn")].some((t) =>
             t.textContent.includes(PROTOCOL_PREFIX),
           );
@@ -1144,18 +1144,18 @@ let contentObserver = null;
 let observedContent = null;
 let lastTurnCount = 0;
 let lastFirstTurn = null;
-let hadSession = false;
+let lastSessionEl = null; // 上次采样到的会话元素引用；移除或更换都视为新对话
 
 function setupNewConversationWatcher() {
-  hadSession = Boolean(document.querySelector("ms-chat-session"));
+  lastSessionEl = document.querySelector("ms-chat-session");
   rehangContentObserver();
   bodyObserver = new MutationObserver(() => {
     const now = Date.now();
     if (now - lastBodyCheck < BODY_CHECK_THROTTLE_MS) return; // 节流：虚拟滚动高频变更不每次现查
     lastBodyCheck = now;
-    const hasSession = Boolean(document.querySelector("ms-chat-session"));
-    if (hadSession && !hasSession) onNewConversation("对话会话已移除"); // ① session 从 DOM 移除
-    hadSession = hasSession;
+    const sessionEl = document.querySelector("ms-chat-session");
+    if (lastSessionEl && sessionEl !== lastSessionEl) onNewConversation("对话会话已更换/移除"); // ① 引用比较：布尔采样会漏「旧新同时到位」的替换
+    lastSessionEl = sessionEl;
     rehangContentObserver();
   });
   bodyObserver.observe(document.body, { childList: true, subtree: true });
