@@ -43,18 +43,22 @@
             const reqId = ++seq;
             emit({ kind: "start", reqId, urlTail: urlTail(url) });
             // 先挂监听再 send：同步 XHR 的 loadend 在 send 内就会派发，后挂会漏
-            this.addEventListener("loadend", () => {
-              try {
-                const rt = this.responseType;
-                if (rt !== "" && rt !== "text") {
-                  emit({ kind: "error", reqId, urlTail: urlTail(url), reason: "responseType=" + rt });
-                  return;
+            this.addEventListener(
+              "loadend",
+              () => {
+                try {
+                  const rt = this.responseType;
+                  if (rt !== "" && rt !== "text") {
+                    emit({ kind: "error", reqId, urlTail: urlTail(url), reason: "responseType=" + rt });
+                    return;
+                  }
+                  emit({ kind: "done", reqId, raw: this.responseText });
+                } catch (err) {
+                  emit({ kind: "error", reqId, urlTail: urlTail(url), reason: String((err && err.message) || err) });
                 }
-                emit({ kind: "done", reqId, raw: this.responseText });
-              } catch (err) {
-                emit({ kind: "error", reqId, urlTail: urlTail(url), reason: String((err && err.message) || err) });
-              }
-            });
+              },
+              { once: true },
+            );
           }
         } catch {}
         return origSend.apply(this, args);

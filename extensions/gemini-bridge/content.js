@@ -226,7 +226,7 @@ panel.innerHTML = `
 .ha-approval-foot { display: flex; gap: 8px; margin-top: 8px; justify-content: flex-end; }
 </style>
 <div class="ha-title">
-  <span>gemini-bridge<span class="ha-badge">v2 网页对话驱动</span></span>
+  <span>gemini-bridge<span class="ha-badge">v3 网页对话驱动</span></span>
   <button id="ha-collapse" title="收起为悬浮球">–</button>
 </div>
 <label class="ha-row">
@@ -1213,7 +1213,7 @@ async function init() {
   setupPanelEvents();
   setupNewConversationWatcher();
   setStatus("待命");
-  log(`gemini-bridge v2 已就绪：桥服务 ${settings.baseUrl}，自动模式 ${settings.autoMode ? "开" : "关"}`);
+  log(`gemini-bridge v3 已就绪：桥服务 ${settings.baseUrl}，自动模式 ${settings.autoMode ? "开" : "关"}`);
   setupCaptureListener(); // 网络捕获接入：等 MAIN world 捕获消息（document_start 已发 hello，此处补 ping）
   deliveryLoop(); // 投递循环：长轮询取回填消息
 }
