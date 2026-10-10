@@ -1,7 +1,7 @@
-// gemini-bridge v2 content script —— 网页对话驱动。
-// 两个循环：
-//   内容监控循环：AI Studio 最新模型回复 → 稳定采样 → POST /result {reply}
-//   投递循环：长轮询 GET /task → 模拟人类逐字回填 → 自动/手动提交
+// gemini-bridge v3 content script —— 网页对话驱动。
+// 回复回传走网络原文捕获（路线 A）：MAIN world inject.js 钩 GenerateContent 响应 → postMessage
+// → 本脚本用 haDecodeGenerateContent（decode.js，同 content_scripts 数组先加载）解码 → POST /result。
+// 投递循环：长轮询 GET /task → 模拟人类逐字回填 → 自动/手动提交。
 // 选择器为 AI Studio 真实 DOM（2026-08-19 落定，task-13-brief 附录 A）。
 // 页面是 Angular SPA + cdk-virtual-scroll：元素频繁创建/销毁，
 // 所有抓取基于 MutationObserver 且每次现查 DOM，禁止缓存元素引用跨轮复用。
@@ -9,8 +9,6 @@
 
 const DEFAULT_BASE_URL = "http://127.0.0.1:8765";
 const PROTOCOL_PREFIX = "【human-agent 工具协议】";
-const STABLE_SAMPLES = 3; // 稳定采样次数（连续 2–3 次，取 3）
-const SAMPLE_INTERVAL_MS = 700; // 采样间隔（500ms–1s 区间）
 const TASK_RETRY_MS = 1_000; // GET /task 无消息后的重试间隔
 const BRIDGE_RETRY_ATTEMPTS = 5; // 桥不可达自动重试次数；第 N 次失败后等 N 秒（1/2/3/4/5s），全部失败转手动重试
 const TYPING_MIN_MS = 200; // 纠错重打每字符延时下限（真人键入节奏 200–500ms/字）
@@ -49,7 +47,7 @@ const defaultSettings = {
 
 let settings = { ...defaultSettings };
 let protocolText = ""; // 已保存的工具协议文本（新对话时重新注入）
-let lastPostedReply = ""; // 最近一次回传的回复（避免无谓重发，服务侧亦去重）
+let lastPostedReply = ""; // 最近一次成功回传的回复（网络捕获去重用，服务侧亦去重）
 let delivering = false; // 投递循环串行占用标志（同一时刻只回填一条消息）
 let reinjectPending = false; // 待投递循环处理的协议重新注入
 let pendingTask = null; // 输入框未就绪时暂存的消息 {text, source}，就绪后补投
@@ -579,50 +577,6 @@ function findChatSessionContent() {
   );
 }
 
-// A2/A3：最后一个内容轮且内部含模型角色的 turn
-function findLastModelTurn() {
-  const turns = document.querySelectorAll("ms-chat-turn.text-chunk-host");
-  for (let i = turns.length - 1; i >= 0; i--) {
-    if (turns[i].querySelector('[data-turn-role="Model"]')) return turns[i];
-  }
-  return null;
-}
-
-// A2：提取模型回复文本（排除 ms-thought-chunk 思考摘要），拼接为 reply。
-// 关键：AI Studio 把 markdown 代码块渲染成 ms-code-block（含 data-test-language 语言标记），
-// innerText 只含代码内容、围栏被渲染器消费——必须把代码块还原为 ```lang 围栏文本，
-// 否则回传给桥服务的内容丢失 ```tool_call 识别信号。
-function extractReply(turn) {
-  return [...turn.querySelectorAll("ms-text-chunk")]
-    .map((chunk) => {
-      const clone = chunk.cloneNode(true); // 克隆后替换，不影响页面
-      for (const block of clone.querySelectorAll("ms-code-block")) {
-        const lang = block.getAttribute("data-test-language") ?? "";
-        const code = block.querySelector("pre code")?.textContent ?? "";
-        const pre = document.createElement("pre");
-        pre.textContent = `\`\`\`${lang}\n${code}\n\`\`\``;
-        block.replaceWith(pre);
-      }
-      return clone.innerText.trim();
-    })
-    .filter(Boolean)
-    .join("\n");
-}
-
-// A3：完成信号。announcer 的 "Response ready." 文本跨轮残留，
-// 仅当它在本轮内容最后一次变化之后才转为 ready（上升沿时间戳晚于 lastContentChangeAt）才算完成信号；
-// 残留的旧 ready 状态不生效，只依赖连续稳定采样计数。
-let announcerPrevReady = false; // 上一轮采样时 announcer 是否已显示 "Response ready."
-let announcerReadySince = 0; // 最近一次 announcer 转为 ready 的时间戳
-
-function announcerReady(lastContentChangeAt) {
-  const el = document.getElementById("cdk-live-announcer-0");
-  const ready = Boolean(el && el.textContent.includes("Response ready."));
-  if (ready && !announcerPrevReady) announcerReadySince = Date.now(); // 上升沿才刷新时间戳
-  announcerPrevReady = ready;
-  return ready && announcerReadySince > lastContentChangeAt;
-}
-
 // A4：输入框（普通 textarea，非 contenteditable）
 function findInput() {
   return document.querySelector('ms-prompt-box textarea.cdk-textarea-autosize.textarea');
@@ -1082,9 +1036,18 @@ async function deliveryLoop() {
   }
 }
 
-// ---------- 内容监控循环：最新模型回复 → 稳定采样 → POST /result ----------
+// ---------- 网络捕获接入（路线 A）：MAIN world → postMessage → 解码 → POST /result ----------
 
-async function postResult(reply) {
+const CAPTURE_MARKER = "gemini-bridge-capture";
+let captureMounted = false; // 「网络捕获已挂载」只记一次（hello 或首条捕获消息先到者）
+
+function noteCaptureMounted(how) {
+  if (captureMounted) return;
+  captureMounted = true;
+  log(`网络捕获已挂载（${how}）`);
+}
+
+async function postResult(reply, stats) {
   setStatus("已抓取回复（等待执行）");
   let resp;
   try {
@@ -1093,13 +1056,16 @@ async function postResult(reply) {
     resp = { error: err instanceof Error ? err.message : String(err) };
   }
   if (resp?.error) {
-    noteBridgeFailure(resp.error); // 桥不可达：静默降级，回复保留待桥恢复后重发
+    noteBridgeFailure(resp.error); // 响亮停滞：本条丢弃不重发（无重采样通道），日志可诊
     return;
   }
   if (resp.ok) {
     noteBridgeSuccess();
-    lastPostedReply = reply; // 仅成功回传才更新去重标记；失败时保持旧值，下轮采样继续重发
-    log(`已回传回复（${reply.length} 字符，${resp.processed ? "已入队执行" : "服务侧忽略（无工具调用/重复）"}）`);
+    lastPostedReply = reply; // 仅成功回传才更新去重标记
+    log(
+      `网络捕获：已回传（${reply.length} 字符，${stats.deltaCount} deltas，滤 ${stats.thoughtCount} thought，` +
+        `${resp.processed ? "已入队执行" : "服务侧忽略（无工具调用/重复）"}）`,
+    );
     if (!resp.processed) setStatus("待命");
     // processed 时保持「已抓取回复（等待执行）」，直到回填消息到达
   } else {
@@ -1108,44 +1074,35 @@ async function postResult(reply) {
   }
 }
 
-async function monitorLoop() {
-  let lastText = "";
-  let stable = 0;
-  let lastContentChangeAt = 0; // 当前内容最后一次变化的时间戳
-  let baselineDone = false; // 历史基线：页面加载时的最后模型回复视为已回传
-  while (true) {
-    try {
-      const turn = findLastModelTurn();
-      const text = turn ? extractReply(turn) : "";
-      if (!baselineDone) {
-        baselineDone = true;
-        // 基线化：进已有对话/刷新时，页面上渲染的历史最后回复是"旧内容"而非新指令结果；
-        // 不设基线会被稳定采样回传——桥服务重启后 lastContent 去重表为空，历史含 tool_call 会被重放
-        if (text !== "") {
-          lastPostedReply = text;
-          lastText = text;
-          lastContentChangeAt = Date.now();
-          log(`历史基线：已将当前最后回复（${text.length} 字符）视为已回传，仅新内容会回传`);
-        }
-        continue;
+function setupCaptureListener() {
+  window.addEventListener("message", (ev) => {
+    if (ev.source !== window) return; // 只收本窗口消息
+    const d = ev.data;
+    if (!d || d.__ha !== CAPTURE_MARKER || d.v !== 1) return; // 非捕获协议一律忽略（含本脚本自己发的 ping）
+    if (d.kind === "hello") {
+      noteCaptureMounted("注入侧握手");
+    } else if (d.kind === "start") {
+      noteCaptureMounted("经捕获消息");
+      log("网络捕获：检测到 GenerateContent 请求");
+    } else if (d.kind === "error") {
+      noteCaptureMounted("经捕获消息");
+      log(`网络捕获异常：${d.reason ?? "未知原因"}（…${d.urlTail ?? ""}）`);
+    } else if (d.kind === "done") {
+      noteCaptureMounted("经捕获消息");
+      const decoded = haDecodeGenerateContent(d.raw);
+      if (decoded === null) {
+        log(`网络捕获解码失败（原文 ${typeof d.raw === "string" ? d.raw.length : 0} 字符），本轮不投递`);
+        return;
       }
-      if (text !== "" && text === lastText) {
-        stable += 1;
-        if (announcerReady(lastContentChangeAt)) stable = STABLE_SAMPLES; // 完成信号可提前确认（A3）
-      } else {
-        stable = 0;
-        lastText = text;
-        lastContentChangeAt = Date.now();
+      if (decoded.answer === lastPostedReply) {
+        log("网络捕获：与上次回传内容相同，跳过投递");
+        return;
       }
-      if (stable >= STABLE_SAMPLES && text !== "" && text !== lastPostedReply) {
-        stable = 0;
-        await postResult(text);
-      }
-    } catch (err) {
-      log(`监控循环异常：${err instanceof Error ? err.message : String(err)}`);
+      postResult(decoded.answer, decoded);
     }
-    await sleep(SAMPLE_INTERVAL_MS);
-  }
+  });
+  // inject.js 在 document_start 已发过 hello，本监听 document_idle 才就位（错过首包）——发 ping 请它补答
+  window.postMessage({ __ha: CAPTURE_MARKER, v: 1, kind: "ping" }, "*");
 }
 
 // ---------- 新对话检测（A1）：观察器随容器变化重挂，触发协议文本重新注入 ----------
@@ -1257,8 +1214,8 @@ async function init() {
   setupNewConversationWatcher();
   setStatus("待命");
   log(`gemini-bridge v2 已就绪：桥服务 ${settings.baseUrl}，自动模式 ${settings.autoMode ? "开" : "关"}`);
+  setupCaptureListener(); // 网络捕获接入：等 MAIN world 捕获消息（document_start 已发 hello，此处补 ping）
   deliveryLoop(); // 投递循环：长轮询取回填消息
-  monitorLoop(); // 内容监控循环：最新回复 → POST /result
 }
 
 init();
