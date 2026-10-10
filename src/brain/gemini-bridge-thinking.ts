@@ -97,8 +97,6 @@ export class GeminiBridgeThinking extends BaseThinking {
         resolve(address.port);
       });
     });
-    // 首条协议消息：工作区声明 + 工具协议（toolProtocol）
-    this.#outbox.push({ type: "message", message: this.toolProtocol() });
   }
 
   async getPort(): Promise<number> {
@@ -129,6 +127,10 @@ export class GeminiBridgeThinking extends BaseThinking {
     const url = new URL(req.url ?? "/", "http://127.0.0.1");
     if (req.method === "GET" && url.pathname === "/task") {
       this.#handleTaskRequest(res);
+      return;
+    }
+    if (req.method === "GET" && url.pathname === "/protocol") {
+      this.#handleProtocolRequest(res);
       return;
     }
     if (req.method === "POST" && url.pathname === "/result") {
@@ -170,6 +172,16 @@ export class GeminiBridgeThinking extends BaseThinking {
   #serveItem(item: OutboxItem, res: http.ServerResponse): void {
     res.writeHead(200, { "Content-Type": "application/json" });
     res.end(JSON.stringify(item));
+  }
+
+  /** 拉取协议文本（工作区声明 + 工具协议）：无状态幂等，每次返回当前值；服务已关闭时 204。 */
+  #handleProtocolRequest(res: http.ServerResponse): void {
+    if (this.#closed) {
+      res.writeHead(204).end();
+      return;
+    }
+    res.writeHead(200, { "Content-Type": "application/json" });
+    res.end(JSON.stringify({ ok: true, protocol: this.toolProtocol() }));
   }
 
   /** 收网页内容：校验 → 去重 → 解析 tool_call → 有则入串行队列；响应立即返回（不等待批完成）。 */

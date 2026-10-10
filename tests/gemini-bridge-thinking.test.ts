@@ -156,16 +156,22 @@ describe("parseToolCalls", () => {
 });
 
 describe("GeminiBridgeThinking 执行型桥服务", () => {
-  it("首条任务为工具协议", async () => {
+  it("GET /protocol 幂等返回工具协议，且不再入队首条协议消息", async () => {
     const { port } = await makeBridge();
-    const message = await getMessageText(port);
-    expect(message).toContain("【human-agent 工具协议】");
+    const res = await fetch(`http://127.0.0.1:${port}/protocol`);
+    expect(res.status).toBe(200);
+    const body = (await res.json()) as { ok: boolean; protocol: string };
+    expect(body.ok).toBe(true);
+    expect(body.protocol).toContain("你的工作区是 /ws-test");
+    expect(body.protocol).toContain("【human-agent 工具协议】");
+    const again = (await (await fetch(`http://127.0.0.1:${port}/protocol`)).json()) as { protocol: string };
+    expect(again.protocol).toBe(body.protocol); // 无状态幂等：重复拉取内容一致
+    expect(await tryGetMessage(port, 300)).toBeNull(); // 协议不再作为任务消息入队
   });
 
   it("含 tool_call 的内容执行后回填结果消息", async () => {
     seedWhitelist("/ws-test", [{ tool: "read_file", key: '{"path":"a.txt"}', kind: "exact" }]);
     const { port, organs } = await makeBridge();
-    await getMessageText(port); // 排空协议首条
     const res = await postReply(port, toolCall("read_file", { path: "a.txt" }));
     expect(res.processed).toBe(true);
     const message = await getMessageText(port);
@@ -188,7 +194,6 @@ describe("GeminiBridgeThinking 执行型桥服务", () => {
       { tool: "terminal", key: "echo hi", kind: "exact" },
     ]);
     const { port, organs } = await makeBridge();
-    await getMessageText(port);
     const reply = [
       toolCall("read_file", { path: "a.txt" }),
       toolCall("terminal", { command: "echo hi" }),
@@ -203,7 +208,6 @@ describe("GeminiBridgeThinking 执行型桥服务", () => {
 
   it("未列入白名单的调用下发审批，未授权不执行", async () => {
     const { port, organs } = await makeBridge({ workspace: "/ws-test" });
-    await getMessage(port);
     const res = await postReply(port, toolCall("terminal", { command: "echo hi" }));
     expect(res.processed).toBe(true);
     const body = await getMessage(port);
@@ -213,7 +217,6 @@ describe("GeminiBridgeThinking 执行型桥服务", () => {
 
   it("多个未列调用合并为一条审批请求", async () => {
     const { port } = await makeBridge({ workspace: "/ws-test" });
-    await getMessage(port);
     const reply = [
       toolCall("terminal", { command: "git push --force origin main" }),
       toolCall("terminal", { command: "echo hi" }),
@@ -231,7 +234,6 @@ describe("GeminiBridgeThinking 执行型桥服务", () => {
 
   it("审批允许后执行并回填结果", async () => {
     const { port, organs } = await makeBridge({ workspace: "/ws-test" });
-    await getMessage(port);
     await postReply(port, toolCall("terminal", { command: "echo hi" }));
     const body = await getMessage(port);
     expect(body?.type).toBe("approval");
@@ -245,7 +247,6 @@ describe("GeminiBridgeThinking 执行型桥服务", () => {
 
   it("审批逐条裁决：允许的执行、拒绝的生成拒绝行", async () => {
     const { port, organs } = await makeBridge({ workspace: "/ws-test" });
-    await getMessage(port);
     const reply = [
       toolCall("terminal", { command: "ls -la" }),
       toolCall("terminal", { command: "echo ok" }),
@@ -270,7 +271,6 @@ describe("GeminiBridgeThinking 执行型桥服务", () => {
 
   it("审批兜底超时全部拒绝", async () => {
     const { port, organs } = await makeBridge({ workspace: "/ws-test", approvalTimeoutMs: 50 });
-    await getMessage(port);
     await postReply(port, toolCall("terminal", { command: "echo hi" }));
     const body = await getMessage(port);
     expect(body?.type).toBe("approval");
@@ -282,7 +282,6 @@ describe("GeminiBridgeThinking 执行型桥服务", () => {
 
   it("close 释放挂起审批", async () => {
     const { bridge, port, organs } = await makeBridge({ workspace: "/ws-test", approvalTimeoutMs: 1000 });
-    await getMessage(port);
     await postReply(port, toolCall("terminal", { command: "echo hi" }));
     const body = await getMessage(port);
     expect(body?.type).toBe("approval");
@@ -294,7 +293,6 @@ describe("GeminiBridgeThinking 执行型桥服务", () => {
   it("全局中断作废审批并丢弃批次", async () => {
     const controller = new AbortController();
     const { port, organs } = await makeBridge({ workspace: "/ws-test", signal: controller.signal });
-    await getMessage(port);
     await postReply(port, toolCall("terminal", { command: "echo hi" }));
     const body = await getMessage(port);
     expect(body?.type).toBe("approval");
@@ -307,7 +305,6 @@ describe("GeminiBridgeThinking 执行型桥服务", () => {
 
   it("参数非法的危险命令不进审批，直接 INVALID_ARGS 拒绝", async () => {
     const { port } = await makeBridge();
-    await getMessage(port);
     const res = await postReply(port, toolCall("terminal", {}));
     expect(res.processed).toBe(true);
     const message = await getMessageText(port); // 直接 message 类型，无审批请求
@@ -316,7 +313,6 @@ describe("GeminiBridgeThinking 执行型桥服务", () => {
 
   it("黑名单命中直接回填拒绝，不下发审批", async () => {
     const { port, organs } = await makeBridge();
-    await getMessageText(port); // 排空协议首条
     await postReply(port, toolCall("terminal", { command: "rm -rf /" }));
     const message = await getMessageText(port);
     expect(message).toContain("BLACKLIST");
@@ -328,7 +324,6 @@ describe("GeminiBridgeThinking 执行型桥服务", () => {
   it("白名单命中静默执行（不下发审批）", async () => {
     seedWhitelist("/ws-test", [{ tool: "terminal", key: "git status", kind: "exact" }]);
     const { port, organs } = await makeBridge();
-    await getMessageText(port);
     await postReply(port, toolCall("terminal", { command: "git status" }));
     const message = await getMessageText(port);
     expect(message).toContain("工具执行结果");
@@ -338,7 +333,6 @@ describe("GeminiBridgeThinking 执行型桥服务", () => {
 
   it("审批带回 whitelist 条目 → 落盘后生效", async () => {
     const { port } = await makeBridge({ workspace: "/ws-test" });
-    await getMessageText(port);
     await postReply(port, toolCall("terminal", { command: "ls -la" }));
     const body = await getMessage(port);
     expect(body?.type).toBe("approval");
@@ -351,7 +345,6 @@ describe("GeminiBridgeThinking 执行型桥服务", () => {
 
   it("非法 whitelist 条目 → 400 拒绝（不落盘不执行）", async () => {
     const { port, organs } = await makeBridge({ workspace: "/ws-test" });
-    await getMessageText(port);
     await postReply(port, toolCall("terminal", { command: "ls -la" }));
     const body = await getMessage(port);
     expect(body?.type).toBe("approval");
@@ -363,7 +356,6 @@ describe("GeminiBridgeThinking 执行型桥服务", () => {
 
   it("根级路径不接受 dir 条目：write_file /x.txt + key / → 400 且不执行", async () => {
     const { port, organs } = await makeBridge({ workspace: "/ws-test" });
-    await getMessageText(port);
     await postReply(port, toolCall("write_file", { path: "/x.txt", content: "x" }));
     const body = await getMessage(port);
     expect(body?.type).toBe("approval");
@@ -375,7 +367,6 @@ describe("GeminiBridgeThinking 执行型桥服务", () => {
 
   it("盘符根 dir 条目 → 400（整盘放行拒绝）", async () => {
     const { port, organs } = await makeBridge({ workspace: "/ws" });
-    await getMessageText(port);
     await postReply(port, toolCall("write_file", { path: "c:/x.txt", content: "x" }));
     const body = await getMessage(port);
     expect(body?.type).toBe("approval");
@@ -387,7 +378,6 @@ describe("GeminiBridgeThinking 执行型桥服务", () => {
 
   it("工作区启动即注册：界内写入静默执行（apply_patch 同样命中）", async () => {
     const { port, organs } = await makeBridge({ workspace: "/ws" });
-    await getMessageText(port);
     await postReply(port, toolCall("write_file", { path: "/ws/a.txt", content: "hi" }));
     const message = await getMessageText(port);
     expect(message).toContain("成功");
@@ -396,7 +386,6 @@ describe("GeminiBridgeThinking 执行型桥服务", () => {
 
   it("界外写入未入白名单 → 下发审批", async () => {
     const { port } = await makeBridge({ workspace: "/ws" });
-    await getMessageText(port);
     await postReply(port, toolCall("write_file", { path: "/tmp/evil.txt", content: "x" }));
     const body = await getMessage(port);
     expect(body?.type).toBe("approval");
@@ -404,7 +393,6 @@ describe("GeminiBridgeThinking 执行型桥服务", () => {
 
   it("未知工具与参数非法拒绝", async () => {
     const { port } = await makeBridge();
-    await getMessageText(port);
     const reply = [toolCall("hack_planet", {}), toolCall("read_file", {})].join("\n");
     const res = await postReply(port, reply);
     expect(res.processed).toBe(true);
@@ -416,7 +404,6 @@ describe("GeminiBridgeThinking 执行型桥服务", () => {
   it("相同内容重复提交只处理一次", async () => {
     seedWhitelist("/ws-test", [{ tool: "read_file", key: '{"path":"a.txt"}', kind: "exact" }]);
     const { port, organs } = await makeBridge();
-    await getMessageText(port);
     const reply = toolCall("read_file", { path: "a.txt" });
     const first = await postReply(port, reply);
     expect(first.processed).toBe(true);
@@ -429,7 +416,6 @@ describe("GeminiBridgeThinking 执行型桥服务", () => {
   it("批超时队列执行超时说明", async () => {
     seedWhitelist("/ws-test", [{ tool: "terminal", key: "slow", kind: "exact" }]);
     const { port, organs } = await makeBridge({ timeoutMs: 100 });
-    await getMessageText(port);
     const res = await postReply(port, toolCall("terminal", { command: "slow" }));
     expect(res.processed).toBe(true);
     const message = await getMessageText(port);
@@ -454,7 +440,6 @@ describe("GeminiBridgeThinking 执行型桥服务", () => {
 
   it("close 释放挂起长轮询", async () => {
     const { bridge, port } = await makeBridge();
-    await getMessage(port); // 排空协议首条，使下一次 GET 挂起
     const poll = getMessage(port);
     bridge.close();
     await expect(poll).resolves.toBeNull(); // 204 结束
