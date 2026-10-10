@@ -1,10 +1,11 @@
 // gemini-bridge v2 background service worker。
-// HTTP 中转：GET /task 长轮询（30s 超时）、POST /result {reply}。
+// HTTP 中转：GET /task 长轮询（30s 超时）、GET /protocol 协议文本按需拉取、POST /result {reply}。
 // host_permissions 规避页面 CSP/CORS 限制；全部 try/catch 答 {error}，不抛未处理异常。
 // content 侧可在消息中带 baseUrl（面板可编辑桥服务地址），缺省回落 DEFAULT_BASE_URL。
 
 const DEFAULT_BASE_URL = "http://127.0.0.1:8765";
 const GET_TASK_TIMEOUT_MS = 30_000; // 服务端长轮询约 25s 后 204，30s 超时兜底
+const GET_PROTOCOL_TIMEOUT_MS = 10_000; // GET /protocol 为即时短请求，10s 超时兜底
 const POST_RESULT_TIMEOUT_MS = 10_000; // POST /result 超时兜底，避免服务端挂起时 sendResponse 悬置
 
 function resolveBase(baseUrl) {
@@ -44,6 +45,47 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
           return;
         }
         sendResponse({ task: await res.json() });
+        return;
+      }
+
+      if (message.type === "get-protocol") {
+        let res;
+        try {
+          res = await fetch(`${base}/protocol`, {
+            signal: AbortSignal.timeout(GET_PROTOCOL_TIMEOUT_MS),
+            cache: "no-store",
+          });
+        } catch (err) {
+          sendResponse({
+            error:
+              err?.name === "TimeoutError" || err?.name === "AbortError"
+                ? "GET /protocol 超时"
+                : err instanceof Error
+                  ? err.message
+                  : String(err),
+          });
+          return;
+        }
+        if (res.status === 204) {
+          sendResponse({ error: "桥服务正在关闭" });
+          return;
+        }
+        if (!res.ok) {
+          sendResponse({ status: res.status, error: `GET /protocol → HTTP ${res.status}` });
+          return;
+        }
+        let protocol = "";
+        try {
+          const data = await res.json();
+          protocol = typeof data?.protocol === "string" ? data.protocol : "";
+        } catch {
+          // 响应体非 JSON 按空处理（下方统一答错，不抛）
+        }
+        if (protocol === "") {
+          sendResponse({ error: "协议文本为空" });
+          return;
+        }
+        sendResponse({ protocol });
         return;
       }
 

@@ -2,6 +2,7 @@
 // 回复回传走网络原文捕获（路线 A）：MAIN world inject.js 钩 GenerateContent 响应 → postMessage
 // → 本脚本用 haDecodeGenerateContent（decode.js，同 content_scripts 数组先加载）解码 → POST /result。
 // 投递循环：长轮询 GET /task → 模拟人类逐字回填 → 自动/手动提交。
+// 协议注入：GET /protocol 按需拉取（无本地存储）；仅空对话自动注入，面板按钮随时可手动注入。
 // 选择器为 AI Studio 真实 DOM（2026-08-19 落定，task-13-brief 附录 A）。
 // 页面是 Angular SPA + cdk-virtual-scroll：元素频繁创建/销毁，
 // 所有抓取基于 MutationObserver 且每次现查 DOM，禁止缓存元素引用跨轮复用。
@@ -24,12 +25,11 @@ const THINK_MIN_MS = 300; // 退格后重打前的「想字」停顿下限
 const THINK_MAX_MS = 800;
 const COMMON_CJK = "的了一是在不和有这大为中上国个"; // 中文错字候选（同音/高频字近似）
 const KB_ROWS = ["qwertyuiop", "asdfghjkl", "zxcvbnm"]; // 键盘相邻键（模拟手误）
-const REINJECT_SUPPRESS_MS = 5_000; // 新对话重新注入防抖窗口
+const REINJECT_SUPPRESS_MS = 5_000; // 新对话自动补投检查防抖窗口
 const BODY_CHECK_THROTTLE_MS = 200; // body 变更检查节流（虚拟滚动高频 churn 下不每次跑 querySelector）
 const LOG_MAX_LINES = 50;
 
 const SETTINGS_KEY = "geminiBridgeSettings";
-const PROTOCOL_KEY = "geminiBridgeProtocol";
 
 const defaultSettings = {
   baseUrl: DEFAULT_BASE_URL,
@@ -46,12 +46,11 @@ const defaultSettings = {
 };
 
 let settings = { ...defaultSettings };
-let protocolText = ""; // 已保存的工具协议文本（新对话时重新注入）
+let pendingInjectText = ""; // 已取得、待投递循环回填的协议文本（空串=无）
+let autoInjectState = "idle"; // 协议自动补投状态机：idle 待检查 / wait-bridge 拉取失败待重试 / done 已了结
 let lastPostedReply = ""; // 最近一次成功回传的回复（网络捕获去重用，服务侧亦去重）
 let delivering = false; // 投递循环串行占用标志（同一时刻只回填一条消息）
-let reinjectPending = false; // 待投递循环处理的协议重新注入
 let pendingTask = null; // 输入框未就绪时暂存的消息 {text, source}，就绪后补投
-let protocolChecked = false; // 本页是否已完成「对话中无协议 → 自动注入」检查
 let reinjectSuppressUntil = 0; // 新对话触发防抖时间戳
 let currentStatus = "待命";
 let bridgeDown = false; // 桥服务不可达标志（进入置位、成功复位）
@@ -176,7 +175,6 @@ panel.innerHTML = `
   font: inherit; cursor: pointer;
 }
 #ha-panel #ha-inject-protocol:hover { border-color: #2563eb; color: #bfdbfe; }
-}
 /* 状态色调：待命蓝 / 已抓取青 / 回填橙 / 倒计时绿 / 等待紫 / 桥断琥珀 / 错误红 */
 .ha-tone-idle  { --dot: #3b82f6; }
 .ha-tone-ready { --dot: #22d3ee; }
@@ -312,34 +310,41 @@ retryBtn.addEventListener("click", () => {
   bridgeDown = false;
   setStatus("待命");
   log("手动重试：重新连接桥服务…");
+  if (autoInjectState === "wait-bridge") {
+    autoInjectState = "idle"; // 手动重试后重走协议拉取检查
+    log("协议自动补投：将重试拉取");
+  }
   if (manualRetryResolve) {
     manualRetryResolve();
     manualRetryResolve = null;
   }
 });
 
-// 手动填入规则文本：走 reinjectPending 路径（跟随自动模式）；protocolText 空时热读本地存储兜底
+// 手动填入规则文本：从桥服务按需拉取（GET /protocol）→ 排队注入（跟随自动模式提交）
 const injectProtocolBtn = panel.querySelector("#ha-inject-protocol");
 injectProtocolBtn.addEventListener("click", async () => {
-  if (!protocolText) {
-    const got = await chrome.storage.sync.get(PROTOCOL_KEY).catch(() => ({}));
-    const saved = got[PROTOCOL_KEY];
-    if (typeof saved === "string" && saved.startsWith(PROTOCOL_PREFIX)) {
-      protocolText = saved;
-      log("填入规则文本：已从本地存储恢复协议文本");
-    }
-  }
-  if (!protocolText) {
-    log("填入规则文本：尚无协议文本（桥服务未连接或未收到首条消息），跳过");
-    return;
-  }
-  protocolChecked = true; // 手动注入即视为本页补投已了结，避免与自动补投两路同时注入
-  if (reinjectPending) {
+  if (pendingInjectText) {
     log("填入规则文本：已在排队等待注入，无需重复");
     return;
   }
-  log("填入规则文本：排队注入协议文本");
-  reinjectPending = true;
+  injectProtocolBtn.disabled = true;
+  log("填入规则文本：正在从桥服务拉取协议文本…");
+  const got = await fetchProtocolText();
+  injectProtocolBtn.disabled = false;
+  if (got.error) {
+    log(`填入规则文本：拉取失败（${got.error}）`);
+    return;
+  }
+  const hasProtocol = [...document.querySelectorAll("ms-chat-turn")].some((t) =>
+    t.textContent.includes(PROTOCOL_PREFIX),
+  );
+  if (hasProtocol) {
+    log("填入规则文本：可见历史中已含协议消息（虚拟滚动下扫描不完整），跳过注入");
+    return;
+  }
+  autoInjectState = "done"; // 手动注入即视为本页自动补投已了结，避免与自动检查两路同时注入
+  pendingInjectText = got.text;
+  log(`填入规则文本：已取得协议文本（${got.text.length} 字符），排队注入`);
 });
 
 const TONE_CLASSES = [
@@ -454,6 +459,10 @@ function noteBridgeSuccess() {
     bridgeDown = false;
     setStatus("待命");
     log("桥服务已连接");
+    if (autoInjectState === "wait-bridge") {
+      autoInjectState = "idle"; // 拉取失败期间桥已恢复：重试自动补投
+      log("协议自动补投：桥服务可用，将重试拉取");
+    }
   }
 }
 
@@ -462,6 +471,19 @@ function waitForManualRetry() {
   return new Promise((resolve) => {
     manualRetryResolve = resolve;
   });
+}
+
+// 从桥服务按需拉取协议文本（GET /protocol，经 background 中继）；返回 {text} 或 {error}
+async function fetchProtocolText() {
+  let resp;
+  try {
+    resp = await chrome.runtime.sendMessage({ type: "get-protocol", baseUrl: settings.baseUrl });
+  } catch (err) {
+    resp = { error: err instanceof Error ? err.message : String(err) };
+  }
+  if (typeof resp?.protocol === "string" && resp.protocol !== "") return { text: resp.protocol };
+  if (resp?.status === 404) return { error: "桥服务无 /protocol 端点（旧版本），请重启桥服务加载新代码" };
+  return { error: resp?.error ?? "协议文本为空" };
 }
 
 function log(text) {
@@ -952,7 +974,7 @@ async function deliverMessage(text, source) {
   delivering = true;
   try {
     setStatus(settings.simulateTyping ? "回填中（模拟粘贴）" : "回填中");
-    log(`${source === "reinject" ? "重新注入协议文本" : "任务消息到达"}：${truncate(text.replace(/\n/g, " "), 80)}`);
+    log(`${source === "reinject" ? "协议文本注入" : "任务消息到达"}：${truncate(text.replace(/\n/g, " "), 80)}`);
     if (!(await typeIntoInput(text))) {
       setStatus("待命");
       pendingTask = { text, source }; // 输入框未就绪：消息暂存待补投，不丢弃
@@ -999,31 +1021,16 @@ async function deliveryLoop() {
         await deliverMessage(task.text, task.source);
         continue;
       }
-      // 页面就绪协议补投：进已有对话/刷新后，若对话历史中无协议消息则注入（本页一次）
-      if (!protocolChecked && protocolText && findInput()) {
-        const input = findInput();
-        // 输入框有未提交内容（可能正是协议）时跳过，避免重复注入；本轮不销记，草稿清空后下轮再查
-        if (input.value.trim() === "") {
-          protocolChecked = true; // 亲自确认过（无论是否注入）才销记，防止草稿占位永久吞掉本页补投
-          const hasProtocol = [...document.querySelectorAll("ms-chat-turn")].some((t) =>
-            t.textContent.includes(PROTOCOL_PREFIX),
-          );
-          if (!hasProtocol) {
-            log("当前对话尚无协议消息，自动注入协议文本");
-            await deliverMessage(protocolText, "reinject");
-            continue;
-          }
-        }
-      }
-      // 新对话触发的协议重新注入（pendingTask 已含协议时跳过，避免重复注入）
-      if (reinjectPending) {
-        reinjectPending = false;
-        if (pendingTask && pendingTask.text.startsWith(PROTOCOL_PREFIX)) {
-          log("协议文本已在待投队列，跳过重复注入");
-          continue;
-        }
-        await deliverMessage(protocolText, "reinject");
+      // 已取得的协议文本（手动按钮/自动检查共用队列）：输入框就绪即注入
+      if (pendingInjectText && findInput()) {
+        const text = pendingInjectText;
+        pendingInjectText = "";
+        await deliverMessage(text, "reinject");
         continue;
+      }
+      // 协议自动补投：仅空对话（双采样确认）自动注入
+      if (autoInjectState === "idle") {
+        if (await autoInjectProtocolIfEligible()) continue;
       }
       let resp;
       try {
@@ -1050,14 +1057,7 @@ async function deliveryLoop() {
         continue; // 审批处理完立即拉取下一条（执行结果回填消息）
       }
       if (resp?.task?.message) {
-        const msg = resp.task.message;
-        if (msg.startsWith(PROTOCOL_PREFIX)) {
-          // 首条任务消息即工具协议文本：保存供新对话重新注入（存储持久化，刷新后仍可用）
-          protocolText = msg;
-          chrome.storage.sync.set({ [PROTOCOL_KEY]: protocolText }).catch(() => log("协议文本保存失败"));
-          log("已保存工具协议文本（检测到新对话时自动重新注入）");
-        }
-        await deliverMessage(msg, "task");
+        await deliverMessage(resp.task.message, "task");
         continue; // 有消息时立即拉取下一条
       }
       // 无消息：仅把错误状态恢复为待命，不覆盖「已抓取回复」等有效状态
@@ -1065,6 +1065,50 @@ async function deliveryLoop() {
     }
     await sleep(TASK_RETRY_MS);
   }
+}
+
+// 对话轮次计数：容器缺失返回 -1（页面加载中/非对话页）
+function liveTurnCount() {
+  const content = findChatSessionContent();
+  return content ? content.children.length : -1;
+}
+
+// 协议自动补投：仅对话为空（无消息轮次、双采样确认）时拉取并注入。
+// 已有消息 → 销记跳过（防旧对话重放，这正是「刷新旧对话重跑旧命令」事故的护栏）；
+// 草稿占位/容器未就绪 → 不销记，下轮再查（草稿清空后自然继续）。
+// 返回 true 表示本轮已了结（注入排队/销记/等待桥恢复），false 表示保持 idle 下轮重试。
+async function autoInjectProtocolIfEligible() {
+  const input = findInput();
+  if (!input) return false; // 输入框未就绪：保持 idle，下轮再看
+  if (input.value.trim() !== "") return false; // 草稿占位：不销记，等下轮（草稿清空后自然继续）
+  const s1 = liveTurnCount();
+  if (s1 === -1) return false; // 对话容器未就绪
+  if (s1 > 0) {
+    autoInjectState = "done";
+    log(`协议自动补投：跳过（当前对话已有 ${s1} 轮消息）`);
+    return true;
+  }
+  await sleep(800); // 双采样：旧对话消息可能在 SPA 渲染队列中尚未落盘
+  const s2 = liveTurnCount();
+  if (s2 !== 0) {
+    if (s2 > 0) {
+      autoInjectState = "done"; // 采样间隔内旧对话消息载入完成 → 判定非空
+      log(`协议自动补投：跳过（检测到对话已有 ${s2} 轮消息）`);
+      return true;
+    }
+    return false; // 容器在采样期间消失（页面切换）：保持 idle 下轮重查
+  }
+  if (findInput()?.value.trim() !== "") return false; // 采样期间出现草稿：取消本次注入，不销记
+  const got = await fetchProtocolText();
+  if (got.error) {
+    autoInjectState = "wait-bridge";
+    log(`协议自动补投：拉取失败（${got.error}）；桥恢复后自动重试，或点「填入规则文本」手动注入`);
+    return true;
+  }
+  autoInjectState = "done";
+  pendingInjectText = got.text;
+  log(`协议自动补投：空对话确认（双采样），已取得协议文本（${got.text.length} 字符），排队注入`);
+  return true;
 }
 
 // ---------- 网络捕获接入（路线 A）：MAIN world → postMessage → 解码 → POST /result ----------
@@ -1199,18 +1243,14 @@ function onContentMutation() {
 function onNewConversation(reason) {
   if (Date.now() < reinjectSuppressUntil) return; // 防抖：级联变更只触发一次
   reinjectSuppressUntil = Date.now() + REINJECT_SUPPRESS_MS;
-  if (!protocolText) {
-    log(`检测到新对话（${reason}）：尚无协议文本，跳过重新注入`);
-    return;
-  }
-  log(`检测到新对话（${reason}）：排队重新注入协议文本`);
-  reinjectPending = true; // 经投递循环执行（同普通回填消息）
+  autoInjectState = "idle"; // 新对话：重走自动补投检查（仅空对话才会实际注入）
+  log(`检测到新对话（${reason}）：将检查协议自动补投`);
 }
 
 // ---------- 启动 ----------
 
 async function init() {
-  const stored = await chrome.storage.sync.get([SETTINGS_KEY, PROTOCOL_KEY]).catch(() => ({}));
+  const stored = await chrome.storage.sync.get(SETTINGS_KEY).catch(() => ({}));
   const saved = stored[SETTINGS_KEY];
   if (saved && typeof saved === "object") {
     const { delayMinSec, delayMaxSec } = clampDelay(Number(saved.delayMinSec), Number(saved.delayMaxSec));
@@ -1236,9 +1276,6 @@ async function init() {
       autoApprove: typeof saved.autoApprove === "boolean" ? saved.autoApprove : defaultSettings.autoApprove,
       approvalTimeoutSec: clampApprovalTimeout(Number(saved.approvalTimeoutSec)),
     };
-  }
-  if (typeof stored[PROTOCOL_KEY] === "string" && stored[PROTOCOL_KEY].startsWith(PROTOCOL_PREFIX)) {
-    protocolText = stored[PROTOCOL_KEY];
   }
   applySettingsToPanel();
   setupPanelEvents();
