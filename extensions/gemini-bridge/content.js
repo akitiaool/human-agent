@@ -2,15 +2,17 @@
 // 回复回传走网络原文捕获（路线 A）：MAIN world inject.js 钩 GenerateContent 响应 → postMessage
 // → 本脚本用 haDecodeGenerateContent（decode.js，同 content_scripts 数组先加载）解码 → POST /result。
 // 投递循环：长轮询 GET /task → 模拟人类逐字回填 → 自动/手动提交。
-// 协议注入：GET /protocol 按需拉取（无本地存储）；仅空对话自动注入，面板按钮随时可手动注入。
+// 协议注入：GET /protocol 按需拉取（无本地存储）；「新对话自动注入协议」开关（默认开）控制自动注入——
+// 会话切换检测 = URL 轮询（/prompts/<id> ⇄ /prompts/new_chat 逐对话唯一），仅空对话页自动注入，
+// 页面加载不自动检查（防刷新旧对话渲染期误判为空导致重放），面板按钮随时可手动注入（无条件）。
 // 选择器为 AI Studio 真实 DOM（2026-08-19 落定，task-13-brief 附录 A）。
 // 页面是 Angular SPA + cdk-virtual-scroll：元素频繁创建/销毁，
-// 所有抓取基于 MutationObserver 且每次现查 DOM，禁止缓存元素引用跨轮复用。
+// 所有 DOM 抓取每次现查、禁止缓存元素引用跨轮复用。
 // 面板样式统一 ha-* 前缀，避免与页面样式冲突。
 
 const DEFAULT_BASE_URL = "http://127.0.0.1:8765";
-const PROTOCOL_PREFIX = "【human-agent 工具协议】";
 const TASK_RETRY_MS = 1_000; // GET /task 无消息后的重试间隔
+const POLL_TICK_MS = 500; // 长轮询在途时的 tick 间隔（回顶重查队列/状态，手动按钮与切对话即时响应）
 const BRIDGE_RETRY_ATTEMPTS = 5; // 桥不可达自动重试次数；第 N 次失败后等 N 秒（1/2/3/4/5s），全部失败转手动重试
 const TYPING_MIN_MS = 200; // 纠错重打每字符延时下限（真人键入节奏 200–500ms/字）
 const TYPING_MAX_MS = 500;
@@ -25,8 +27,7 @@ const THINK_MIN_MS = 300; // 退格后重打前的「想字」停顿下限
 const THINK_MAX_MS = 800;
 const COMMON_CJK = "的了一是在不和有这大为中上国个"; // 中文错字候选（同音/高频字近似）
 const KB_ROWS = ["qwertyuiop", "asdfghjkl", "zxcvbnm"]; // 键盘相邻键（模拟手误）
-const REINJECT_SUPPRESS_MS = 5_000; // 新对话自动补投检查防抖窗口
-const BODY_CHECK_THROTTLE_MS = 200; // body 变更检查节流（虚拟滚动高频 churn 下不每次跑 querySelector）
+const HREF_POLL_MS = 400; // 会话地址轮询间隔（会话切换检测）
 const LOG_MAX_LINES = 50;
 
 const SETTINGS_KEY = "geminiBridgeSettings";
@@ -34,6 +35,7 @@ const SETTINGS_KEY = "geminiBridgeSettings";
 const defaultSettings = {
   baseUrl: DEFAULT_BASE_URL,
   autoMode: true,
+  autoInject: true, // 新对话自动注入协议（仅空对话页自动拉取注入；关=只用面板按钮手动注入）
   simulateTyping: true,
   delayMinSec: 3,
   delayMaxSec: 8,
@@ -47,11 +49,15 @@ const defaultSettings = {
 
 let settings = { ...defaultSettings };
 let pendingInjectText = ""; // 已取得、待投递循环回填的协议文本（空串=无）
-let autoInjectState = "idle"; // 协议自动补投状态机：idle 待检查 / wait-bridge 拉取失败待重试 / done 已了结
+// 协议自动补投状态机（仅「新对话自动注入协议」开关开启时运行）：
+// idle 待检查（新对话事件 / 开关打开时置位）/ wait-bridge 拉取失败待重试 / done 已了结。
+// 初始 done：页面加载不自动检查——旧对话刷新时渲染未完成会被误判为空对话从而重放（事故护栏）。
+let autoInjectState = "done";
+let autoInjectWaitLogged = false; // 「容器存在但暂无消息」保守等待日志只记一次（新对话事件复位）
 let lastPostedReply = ""; // 最近一次成功回传的回复（网络捕获去重用，服务侧亦去重）
 let delivering = false; // 投递循环串行占用标志（同一时刻只回填一条消息）
+let inflightPoll = null; // 在途的 get-task 长轮询（跨 tick 保留，消费前不置空——返回的消息不丢）
 let pendingTask = null; // 输入框未就绪时暂存的消息 {text, source}，就绪后补投
-let reinjectSuppressUntil = 0; // 新对话触发防抖时间戳
 let currentStatus = "待命";
 let bridgeDown = false; // 桥服务不可达标志（进入置位、成功复位）
 let bridgeFailCount = 0; // 连续失败次数（5 次后转手动重试）
@@ -151,6 +157,14 @@ panel.innerHTML = `
   border: 1px solid #4b5563; border-radius: 4px; padding: 0 4px; margin-left: 4px;
 }
 #ha-panel .ha-row { display: flex; align-items: center; gap: 6px; margin: 4px 0; }
+#ha-panel .ha-group-card {
+  margin: 6px 0 8px; padding: 4px 8px 6px;
+  background: #181818; border: 1px solid #333; border-radius: 6px;
+}
+#ha-panel .ha-group-card .ha-group-title {
+  font-size: 11px; font-weight: 600; color: #9ca3af; margin: 2px 0 4px;
+}
+#ha-panel .ha-group-card .ha-row { margin: 3px 0; }
 #ha-panel input[type="number"], #ha-panel input[type="text"], #ha-panel select {
   background: #111; color: #e8e8e8; border: 1px solid #4b5563;
   border-radius: 4px; padding: 2px 6px; width: 56px; font: inherit;
@@ -233,14 +247,20 @@ panel.innerHTML = `
   <span>gemini-bridge<span class="ha-badge">v3 网页对话驱动</span></span>
   <button id="ha-collapse" title="收起为悬浮球">–</button>
 </div>
-<label class="ha-row">
-  <input type="checkbox" id="ha-auto-mode"> 自动模式（自动提交回填消息）
-</label>
+<div class="ha-group-card">
+  <div class="ha-group-title">自动模式</div>
+  <label class="ha-row">
+    <input type="checkbox" id="ha-auto-mode"> 自动提交回填消息
+  </label>
+  <label class="ha-row">
+    <input type="checkbox" id="ha-auto-inject"> 新对话自动注入协议
+  </label>
+  <label class="ha-row">
+    <input type="checkbox" id="ha-auto-approve"> 自动授权危险命令
+  </label>
+</div>
 <label class="ha-row">
   <input type="checkbox" id="ha-simulate"> 模拟人类逐字输入
-</label>
-<label class="ha-row">
-  <input type="checkbox" id="ha-auto-approve"> 自动授权危险命令
 </label>
 <div class="ha-row">
   <span>审批超时</span>
@@ -280,7 +300,7 @@ panel.innerHTML = `
   <span>桥服务</span>
   <input type="text" id="ha-base-url" spellcheck="false" placeholder="http://127.0.0.1:8765">
 </div>
-<button id="ha-inject-protocol" title="手动把工具协议（规则）文本填入输入框（自动模式开=填好后自动提交）">填入规则文本</button>
+<button id="ha-inject-protocol" title="手动把工具协议（规则）文本填入输入框（自动提交开=填好后自动提交）">填入规则文本</button>
 <div class="ha-status" id="ha-status">待命</div>
 <button id="ha-retry" hidden>手动重试</button>
 <div class="ha-log-bar">
@@ -320,7 +340,7 @@ retryBtn.addEventListener("click", () => {
   }
 });
 
-// 手动填入规则文本：从桥服务按需拉取（GET /protocol）→ 排队注入（跟随自动模式提交）
+// 手动填入规则文本：从桥服务按需拉取（GET /protocol）→ 排队注入（跟随自动提交）
 const injectProtocolBtn = panel.querySelector("#ha-inject-protocol");
 injectProtocolBtn.addEventListener("click", async () => {
   if (pendingInjectText) {
@@ -333,13 +353,6 @@ injectProtocolBtn.addEventListener("click", async () => {
   injectProtocolBtn.disabled = false;
   if (got.error) {
     log(`填入规则文本：拉取失败（${got.error}）`);
-    return;
-  }
-  const hasProtocol = [...document.querySelectorAll("ms-chat-turn")].some((t) =>
-    t.textContent.includes(PROTOCOL_PREFIX),
-  );
-  if (hasProtocol) {
-    log("填入规则文本：可见历史中已含协议消息（虚拟滚动下扫描不完整），跳过注入");
     return;
   }
   autoInjectState = "done"; // 手动注入即视为本页自动补投已了结，避免与自动检查两路同时注入
@@ -517,6 +530,7 @@ function clampApprovalTimeout(v) {
 
 function applySettingsToPanel() {
   panel.querySelector("#ha-auto-mode").checked = settings.autoMode;
+  panel.querySelector("#ha-auto-inject").checked = settings.autoInject;
   panel.querySelector("#ha-simulate").checked = settings.simulateTyping;
   panel.querySelector("#ha-delay-min").value = settings.delayMinSec;
   panel.querySelector("#ha-delay-max").value = settings.delayMaxSec;
@@ -540,7 +554,18 @@ function setupPanelEvents() {
   panel.querySelector("#ha-auto-mode").addEventListener("change", (e) => {
     settings.autoMode = e.target.checked;
     scheduleSaveSettings();
-    log(`自动模式：${settings.autoMode ? "开" : "关"}`);
+    log(`自动提交回填消息：${settings.autoMode ? "开" : "关"}`);
+  });
+  panel.querySelector("#ha-auto-inject").addEventListener("change", (e) => {
+    settings.autoInject = e.target.checked;
+    scheduleSaveSettings();
+    if (settings.autoInject) {
+      autoInjectState = "idle"; // 打开开关即检查当前对话（空对话页才会实际注入）
+      autoInjectWaitLogged = false;
+      log("新对话自动注入协议：开（将检查当前对话的协议补投）");
+    } else {
+      log("新对话自动注入协议：关（需要时点「填入规则文本」手动注入）");
+    }
   });
   panel.querySelector("#ha-simulate").addEventListener("change", (e) => {
     settings.simulateTyping = e.target.checked;
@@ -620,15 +645,6 @@ function setupPanelEvents() {
 }
 
 // ---------- AI Studio DOM 操作（每次现查，禁止缓存跨轮复用） ----------
-
-// A1：对话容器根（其子元素全部为 ms-chat-turn）
-function findChatSessionContent() {
-  return (
-    document.querySelector("ms-chat-session > ms-autoscroll-container > div > div.chat-session-content") ??
-    document.querySelector(".chat-session-content") ??
-    null
-  );
-}
 
 // A4：输入框（普通 textarea，非 contenteditable）
 function findInput() {
@@ -983,7 +999,7 @@ async function deliverMessage(text, source) {
     }
     if (!settings.autoMode) {
       setStatus("待命");
-      log("手动模式：已回填输入框，请点击页面发送按钮提交");
+      log("自动提交未开：已回填输入框，请点击页面发送按钮提交");
       return;
     }
     const delayMs = randRange(settings.delayMinSec, settings.delayMaxSec) * 1000;
@@ -996,7 +1012,7 @@ async function deliverMessage(text, source) {
     // 竞态守卫：延迟回调触发时开关已关闭 → 跳过点击（A7）
     if (!settings.autoMode) {
       setStatus("待命");
-      log("延迟期间自动模式已关闭，跳过自动提交（请在输入框手动发送）");
+      log("延迟期间自动提交已关闭，跳过提交（请在输入框手动发送）");
       return;
     }
     if (await clickSendWhenReady()) {
@@ -1011,6 +1027,8 @@ async function deliverMessage(text, source) {
   }
 }
 
+// 长轮询 tick 化：get-task 在途时每 POLL_TICK_MS 回到循环顶重查队列/状态，
+// 手动按钮与新对话检查即时响应；in-flight 轮询跨 tick 保留（promise 里的消息不丢，消费前不置空）。
 async function deliveryLoop() {
   while (true) {
     if (!delivering) {
@@ -1028,16 +1046,26 @@ async function deliveryLoop() {
         await deliverMessage(text, "reinject");
         continue;
       }
-      // 协议自动补投：仅空对话（双采样确认）自动注入
-      if (autoInjectState === "idle") {
+      // 协议自动补投：「新对话自动注入协议」开 且 空对话（双采样确认）才执行
+      if (settings.autoInject && autoInjectState === "idle") {
         if (await autoInjectProtocolIfEligible()) continue;
       }
-      let resp;
-      try {
-        resp = await chrome.runtime.sendMessage({ type: "get-task", baseUrl: settings.baseUrl });
-      } catch (err) {
-        resp = { error: err instanceof Error ? err.message : String(err) };
+      if (!inflightPoll) {
+        inflightPoll = (async () => {
+          try {
+            return await chrome.runtime.sendMessage({ type: "get-task", baseUrl: settings.baseUrl });
+          } catch (err) {
+            return { error: err instanceof Error ? err.message : String(err) };
+          }
+        })();
       }
+      const raced = await Promise.race([
+        inflightPoll.then((resp) => ({ kind: "poll", resp })),
+        sleep(POLL_TICK_MS).then(() => ({ kind: "tick" })),
+      ]);
+      if (raced.kind === "tick") continue; // 轮询仍在途：回顶重查队列/状态
+      inflightPoll = null; // 本轮询已消费，下轮重新发起
+      const resp = raced.resp;
       if (resp?.error) {
         bridgeFailCount += 1;
         if (bridgeFailCount <= BRIDGE_RETRY_ATTEMPTS) {
@@ -1067,22 +1095,29 @@ async function deliveryLoop() {
   }
 }
 
-// 对话轮次计数：容器缺失返回 -1（页面加载中/非对话页）
+// 对话轮次计数：文档级统计 ms-chat-turn 元素，排除思考轮（页面实测：思考轮额外挂
+// .thought-activity-host 类，与消息轮同用 ms-chat-turn 标签，不排除会虚计）。
+// 不用容器子元素计数——容器 children 混有非轮次 UI（幻觉免责声明、Drive 提示等），会虚高；
+// 空对话无容器也无轮次元素，恒为 0，不再出现「容器缺失 -1」把空对话判定卡死的状态。
 function liveTurnCount() {
-  const content = findChatSessionContent();
-  return content ? content.children.length : -1;
+  return document.querySelectorAll("ms-chat-turn:not(.thought-activity-host)").length;
 }
 
-// 协议自动补投：仅对话为空（无消息轮次、双采样确认）时拉取并注入。
-// 已有消息 → 销记跳过（防旧对话重放，这正是「刷新旧对话重跑旧命令」事故的护栏）；
-// 草稿占位/容器未就绪 → 不销记，下轮再查（草稿清空后自然继续）。
+// 协议自动补投（仅「新对话自动注入协议」开关开启时运行）：仅新对话页（URL 含 /prompts/new_chat）
+// 且对话为空（无消息轮次、双采样确认）时拉取并注入。仅由会话切换（onNewConversation，URL 轮询）
+// 或开关打开置 idle 触发；页面加载初始 done 不检查（防刷新旧对话重放）。
+// 已有消息 → 销记跳过；不在新对话页 → 销记跳过（历史对话渲染中也不注入——URL 即证据）；
+// 草稿占位 → 不销记，下轮再查；新对话页显示会话元素 → 首条消息提交过渡态，保守等待（日志一次，不销记）。
 // 返回 true 表示本轮已了结（注入排队/销记/等待桥恢复），false 表示保持 idle 下轮重试。
 async function autoInjectProtocolIfEligible() {
+  if (!settings.autoInject) {
+    autoInjectState = "done"; // 开关已关：销记（重新打开时由开关事件复位 idle）
+    return true;
+  }
   const input = findInput();
   if (!input) return false; // 输入框未就绪：保持 idle，下轮再看
   if (input.value.trim() !== "") return false; // 草稿占位：不销记，等下轮（草稿清空后自然继续）
   const s1 = liveTurnCount();
-  if (s1 === -1) return false; // 对话容器未就绪
   if (s1 > 0) {
     autoInjectState = "done";
     log(`协议自动补投：跳过（当前对话已有 ${s1} 轮消息）`);
@@ -1090,15 +1125,30 @@ async function autoInjectProtocolIfEligible() {
   }
   await sleep(800); // 双采样：旧对话消息可能在 SPA 渲染队列中尚未落盘
   const s2 = liveTurnCount();
-  if (s2 !== 0) {
-    if (s2 > 0) {
-      autoInjectState = "done"; // 采样间隔内旧对话消息载入完成 → 判定非空
-      log(`协议自动补投：跳过（检测到对话已有 ${s2} 轮消息）`);
-      return true;
+  if (s2 > 0) {
+    autoInjectState = "done"; // 采样间隔内旧对话消息载入完成 → 判定非空
+    log(`协议自动补投：跳过（检测到对话已有 ${s2} 轮消息）`);
+    return true;
+  }
+  if (!location.href.includes("/prompts/new_chat")) {
+    // 不在新对话页：历史对话渲染中（轮次尚未落盘）或已切走——注入只发生在空对话页
+    autoInjectState = "done";
+    log("协议自动补投：跳过（当前不在新对话页）");
+    return true;
+  }
+  if (document.querySelector("ms-chat-session")) {
+    // 新对话页却有会话元素：首条消息提交瞬间的过渡态 → 保守等待，不销记
+    if (!autoInjectWaitLogged) {
+      autoInjectWaitLogged = true;
+      log("协议自动补投：会话容器已存在但暂无消息（可能在渲染），保守等待…");
     }
-    return false; // 容器在采样期间消失（页面切换）：保持 idle 下轮重查
+    return false;
   }
   if (findInput()?.value.trim() !== "") return false; // 采样期间出现草稿：取消本次注入，不销记
+  if (!settings.autoInject) {
+    autoInjectState = "done"; // 采样期间开关被关：销记，不再注入
+    return true;
+  }
   const got = await fetchProtocolText();
   if (got.error) {
     autoInjectState = "wait-bridge";
@@ -1180,71 +1230,42 @@ function setupCaptureListener() {
   window.postMessage({ __ha: CAPTURE_MARKER, v: 1, kind: "ping" }, "*");
 }
 
-// ---------- 新对话检测（A1）：观察器随容器变化重挂，触发协议文本重新注入 ----------
+// ---------- 会话切换检测（A1）：URL 轮询（/prompts/<id> 逐对话唯一），触发协议文本重新注入 ----------
 
-let bodyObserver = null;
-let lastBodyCheck = 0; // body 变更回调节流时间戳
-let contentObserver = null;
-let observedContent = null;
-let lastTurnCount = 0;
-let lastFirstTurn = null;
-let lastSessionEl = null; // 上次采样到的会话元素引用；移除或更换都视为新对话
+let lastHref = null; // URL 轮询基线
+let lastTriggerHref = null; // 上次触发补投检查的地址（重复信号合并）
 
 function setupNewConversationWatcher() {
-  lastSessionEl = document.querySelector("ms-chat-session");
-  rehangContentObserver();
-  bodyObserver = new MutationObserver(() => {
-    const now = Date.now();
-    if (now - lastBodyCheck < BODY_CHECK_THROTTLE_MS) return; // 节流：虚拟滚动高频变更不每次现查
-    lastBodyCheck = now;
-    const sessionEl = document.querySelector("ms-chat-session");
-    if (lastSessionEl && sessionEl !== lastSessionEl) onNewConversation("对话会话已更换/移除"); // ① 引用比较：布尔采样会漏「旧新同时到位」的替换
-    lastSessionEl = sessionEl;
-    rehangContentObserver();
-  });
-  bodyObserver.observe(document.body, { childList: true, subtree: true });
-}
-
-// 每次取到新的 .chat-session-content 后在其上重建 childList 观察器
-function rehangContentObserver() {
-  const content = findChatSessionContent();
-  if (!content) {
-    if (observedContent && lastTurnCount > 0) onNewConversation("对话容器已消失");
-    if (contentObserver) {
-      contentObserver.disconnect();
-      contentObserver = null;
+  lastHref = location.href;
+  lastTriggerHref = location.href; // 初始同步：页面加载自身的路由变化不触发检查
+  // AI Studio 每个对话有唯一地址（历史对话 /prompts/<id>，空对话 /prompts/new_chat），
+  // 地址一变即切换，逐次必中；启动期首次路由（裸域 → /prompts/…）不算切换（页面加载护栏）。
+  setInterval(() => {
+    const href = location.href;
+    if (href === lastHref) return;
+    const prev = lastHref;
+    lastHref = href;
+    if (!prev.includes("/prompts/")) {
+      lastTriggerHref = href; // 启动期路由：同步基线，不触发
+      return;
     }
-    observedContent = null;
-    lastTurnCount = 0;
-    lastFirstTurn = null;
-    return;
-  }
-  if (content === observedContent) return;
-  if (contentObserver) contentObserver.disconnect();
-  observedContent = content;
-  lastTurnCount = content.children.length; // 子元素全部为 ms-chat-turn
-  lastFirstTurn = content.firstElementChild;
-  contentObserver = new MutationObserver(onContentMutation);
-  contentObserver.observe(content, { childList: true });
+    onNewConversation("会话地址已变更");
+  }, HREF_POLL_MS);
 }
 
-function onContentMutation() {
-  const content = observedContent;
-  if (!content) return;
-  const count = content.children.length;
-  const first = content.firstElementChild;
-  if (lastTurnCount > 0 && (count === 0 || first !== lastFirstTurn)) {
-    onNewConversation("对话轮次已清空/重置"); // ② 计数清空或首个子元素变化
-  }
-  lastTurnCount = count;
-  lastFirstTurn = first;
-}
-
+// 会话切换统一入口（URL 轮询）：按当前地址去重——同一地址重复信号只触发一次检查，
+// 不吞真实切换（切一次址变一次；启动期首次路由在轮询侧同步基线）。
 function onNewConversation(reason) {
-  if (Date.now() < reinjectSuppressUntil) return; // 防抖：级联变更只触发一次
-  reinjectSuppressUntil = Date.now() + REINJECT_SUPPRESS_MS;
-  autoInjectState = "idle"; // 新对话：重走自动补投检查（仅空对话才会实际注入）
-  log(`检测到新对话（${reason}）：将检查协议自动补投`);
+  const href = location.href;
+  if (href === lastTriggerHref) return;
+  lastTriggerHref = href;
+  autoInjectState = "idle"; // 新对话：若自动注入开启则重走补投检查（仅空对话才会实际注入）
+  autoInjectWaitLogged = false; // 保守等待日志按对话重记
+  log(
+    settings.autoInject
+      ? `检测到新对话（${reason}）：将检查协议自动补投`
+      : `检测到新对话（${reason}）：自动注入未开，需要时点「填入规则文本」`,
+  );
 }
 
 // ---------- 启动 ----------
@@ -1271,6 +1292,7 @@ async function init() {
       typoChance: clampTypoChance(Number(saved.typoChance)),
       speed: clampSpeed(Number(saved.speed)),
       autoMode: typeof saved.autoMode === "boolean" ? saved.autoMode : defaultSettings.autoMode,
+      autoInject: typeof saved.autoInject === "boolean" ? saved.autoInject : defaultSettings.autoInject,
       simulateTyping:
         typeof saved.simulateTyping === "boolean" ? saved.simulateTyping : defaultSettings.simulateTyping,
       autoApprove: typeof saved.autoApprove === "boolean" ? saved.autoApprove : defaultSettings.autoApprove,
@@ -1281,7 +1303,9 @@ async function init() {
   setupPanelEvents();
   setupNewConversationWatcher();
   setStatus("待命");
-  log(`gemini-bridge v3 已就绪：桥服务 ${settings.baseUrl}，自动模式 ${settings.autoMode ? "开" : "关"}`);
+  log(
+    `gemini-bridge v3 已就绪：桥服务 ${settings.baseUrl}，自动提交 ${settings.autoMode ? "开" : "关"}，新对话自动注入 ${settings.autoInject ? "开" : "关"}`,
+  );
   setupCaptureListener(); // 网络捕获接入：等 MAIN world 捕获消息（document_start 已发 hello，此处补 ping）
   deliveryLoop(); // 投递循环：长轮询取回填消息
 }
