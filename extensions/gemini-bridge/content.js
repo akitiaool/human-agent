@@ -170,6 +170,12 @@ panel.innerHTML = `
   font: inherit; cursor: pointer;
 }
 #ha-panel #ha-retry:hover { border-color: #b91c1c; color: #fecaca; }
+#ha-panel #ha-inject-protocol {
+  margin-top: 6px; width: 100%; background: #111; color: #93c5fd;
+  border: 1px solid #1d4ed8; border-radius: 4px; padding: 4px 0;
+  font: inherit; cursor: pointer;
+}
+#ha-panel #ha-inject-protocol:hover { border-color: #2563eb; color: #bfdbfe; }
 }
 /* 状态色调：待命蓝 / 已抓取青 / 回填橙 / 倒计时绿 / 等待紫 / 桥断琥珀 / 错误红 */
 .ha-tone-idle  { --dot: #3b82f6; }
@@ -276,6 +282,7 @@ panel.innerHTML = `
   <span>桥服务</span>
   <input type="text" id="ha-base-url" spellcheck="false" placeholder="http://127.0.0.1:8765">
 </div>
+<button id="ha-inject-protocol" title="手动把工具协议（规则）文本填入输入框（自动模式开=填好后自动提交）">填入规则文本</button>
 <div class="ha-status" id="ha-status">待命</div>
 <button id="ha-retry" hidden>手动重试</button>
 <div class="ha-log-bar">
@@ -309,6 +316,30 @@ retryBtn.addEventListener("click", () => {
     manualRetryResolve();
     manualRetryResolve = null;
   }
+});
+
+// 手动填入规则文本：走 reinjectPending 路径（跟随自动模式）；protocolText 空时热读本地存储兜底
+const injectProtocolBtn = panel.querySelector("#ha-inject-protocol");
+injectProtocolBtn.addEventListener("click", async () => {
+  if (!protocolText) {
+    const got = await chrome.storage.sync.get(PROTOCOL_KEY).catch(() => ({}));
+    const saved = got[PROTOCOL_KEY];
+    if (typeof saved === "string" && saved.startsWith(PROTOCOL_PREFIX)) {
+      protocolText = saved;
+      log("填入规则文本：已从本地存储恢复协议文本");
+    }
+  }
+  if (!protocolText) {
+    log("填入规则文本：尚无协议文本（桥服务未连接或未收到首条消息），跳过");
+    return;
+  }
+  protocolChecked = true; // 手动注入即视为本页补投已了结，避免与自动补投两路同时注入
+  if (reinjectPending) {
+    log("填入规则文本：已在排队等待注入，无需重复");
+    return;
+  }
+  log("填入规则文本：排队注入协议文本");
+  reinjectPending = true;
 });
 
 const TONE_CLASSES = [
