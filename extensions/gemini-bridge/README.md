@@ -1,16 +1,23 @@
-# gemini-bridge 浏览器扩展（v2 网页对话驱动）
+# gemini-bridge 浏览器扩展（v3 网络原文捕获 · 网页对话驱动）
 
-human-agent 与 AI Studio 网页版 Gemini 之间的桥。v2 形态：**对话发生在网页**
+human-agent 与 AI Studio 网页版 Gemini 之间的桥。**对话发生在网页**
 （Google AI Studio），智能体仅执行工具。插件做三件事：
 
-1. **内容监控**：抓取网页上最新的模型回复，POST 给本机桥服务
-   （`POST /result {reply}`），桥服务解析 ```tool_call``` 交给智能体执行；
+1. **网络原文捕获**：页面主世界（MAIN world）薄 hook 拦截 GenerateContent 响应流，
+   取**未渲染的模型原文**解码后 POST 给本机桥服务（`POST /result {reply}`），
+   桥服务解析 ```tool_call``` 交给智能体执行。DOM 抓取通道已整体删除——
+   渲染失真不可靠；捕获失手时任务「响亮停滞」（面板不再出现「已回传」日志，
+   一眼可诊、可修复），绝不降级产出错值；
 2. **投递回填**：长轮询桥服务（`GET /task`）取回填消息（工具执行结果 / 协议文本），
    **模拟人类分段粘贴输入**（分段粘贴 + 错别字纠错）到页面输入框，自动模式在随机延迟后点击发送；
 3. **协议注入**：保存桥服务首条任务消息（工具协议文本），检测到新对话时自动重新注入。
 
 整个流水线内容驱动、无 id 握手：`网页回复 → 桥服务解析执行 → 回填消息 → 网页提交 → 新回复…`
 （去重由服务侧兜底，重复提交返回 `processed: false`）。
+
+扩展文件：`manifest.json`（v0.3.0）、`background.js`（全 try/catch 中转）、
+`inject.js`（MAIN world 捕获层，document_start）、`decode.js`（响应流解码，纯函数）、
+`content.js`（隔离世界接入层：面板 / 投递循环 / 审批弹窗 / 新对话检测）。
 
 ## 前置条件
 
@@ -79,9 +86,12 @@ human-agent 与 AI Studio 网页版 Gemini 之间的桥。v2 形态：**对话�
 |---|---|
 | 面板状态「错误」，日志显示取任务失败 | 桥服务未启动（先 `GEMINI_BRIDGE_PORT=8765 pnpm dev`）；端口占用（换端口后同步改面板「桥服务地址」与 `manifest.json` 的 `host_permissions`） |
 | 回填后输入框无反应 / 无法提交 | 页面未在对话页（无 `ms-prompt-box textarea`）；或页面 DOM 结构更新导致选择器失效 |
-| 页面结构变化导致失效 | 现象：日志「未找到输入框」「未找到发送按钮」，或监控循环抓不到回复。打开 DevTools 检查元素，更新 `content.js` 顶部选择器常量区域：输入框 `ms-prompt-box textarea.cdk-textarea-autosize.textarea`、发送按钮 `ms-run-button button[type="submit"].ms-button-primary`、模型轮 `ms-chat-turn.text-chunk-host` + `[data-turn-role="Model"]`、完成信号 `#cdk-live-announcer-0`。AI Studio 为 Angular SPA + 虚拟滚动，元素频繁创建/销毁，抓取必须每次现查 DOM |
-| 插件加载时报错 | `chrome://extensions` 页面点「错误」查看 background 日志；确认三个文件无语法错误 |
+| 回填失效（未找到输入框/发送按钮） | 打开 DevTools 检查元素，更新 `content.js` 顶部选择器常量区域：输入框 `ms-prompt-box textarea.cdk-textarea-autosize.textarea`、发送按钮 `ms-run-button button[type="submit"].ms-button-primary`。AI Studio 为 Angular SPA + 虚拟滚动，元素频繁创建/销毁，抓取必须每次现查 DOM |
+| 回复不再回传（无「已回传」日志） | 响亮停滞诊断：无「网络捕获已挂载」→ 注入层未生效（Chrome < 111 不支持 `world:"MAIN"`；或扩展代码更新后未刷新 AI Studio 页面，content script 不热重载）；有「检测到 GenerateContent 请求」但无「已回传」→ 解码失败（看「解码失败（原文 N 字符）」日志）或 AI Studio 端点迁移（更新 `inject.js` 的 URL 命中判据） |
+| 插件加载时报错 | `chrome://extensions` 页面点「错误」查看 background 日志；确认四个文件（background.js、content.js、inject.js、decode.js）无语法错误 |
 | 新对话后协议文本未注入 | 插件只在「检测到新对话」时重新注入已保存的协议文本；若扩展刚加载（存储中无协议文本），需在桥服务启动后先等首条协议消息到达并保存 |
+
+**扩展重载**：修改扩展代码后需在 `chrome://extensions` 点刷新，并**刷新 AI Studio 页面**（content script 不热重载），否则仍跑旧代码。
 
 ## 安全
 
