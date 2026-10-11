@@ -24,7 +24,7 @@ human-agent 与 AI Studio 网页版 Gemini 之间的桥。**对话发生在网�
    任何对话、任何开关状态下都可用面板「填入规则文本」按钮手动注入（无条件）。
 
 整个流水线内容驱动、无 id 握手：`网页回复 → 桥服务解析执行 → 回填消息 → 网页提交 → 新回复…`
-（去重由服务侧兜底，重复提交返回 `processed: false`）。
+（无工具调用的回复返回 `processed: false`，本轮自终止；同一内容重复提交照常执行——重复控制归模型侧）。
 
 扩展文件：`manifest.json`（v0.3.0）、`background.js`（全 try/catch 中转）、
 `inject.js`（MAIN world 捕获层，document_start）、`decode.js`（响应流解码，纯函数）、

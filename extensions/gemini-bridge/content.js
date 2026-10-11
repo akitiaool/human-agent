@@ -1237,7 +1237,7 @@ async function postResult(reply, stats) {
     noteBridgeSuccess();
     log(
       `网络捕获：已回传（${reply.length} 字符，${stats.deltaCount} deltas，滤 ${stats.thoughtCount} thought，` +
-        `${resp.processed ? "已入队执行" : "服务侧忽略（无工具调用/重复）"}）`,
+        `${resp.processed ? "已入队执行" : "服务侧忽略（无工具调用）"}）`,
     );
     if (!resp.processed) setStatus("待命");
     // processed 时保持「已抓取回复（等待执行）」，直到回填消息到达
