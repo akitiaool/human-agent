@@ -3,6 +3,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { FileWriter } from "../src/hands/file-writer.js";
+import { computeVersionId } from "../src/hands/diff-engine.js";
 
 describe("FileWriter", () => {
   let dir: string;
@@ -72,5 +73,35 @@ describe("FileWriter", () => {
   it("applyPatch 目标文件不存在时返回失败", async () => {
     const result = await writer.applyPatch(join(dir, "missing.txt"), "- x\n");
     expect(result.success).toBe(false);
+  });
+
+  it("editFile 校验 base_version 成功并原子替换多个 Hunk", async () => {
+    const file = join(dir, "edit-test.txt");
+    const initial = "function a() { return 1; }\nfunction b() { return 2; }";
+    await writeFile(file, initial, "utf-8");
+    const v1 = computeVersionId(initial);
+
+    const result = await writer.editFile(
+      file,
+      [
+        { search: "return 1;", replace: "return 10;" },
+        { search: "return 2;", replace: "return 20;" },
+      ],
+      v1,
+    );
+
+    expect(result.success).toBe(true);
+    expect(result.data?.hunksApplied).toBe(2);
+    expect(result.data?.newVersionId).toMatch(/^v-[a-f0-9]{8}$/);
+    expect(await readFile(file, "utf-8")).toBe("function a() { return 10; }\nfunction b() { return 20; }");
+  });
+
+  it("editFile 在 base_version 不匹配时拒绝修改并返回 VERSION_MISMATCH", async () => {
+    const file = join(dir, "mismatch.txt");
+    await writeFile(file, "hello", "utf-8");
+    const result = await writer.editFile(file, [{ search: "hello", replace: "world" }], "v-wrong");
+    expect(result.success).toBe(false);
+    expect(result.error?.code).toBe("VERSION_MISMATCH");
+    expect(await readFile(file, "utf-8")).toBe("hello");
   });
 });

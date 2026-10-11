@@ -234,6 +234,93 @@ describe("AgentLoop", () => {
     expect(parsed.error?.code).toBe("USER_DENIED");
   });
 
+  it("多个工具调用按原数组顺序依次执行与写入上下文（保持时序不乱序）", async () => {
+    const executionOrder: string[] = [];
+    const call1 = { name: "terminal", arguments: { command: "echo step1-pending" } };
+    const call2 = { name: "terminal", arguments: { command: "echo step2-allowed" } };
+    const call3 = { name: "terminal", arguments: { command: "echo step3-blocked" } };
+
+    const brain = new ScriptedBrain(
+      [
+        { result: { text: "", toolCalls: [call1, call2, call3] } },
+        { result: { text: "全流程完成" } },
+      ],
+      {
+        allowed: [call2],
+        pending: [call1],
+        blocked: [{ call: call3, result: fail("BLACKLIST", "黑名单禁止") }],
+      },
+    );
+
+    const hands = buildHands();
+    const origExec = hands.executeCommand;
+    hands.executeCommand = async (cmd, sig, timeout) => {
+      executionOrder.push(cmd);
+      return origExec(cmd, sig, timeout);
+    };
+
+    const signal = new AbortController().signal;
+    const loop = new AgentLoop({
+      brain,
+      ears: new FakeEars(["按序执行三步", "/exit"]),
+      eyes: buildEyes(),
+      hands,
+      output: new TextOutput({ stdout: new FakeWritable(), intervalMs: 0 }),
+      signal,
+      mouth: autoAllowMouth,
+    });
+
+    await loop.run();
+    // 顺序必须严格保持为 step1 -> step2
+    expect(executionOrder).toEqual(["echo step1-pending", "echo step2-allowed"]);
+
+    const secondCall = brain.messagesOf(1);
+    const toolMessages = secondCall.filter((m) => m.role === "tool");
+    expect(toolMessages).toHaveLength(3);
+    expect(toolMessages[0]!.name).toBe("terminal");
+    expect(toolMessages[1]!.name).toBe("terminal");
+    expect(toolMessages[2]!.name).toBe("terminal");
+    expect(JSON.parse(toolMessages[2]!.content)).toMatchObject({ success: false, error: { code: "BLACKLIST" } });
+  });
+
+  it("多个工具中部分被拒绝/失败不中断其他正常工具的独立执行", async () => {
+    const call1 = { name: "terminal", arguments: { command: "echo deny-this" } };
+    const call2 = { name: "terminal", arguments: { command: "echo allow-this" } };
+
+    const brain = new ScriptedBrain(
+      [
+        { result: { text: "", toolCalls: [call1, call2] } },
+        { result: { text: "完成" } },
+      ],
+      {
+        allowed: [],
+        pending: [call1, call2],
+        blocked: [],
+      },
+    );
+
+    const signal = new AbortController().signal;
+    const loop = new AgentLoop({
+      brain,
+      ears: new FakeEars(["执行", "/exit"]),
+      eyes: buildEyes(),
+      hands: buildHands(),
+      output: new TextOutput({ stdout: new FakeWritable(), intervalMs: 0 }),
+      signal,
+      mouth: {
+        confirm: async () => true,
+        askApproval: async (prompt) => (prompt.key.includes("deny") ? { action: "deny" } : { action: "allow" }),
+      },
+    });
+
+    await loop.run();
+    const secondCall = brain.messagesOf(1);
+    const toolMessages = secondCall.filter((m) => m.role === "tool");
+    expect(toolMessages).toHaveLength(2);
+    expect(JSON.parse(toolMessages[0]!.content)).toMatchObject({ success: false, error: { code: "USER_DENIED" } });
+    expect(JSON.parse(toolMessages[1]!.content)).toMatchObject({ success: true });
+  });
+
   it("输入为空或 /exit 时退出且不调用大脑", async () => {
     const brain = new ScriptedBrain([]);
     const signal = new AbortController().signal;

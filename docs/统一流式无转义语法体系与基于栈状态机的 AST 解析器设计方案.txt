@@ -1,0 +1,443 @@
+# human-agent 统一流式无转义语法体系与基于栈状态机的 AST 解析器设计方案
+
+---
+
+## 一、 背景与核心设计目标
+
+### 1. 痛点与历史缺陷总结
+1. **JSON 转义地狱与解析脆弱性**：
+   - 传统的 JSON 参数要求字符串中的换行必须转义为 `\n`、引号转义为 `\"`；
+   - 在长代码读写或多层数据嵌套时，大模型极易丢失转义斜杠导致 `JSON.parse` 语法崩溃；同时多重转义严重污染可读性并虚耗大量 Token。
+2. **同质化围栏与嵌套截断漏洞**：
+   - 使用静态三反引号（````）作为代码围栏时，若文件源码或文档内部本身包含代码块或三反引号，非贪婪正则会发生提前闭合，硬生生切断上下文。
+3. **双轨制解析混乱**：
+   - 之前系统同时存在“纯 JSON 参数”与“原生 Diff 文本”两套并存的逻辑，导致解析器依靠关键字猜测切片，极易将含有关键字的代码误切破坏。
+4. **冗余标记开销**：
+   - 原生冗余写法对每一个分块都需要独立的开启与闭合符（$2 \times N$ 声明），造成标记膨胀与思维割裂。
+
+### 2. 核心设计目标
+1. **100% 纯净无转义（Raw Native Text）**：源码、Shell 脚本、文档完全原汁原味直出，零 `\n`，零 `\"`，零反斜杠负担。
+2. **词法标记三权分立（Tri-Token Orthogonality）**：开启（`<:::`）、过渡（`<::>`）、终结（`:::>`）严格正交，互不越界。
+3. **流式连续语义（Streamlined Transition, $N+1$ 极简公式）**：在连续阶段切换时，仅需 $N+1$ 个语法声明即可完成 $N$ 个状态的高效推进。
+4. **下推自动机与嵌套白名单（Stack-Based PDA with Allowed Children）**：基于编译原理语法栈进行上下文无关文法解析，内层字面量天然免疫，彻底杜绝任何嵌套冲突与提前截断。
+5. **一等公民流控与版本控制**：原生支持 `PIPELINE`（时序依赖阻断）、`BATCH`（独立并行）与 `versionId` 快照乐观锁。
+
+---
+
+## 二、 词法规范与流式语法体系
+
+### 1. 顶层纯粹性防护（Zero Ambiguity Envelope）
+整个回复外层必须且只能由大括号 `{` 与 `}` 包含，保证在任何前端或富文本渲染环境中被视为完整的数据作用域容器。外层若有任何自然语言杂项文本，直接 100% 判定为普通文本对话。
+
+```text
+{
+... 所有语法声明内容 ...
+}
+```
+
+### 2. 三大核心词法标记（Tokens）
+
+| 标记符号 | 角色 | 状态机栈动作 | 语义与作用 |
+|---|---|---|---|
+| **`<:::`** | **唯一开启符 (OPEN)** | `Push(NewNode)` | 开启一个全新的作用域，将新节点压入解析栈。在此之前的内容不属于本作用域。 |
+| **`<::>`** | **唯一过渡符 (TRANSITION)** | `Pop(PrevNode)` <br>+ `Push(NextNode)` | **只能存在于开启符与终结符之间**。自动将前一阶段内容归档出栈，并无缝将同级新阶段压入栈顶。 |
+| **`:::>`** | **唯一终结符 (CLOSE)** | `Pop(CurrentNode)` | 显式终结当前作用域并出栈。在此之后的内容不属于本作用域。 |
+
+---
+
+### 3. $N+1$ 流式语法公式与对比
+
+假设一个局部修改任务包含 $M$ 个 Hunk（即 $N = 2M$ 个状态块：$M$ 个 `BEFORE` + $M$ 个 `AFTER`）：
+
+- **冗余写法（$2N$ 个标记）**：
+  `<::: BEFORE[1]` ... `:::> BEFORE[1]` + `<::: AFTER[1]` ... `:::> AFTER[1]` + `<::: BEFORE[2]` ... `:::> BEFORE[2]` ... （共 8 个标记，臃肿且易错）。
+- **流式连续语法（$N+1$ 个标记）**：
+  仅需 1 个开启符 + 3 个过渡符 + 1 个终结符 = **5 个标记**：
+  ```text
+  <::: BEFORE[1]
+  旧代码片段 1
+  <::> AFTER[1]
+  新代码片段 1
+  <::> BEFORE[2]
+  旧代码片段 2
+  <::> AFTER[2]
+  新代码片段 2
+  :::> AFTER[2]
+  ```
+
+---
+
+## 三、 节点类型与嵌套白名单矩阵（Allowed Children Matrix）
+
+解析器内部将输入抽象为语法树（AST）。每个节点类型（`NodeType`）严格维护一份 `allowedChildren` 白名单，不在栈顶白名单内的任何语法标记**一律作为普通纯文本字面量累加**，绝不入栈或出栈。
+
+```
+                     ┌──────────────────┐
+                     │   ROOT ({ ... }) │
+                     └────────┬─────────┘
+                              │ 允许包含
+         ┌────────────────────┼────────────────────┐
+         ▼                    ▼                    ▼
+┌─────────────────┐  ┌─────────────────┐  ┌─────────────────┐
+│  PIPELINE[ID]   │  │    BATCH[ID]    │  │  TOOL_CALL[ID]  │
+└────────┬────────┘  └────────┬────────┘  └────────┬────────┘
+         │ 允许嵌套           │ 允许嵌套           │ 允许包含 (叶子数据块)
+         ├─────────┐          ├─────────┐          ├──────────┬──────────┬──────────┐
+         ▼         ▼          ▼         ▼          ▼          ▼          ▼          ▼
+    PIPELINE     BATCH     PIPELINE   BATCH     CONTENT    COMMAND     BEFORE   Key: Value
+                                                                       (过渡到)
+                                                                        AFTER
+```
+
+### 嵌套白名单矩阵定义表：
+
+| 节点类型 (`NodeType`) | 允许入栈的子节点 (`allowedChildren`) | 允许过渡的目标 (`allowedTransitions`) | 节点性质 |
+|---|---|---|---|
+| **`ROOT`** | `PIPELINE`, `BATCH`, `TOOL_CALL` | `(无)` | 根容器 |
+| **`PIPELINE`** | `PIPELINE`, `BATCH`, `TOOL_CALL` | `(无)` | 流水线容器（串行，失败即阻断） |
+| **`BATCH`** | `PIPELINE`, `BATCH`, `TOOL_CALL` | `(无)` | 批处理容器（并行/独立，失败隔离） |
+| **`TOOL_CALL`** | `CONTENT`, `COMMAND`, `BEFORE` | `(无)` | 工具调用叶子节点（内含元数据与数据块） |
+| **`CONTENT`** | `(空集合 - 拒绝任何子节点)` | `(无)` | 终结数据块（全量文件内容） |
+| **`COMMAND`** | `(空集合 - 拒绝任何子节点)` | `(无)` | 终结数据块（终端执行脚本） |
+| **`BEFORE`** | `(空集合)` | `AFTER` | 过渡数据块（旧代码） |
+| **`AFTER`** | `(空集合)` | `BEFORE` *(开启下一段)* | 终结/过渡数据块（新代码） |
+
+---
+
+## 四、 具体工具与场景语法形态全集
+
+### 1. 局部 Diff 精确多块替换（`edit_file`）
+```text
+{
+<::: TOOL_CALL[edit_1]
+tool: edit_file
+path: src/heart/loop.ts
+base_version: v-d8e2a14b
+
+<::: BEFORE[1]
+const defaultTimeout = 30000;
+<::> AFTER[1]
+const defaultTimeout = 60000;
+<::> BEFORE[2]
+for (const call of verdict.allowed) {
+  this.#emit("ACTING", call.name);
+}
+<::> AFTER[2]
+for (const call of calls) {
+  if (allowedSet.has(call)) {
+    this.#emit("ACTING", call.name);
+  }
+}
+:::> AFTER[2]
+
+:::> TOOL_CALL[edit_1]
+}
+```
+
+### 2. 全量写文件（`write_file`）
+原生嵌入任意复杂代码，内部包含各种引号、标签、甚至示例标记均免疫：
+```text
+{
+<::: TOOL_CALL[write_doc]
+tool: write_file
+path: docs/guide.md
+<::: CONTENT
+# 使用指南
+下面是工具调用的声明示范：
+<::: TOOL_CALL[demo]
+tool: terminal
+:::> TOOL_CALL[demo]
+这段内容会被完整写入文件，绝不会被解析器误截断！
+:::> CONTENT
+:::> TOOL_CALL[write_doc]
+}
+```
+
+### 3. 切片读取文件（`read_file`）
+```text
+{
+<::: TOOL_CALL[read_pkg]
+tool: read_file
+path: package.json
+start_line: 1
+line_count: 20
+:::> TOOL_CALL[read_pkg]
+}
+```
+
+### 4. 复杂终端命令执行（`terminal`）
+```text
+{
+<::: TOOL_CALL[exec_test]
+tool: terminal
+timeout_ms: 15000
+<::: COMMAND
+pnpm exec tsc --noEmit && pnpm test
+:::> COMMAND
+:::> TOOL_CALL[exec_test]
+}
+```
+
+### 5. 复合树状依赖流控（Pipeline 嵌套 Batch）
+```text
+{
+<::: PIPELINE[ci_pipeline]
+
+  <::: TOOL_CALL[step_build]
+  tool: terminal
+  <::: COMMAND
+  pnpm build
+  :::> COMMAND
+  :::> TOOL_CALL[step_build]
+
+  <::: BATCH[step_parallel_tests]
+    <::: TOOL_CALL[test_unit]
+    tool: terminal
+    <::: COMMAND
+    vitest run tests/diff-engine.test.ts
+    :::> COMMAND
+    :::> TOOL_CALL[test_unit]
+
+    <::: TOOL_CALL[test_integration]
+    tool: terminal
+    <::: COMMAND
+    vitest run tests/loop.test.ts
+    :::> COMMAND
+    :::> TOOL_CALL[test_integration]
+  :::> BATCH[step_parallel_tests]
+
+  <::: TOOL_CALL[step_git_commit]
+  tool: terminal
+  <::: COMMAND
+  git add . && git commit -m "feat: complete refactoring"
+  :::> COMMAND
+  :::> TOOL_CALL[step_git_commit]
+
+:::> PIPELINE[ci_pipeline]
+}
+```
+
+---
+
+## 五、 基于栈的 AST 解析状态机实现算法
+
+### 1. 核心数据结构定义
+
+```typescript
+export enum NodeType {
+  ROOT = "ROOT",
+  PIPELINE = "PIPELINE",
+  BATCH = "BATCH",
+  TOOL_CALL = "TOOL_CALL",
+  CONTENT = "CONTENT",
+  COMMAND = "COMMAND",
+  BEFORE = "BEFORE",
+  AFTER = "AFTER",
+}
+
+export interface DiffHunk {
+  search: string;
+  replace: string;
+}
+
+export interface ASTNode {
+  type: NodeType;
+  id?: string;
+  metadata: Record<string, string>;
+  rawText: string;
+  children: ASTNode[];
+  hunks?: DiffHunk[];
+}
+```
+
+### 2. 状态机解析算法（Deterministic Parser Algorithm）
+
+```typescript
+export class ASTParser {
+  private stack: ASTNode[] = [];
+
+  parse(rawText: string): ASTNode | null {
+    const unwrap = this.unwrapRoot(rawText);
+    if (unwrap === null) return null; // 纯粹性校验失败，直接返回 null
+
+    const root: ASTNode = {
+      type: NodeType.ROOT,
+      metadata: {},
+      rawText: "",
+      children: [],
+    };
+    this.stack = [root];
+
+    const lines = unwrap.split(/\r?\n/);
+    for (const line of lines) {
+      this.consumeLine(line);
+    }
+
+    // 栈必须完全平衡回退到只剩 ROOT 节点
+    if (this.stack.length !== 1 || this.stack[0].type !== NodeType.ROOT) {
+      return null;
+    }
+
+    return root;
+  }
+
+  private consumeLine(line: string): void {
+    const top = this.stack[this.stack.length - 1];
+    const token = this.lexLine(line);
+
+    // 1. 普通文本行：追加到栈顶节点中
+    if (token === null) {
+      if (top.type === NodeType.TOOL_CALL) {
+        const kv = this.parseKeyValue(line);
+        if (kv) {
+          top.metadata[kv.key] = kv.value;
+          return;
+        }
+      }
+      top.rawText += (top.rawText ? "\n" : "") + line;
+      return;
+    }
+
+    // 2. 开启标记 <::: TYPE[ID]
+    if (token.kind === "OPEN") {
+      const allowed = ALLOWED_CHILDREN_MAP[top.type];
+      if (allowed && allowed.has(token.type)) {
+        const newNode: ASTNode = {
+          type: token.type,
+          id: token.id,
+          metadata: {},
+          rawText: "",
+          children: [],
+        };
+        top.children.push(newNode);
+        this.stack.push(newNode);
+      } else {
+        // 不在白名单内的标记，直接降级为纯文本字面量累加
+        top.rawText += (top.rawText ? "\n" : "") + line;
+      }
+      return;
+    }
+
+    // 3. 过渡标记 <::> TYPE[ID]
+    if (token.kind === "TRANSITION") {
+      const parent = this.stack[this.stack.length - 2];
+      if (parent && top.type === NodeType.BEFORE && token.type === NodeType.AFTER) {
+        // BEFORE -> AFTER 过渡
+        this.stack.pop(); // 出栈 BEFORE
+        const afterNode: ASTNode = {
+          type: NodeType.AFTER,
+          id: token.id,
+          metadata: {},
+          rawText: "",
+          children: [],
+        };
+        parent.children.push(afterNode);
+        this.stack.push(afterNode); // 入栈 AFTER
+      } else if (parent && top.type === NodeType.AFTER && token.type === NodeType.BEFORE) {
+        // AFTER -> BEFORE (多 Hunk 连续过渡)
+        this.stack.pop(); // 出栈前一个 AFTER
+        const beforeNode: ASTNode = {
+          type: NodeType.BEFORE,
+          id: token.id,
+          metadata: {},
+          rawText: "",
+          children: [],
+        };
+        parent.children.push(beforeNode);
+        this.stack.push(beforeNode); // 入栈新 BEFORE
+      } else {
+        top.rawText += (top.rawText ? "\n" : "") + line;
+      }
+      return;
+    }
+
+    // 4. 终结标记 :::> TYPE[ID]
+    if (token.kind === "CLOSE") {
+      if (top.type === token.type && (!token.id || top.id === token.id)) {
+        this.stack.pop(); // 成功闭合出栈
+      } else {
+        // 标记不匹配，作为普通文本累加
+        top.rawText += (top.rawText ? "\n" : "") + line;
+      }
+      return;
+    }
+  }
+
+  private unwrapRoot(text: string): string | null {
+    const trimmed = text.trim();
+    if (!trimmed.startsWith("{") || !trimmed.endsWith("}")) return null;
+    return trimmed.slice(1, -1).trim();
+  }
+
+  private parseKeyValue(line: string): { key: string; value: string } | null {
+    const match = /^([a-zA-Z0-9_]+)\s*:\s*(.*)$/.exec(line.trim());
+    if (match) return { key: match[1], value: match[2] };
+    return null;
+  }
+
+  private lexLine(line: string): { kind: "OPEN" | "TRANSITION" | "CLOSE"; type: NodeType; id?: string } | null {
+    const openMatch = /^\s*<:::\s*([A-Z_]+)(?:\[([a-zA-Z0-9_-]+)\])?\s*$/.exec(line);
+    if (openMatch) return { kind: "OPEN", type: openMatch[1] as NodeType, id: openMatch[2] };
+
+    const transMatch = /^\s*<::>\s*([A-Z_]+)(?:\[([a-zA-Z0-9_-]+)\])?\s*$/.exec(line);
+    if (transMatch) return { kind: "TRANSITION", type: transMatch[1] as NodeType, id: transMatch[2] };
+
+    const closeMatch = /^\s*:::>\s*([A-Z_]+)(?:\[([a-zA-Z0-9_-]+)\])?\s*$/.exec(line);
+    if (closeMatch) return { kind: "CLOSE", type: closeMatch[1] as NodeType, id: closeMatch[2] };
+
+    return null;
+  }
+}
+```
+
+---
+
+## 六、 扁平化转换与执行器契约对接
+
+AST 解析完成后，递归遍历语法树，将节点转换为系统执行器所需的契约对象：
+
+1. **`TOOL_CALL` 节点转换为 `ToolCall`**：
+   - `name = node.metadata.tool`；
+   - `arguments.path = node.metadata.path`；
+   - `arguments.base_version = node.metadata.base_version`；
+   - `arguments.start_line = parseInt(node.metadata.start_line)`；
+   - `arguments.line_count = parseInt(node.metadata.line_count)`；
+   - 若子节点包含 `CONTENT`：`arguments.content = contentNode.rawText`；
+   - 若子节点包含 `COMMAND`：`arguments.command = commandNode.rawText`；
+   - 若子节点包含 `BEFORE` 与 `AFTER` 配对序列：自动配对组装为 `arguments.hunks: DiffHunk[]`。
+2. **`PIPELINE` 与 `BATCH` 转换为 `CompositeToolCall`**：
+   - 保持原有的嵌套树状结构，直接输入执行引擎递归流控调度。
+
+---
+
+## 七、 实施路线图与 TDD 计划
+
+```text
+Phase 1: AST 词法与语法解析器核心落地 (src/brain/ast-parser.ts)
+  ├── 实现 Lexer (三大 Token: <:::, <::>, :::>)
+  ├── 实现 ASTParser (Pushdown Automaton 状态机)
+  ├── 严格实现 ALLOWED_CHILDREN_MAP 矩阵
+  └── 单元测试 tests/ast-parser.test.ts (覆盖纯粹性、N+1流式Diff、嵌套白名单、转义免疫)
+
+Phase 2: 知识库与 Schema 协议全面同步 (src/brain/knowledge.ts)
+  ├── 声明 8 个工具的标准参数元数据规范
+  └── 完整注入 { <::: TOOL_CALL[ID] ... :::> } 规则与 <::: BEFORE[1] <::> AFTER[1] 规范
+
+Phase 3: 桥服务与终端 CLI 执行引擎接入 (src/brain/gemini-bridge-thinking.ts & loop.ts)
+  ├── 用 ASTParser 替换脆弱的正规正则匹配
+  ├── 统一将 AST 转换为 ToolCallNode 树与 flatCalls
+  └── 强化执行流控 (Pipeline 阻断标记与 Batch 独立执行)
+
+Phase 4: 全量回归测试与质量检验
+  ├── 运行 pnpm build (0 错误类型构建)
+  └── 运行 pnpm test (100% 测试用例通过)
+```
+
+---
+
+## 八、 方案总结
+
+本方案在架构层面完成了关键重构：
+1. **统一性**：全系统所有工具与控制流彻底消灭 JSON 转义，统一为 `<::: TYPE[ID]` / `<::> TYPE[ID]` / `:::> TYPE[ID]` 体系；
+2. **数学完备**：基于上下文无关文法（CFG）与下推自动机，彻底根绝内层特殊字符导致的外层提前截断与误识别；
+3. **极度轻量与流线化**：$N+1$ 流式语法让大模型输出效率最大化，生成更流畅、更准确。

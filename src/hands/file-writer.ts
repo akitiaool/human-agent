@@ -1,6 +1,8 @@
 import { mkdir, readFile, writeFile } from "node:fs/promises";
 import { dirname } from "node:path";
-import { fail, ok, type ActionResult } from "../types/index.js";
+import { fail, ok, type ActionResult, type EditFileResult } from "../types/index.js";
+import type { DiffHunk } from "../brain/llm.js";
+import { applyHunks, computeVersionId } from "./diff-engine.js";
 
 function errnoCode(err: unknown, fallback: string): string {
   if (err instanceof Error) {
@@ -75,5 +77,50 @@ export class FileWriter {
       }
     }
     return ok(undefined);
+  }
+
+  /**
+   * 局部代码精确替换：具备快照版本校验（baseVersion 乐观锁）与原子多 Hunk 应用。
+   */
+  async editFile(
+    path: string,
+    hunks: readonly DiffHunk[],
+    baseVersion?: string,
+  ): Promise<ActionResult<EditFileResult>> {
+    let current: string;
+    try {
+      current = await readFile(path, "utf-8");
+    } catch (err) {
+      return fail(errnoCode(err, "READ_ERROR"), errnoMessage(err));
+    }
+
+    const currentVersion = computeVersionId(current);
+    if (baseVersion !== undefined && baseVersion !== currentVersion) {
+      return fail(
+        "VERSION_MISMATCH",
+        `文件版本不匹配：声明的 base_version 为 ${baseVersion}，但磁盘当前版本为 ${currentVersion}。请重新读取该文件。`,
+      );
+    }
+
+    const applyRes = applyHunks(current, hunks);
+    if (!applyRes.success) {
+      return fail(applyRes.error!.code, applyRes.error!.message);
+    }
+
+    const newContent = applyRes.data!;
+    if (newContent !== current) {
+      try {
+        await writeFile(path, newContent, "utf-8");
+      } catch (err) {
+        return fail(errnoCode(err, "WRITE_ERROR"), errnoMessage(err));
+      }
+    }
+
+    const newVersionId = computeVersionId(newContent);
+    return ok({
+      path,
+      newVersionId,
+      hunksApplied: hunks.length,
+    });
   }
 }

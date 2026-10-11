@@ -10,7 +10,7 @@ describe("FileReader", () => {
 
   beforeAll(async () => {
     dir = await mkdtemp(join(tmpdir(), "file-reader-"));
-    await writeFile(join(dir, "a.txt"), "hello world");
+    await writeFile(join(dir, "a.txt"), "hello world\nline 2\nline 3\nline 4");
     await mkdir(join(dir, "sub"));
     await writeFile(join(dir, "sub", "b.txt"), "hello code");
     await mkdir(join(dir, "sub", "node_modules"));
@@ -21,10 +21,22 @@ describe("FileReader", () => {
     await rm(dir, { recursive: true, force: true });
   });
 
-  it("读取存在的文件成功", async () => {
+  it("读取存在的文件成功并返回 versionId 与 totalLines", async () => {
     const result = await reader.readFile(join(dir, "a.txt"));
     expect(result.success).toBe(true);
-    expect(result.data).toBe("hello world");
+    expect(result.data?.content).toContain("hello world");
+    expect(result.data?.versionId).toMatch(/^v-[a-f0-9]{8}$/);
+    expect(result.data?.totalLines).toBe(4);
+  });
+
+  it("支持 start_line 与 line_count 切片读取并带行号输出", async () => {
+    const result = await reader.readFile(join(dir, "a.txt"), { startLine: 2, lineCount: 2 });
+    expect(result.success).toBe(true);
+    expect(result.data?.startLine).toBe(2);
+    expect(result.data?.endLine).toBe(3);
+    expect(result.data?.content).toContain("2 | line 2");
+    expect(result.data?.content).toContain("3 | line 3");
+    expect(result.data?.content).not.toContain("1 | hello world");
   });
 
   it("读取不存在的文件返回失败结果而非抛错", async () => {

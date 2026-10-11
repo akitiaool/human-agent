@@ -218,10 +218,14 @@ export class AgentLoop {
     }
   }
 
-  /** 反思裁决：放行的调用路由到器官执行，拦截的调用直接反馈错误（裁决规则在大脑，不在心脏）。 */
+  /** 反思裁决：按原 calls 顺序依次执行/拦截，放行的调用路由到器官执行，拦截的调用直接反馈错误。 */
   async #execute(calls: readonly ToolCall[], turnSignal: AbortSignal): Promise<void> {
     const verdict = await this.#brain.reflect(calls);
-    for (const call of verdict.allowed) {
+    const allowedSet = new Set(verdict.allowed);
+    const pendingSet = new Set(verdict.pending);
+    const blockedMap = new Map(verdict.blocked.map((item) => [item.call, item.result] as const));
+
+    for (const call of calls) {
       if (this.#signal.aborted) {
         this.#status = "INTERRUPTED";
         return;
@@ -230,55 +234,56 @@ export class AgentLoop {
         this.#output.warn("任务超时，已终止本轮。");
         return;
       }
-      this.#emit("ACTING", call.name);
-      const result = await executeTool(
-        { eyes: this.#eyes, hands: this.#hands },
-        call.name,
-        call.arguments,
-        turnSignal,
-      );
-      this.#finish(call.name, result);
-      this.#context.add({ role: "tool", name: call.name, content: JSON.stringify(result) });
-    }
-    for (const call of verdict.pending) {
-      if (this.#signal.aborted) {
-        this.#status = "INTERRUPTED";
-        return;
-      }
-      if (this.#turnTimedOut) {
-        this.#output.warn("任务超时，已终止本轮。");
-        return;
-      }
-      const isWrite = call.name === "write_file" || call.name === "apply_patch";
-      const prompt: ApprovalPrompt = {
-        tool: call.name,
-        key: matchKeyFor(call) ?? "",
-        kind: isWrite ? "path" : "exact",
-      };
-      const choice = await this.#mouth.askApproval(prompt);
-      if (choice.action === "deny") {
-        const denied = fail("USER_DENIED", `用户拒绝了工具调用: ${call.name}`);
-        this.#finish(call.name, denied);
-        this.#context.add({ role: "tool", name: call.name, content: JSON.stringify(denied) });
+
+      if (blockedMap.has(call)) {
+        const blockedResult = blockedMap.get(call)!;
+        this.#finish(call.name, blockedResult);
+        this.#context.add({ role: "tool", name: call.name, content: JSON.stringify(blockedResult) });
         continue;
       }
-      if (choice.action === "whitelist") {
-        await this.#brain.addWhitelistEntry(choice.entry);
-        this.#output.info(`已加入白名单：${choice.entry.tool} ${choice.entry.key}`);
+
+      if (allowedSet.has(call)) {
+        this.#emit("ACTING", call.name);
+        const result = await executeTool(
+          { eyes: this.#eyes, hands: this.#hands },
+          call.name,
+          call.arguments,
+          turnSignal,
+        );
+        this.#finish(call.name, result);
+        this.#context.add({ role: "tool", name: call.name, content: JSON.stringify(result) });
+        continue;
       }
-      this.#emit("ACTING", call.name);
-      const result = await executeTool(
-        { eyes: this.#eyes, hands: this.#hands },
-        call.name,
-        call.arguments,
-        turnSignal,
-      );
-      this.#finish(call.name, result);
-      this.#context.add({ role: "tool", name: call.name, content: JSON.stringify(result) });
-    }
-    for (const item of verdict.blocked) {
-      this.#finish(item.call.name, item.result);
-      this.#context.add({ role: "tool", name: item.call.name, content: JSON.stringify(item.result) });
+
+      if (pendingSet.has(call)) {
+        const isWrite = call.name === "write_file" || call.name === "apply_patch";
+        const prompt: ApprovalPrompt = {
+          tool: call.name,
+          key: matchKeyFor(call) ?? "",
+          kind: isWrite ? "path" : "exact",
+        };
+        const choice = await this.#mouth.askApproval(prompt);
+        if (choice.action === "deny") {
+          const denied = fail("USER_DENIED", `用户拒绝了工具调用: ${call.name}`);
+          this.#finish(call.name, denied);
+          this.#context.add({ role: "tool", name: call.name, content: JSON.stringify(denied) });
+          continue;
+        }
+        if (choice.action === "whitelist") {
+          await this.#brain.addWhitelistEntry(choice.entry);
+          this.#output.info(`已加入白名单：${choice.entry.tool} ${choice.entry.key}`);
+        }
+        this.#emit("ACTING", call.name);
+        const result = await executeTool(
+          { eyes: this.#eyes, hands: this.#hands },
+          call.name,
+          call.arguments,
+          turnSignal,
+        );
+        this.#finish(call.name, result);
+        this.#context.add({ role: "tool", name: call.name, content: JSON.stringify(result) });
+        continue;
+      }
     }
   }
 

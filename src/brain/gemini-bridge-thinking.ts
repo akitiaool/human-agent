@@ -1,16 +1,17 @@
 // 执行型桥服务（v3）：网页驱动对话，智能体只执行。
-// 接收网页内容（POST /result）→ 解析 ```tool_call``` → 统一 reflect 裁决
+// 接收网页内容（POST /result）→ ASTParser 状态机解析 → 统一 reflect 裁决
 // （黑名单绝对拒绝 / 未知与参数非法拦截 / 白名单放行 / 其余 pending）
 // → pending 经审批协议批量下发（GET /task 下发 approval + POST /approval 回裁决，
-//   可携带 whitelist 条目落盘）→ 共享执行器执行 → 序列化回填消息入队；插件经长轮询（GET /task）取回填。
-// 不再实现 BrainInference（无模型推理，不运行心脏循环）。
+//   可携带 whitelist 条目落盘）→ 共享执行器执行（支持 pipeline 链式依赖与 batch 独立执行，以及 edit_file 原生无转义 Diff）
+// → 序列化回填消息入队；插件经长轮询（GET /task）取回填。
 import http from "node:http";
 import type { AddressInfo } from "node:net";
 import { executeTool, type ToolOrgans } from "../heart/executor.js";
 import { matchKeyFor, normalizePath, toolMatches } from "../nose/policy.js";
+import { ASTParser, flattenToolCalls } from "./ast-parser.js";
 import type { ActionResult, EyesContract, HandsContract, WhitelistEntry } from "../types/index.js";
 import { fail } from "../types/index.js";
-import type { BrainInferenceResult, ToolCall } from "./llm.js";
+import type { BrainInferenceResult, ToolCall, ToolCallNode } from "./llm.js";
 import { BaseThinking, type BaseThinkingOptions } from "./thinking.js";
 
 export interface GeminiBridgeThinkingOptions extends BaseThinkingOptions {
@@ -36,30 +37,18 @@ type OutboxItem =
 /** 审批裁决：allowed 逐条对应危险命令顺序；timedOut 标记兜底超时（拒绝文案区分）。 */
 type ApprovalDecision = { allowed: boolean[]; timedOut: boolean };
 
-/** 容错解析 ```tool_call``` JSON 代码块：坏 JSON 块丢弃、其余原文拼回 text。 */
+/**
+ * 解析工具调用代码块（由 ASTParser 状态机执行确定性解析）。
+ * 零歧义铁律：如果回复包含任何非工具代码块的文本（解释、说明、闲聊），
+ * 100% 判定为普通文本对话，不执行任何工具。
+ */
 export function parseToolCalls(text: string): BrainInferenceResult {
-  const pattern = /```tool_call\s*\n([\s\S]*?)(?:\n)?```/g;
-  const calls: ToolCall[] = [];
-  for (const match of text.matchAll(pattern)) {
-    try {
-      const parsed = JSON.parse(match[1]!) as unknown;
-      if (isToolCall(parsed)) calls.push(parsed);
-    } catch {
-      // 坏 JSON 块丢弃
-    }
+  const parser = new ASTParser();
+  const res = parser.parseToInference(text);
+  if (res !== null) {
+    return res;
   }
-  const stripped = text.replace(pattern, "").trim();
-  return { text: stripped, ...(calls.length > 0 ? { toolCalls: calls } : {}) };
-}
-
-function isToolCall(value: unknown): value is ToolCall {
-  if (typeof value !== "object" || value === null) return false;
-  const candidate = value as Record<string, unknown>;
-  return (
-    typeof candidate.name === "string" &&
-    typeof candidate.arguments === "object" &&
-    candidate.arguments !== null
-  );
+  return { text: text.trim() };
 }
 
 /** 回填消息队列（outbox）+ 长轮询 waiter 的唤醒协议。 */
@@ -77,8 +66,6 @@ export class GeminiBridgeThinking extends BaseThinking {
   readonly #approvalTimeoutMs: number;
   /** 单批串行队列：一次只处理一批，避免并发批交错。 */
   #busy: Promise<void> = Promise.resolve();
-  /** 最近一次处理（含 tool_call）的内容，用于去重。 */
-  #lastContent: string | undefined;
   /** close() 后置位：此后到达的长轮询请求立即 204（close 时请求可能尚未到达服务端）。 */
   #closed = false;
 
@@ -113,9 +100,6 @@ export class GeminiBridgeThinking extends BaseThinking {
     this.#outbox.length = 0;
     for (const waiter of this.#waiters) waiter();
     this.#waiters.length = 0;
-    // 延迟关闭：挂起的长轮询可能在 close() 时尚未完成 TCP 连接/请求解析
-    // （此时会走到 #closed 分支立即 204），立即停监听会使其 fetch 收到
-    // ECONNREFUSED、立即强杀会截断 204；留出窗口让 204 送达后再清理。
     setTimeout(() => {
       this.#server.close();
       this.#server.closeIdleConnections();
@@ -184,7 +168,7 @@ export class GeminiBridgeThinking extends BaseThinking {
     res.end(JSON.stringify({ ok: true, protocol: this.toolProtocol() }));
   }
 
-  /** 收网页内容：校验 → 去重 → 解析 tool_call → 有则入串行队列；响应立即返回（不等待批完成）。 */
+  /** 收网页内容：校验 → 解析 tool_call → 有则入串行队列；响应立即返回。 */
   #handleResultRequest(req: http.IncomingMessage, res: http.ServerResponse): void {
     readJsonBody(req).then(
       (body) => {
@@ -207,25 +191,25 @@ export class GeminiBridgeThinking extends BaseThinking {
     );
   }
 
-  /** 去重（与最近一次处理内容完全相同则不处理）→ 解析 tool_call；无则不排队。 */
+  /** 解析 tool_call → 有则入串行队列。重复控制属模型侧（失败重试等场景需要重复执行），服务端不做静默去重。 */
   #enqueue(reply: string): boolean {
-    if (reply === this.#lastContent) return false;
-    const calls = parseToolCalls(reply).toolCalls ?? [];
-    if (calls.length === 0) return false;
-    this.#lastContent = reply;
-    this.#busy = this.#busy.then(() => this.#process(calls));
+    const parsed = parseToolCalls(reply);
+    const nodes = parsed.toolTree ?? (parsed.toolCalls ? parsed.toolCalls : []);
+    if (nodes.length === 0) return false;
+    this.#busy = this.#busy.then(() => this.#process(nodes));
     return true;
   }
 
-  /** 单批流水线：统一裁决（黑名单/未知/非法/白名单/需授权）→ 需授权的批量审批 → 按原 calls 顺序执行/拒绝 → 回填。 */
-  async #process(calls: readonly ToolCall[]): Promise<void> {
+  /** 单批流水线：统一裁决 → 需授权的批量审批 → 执行流控（支持 pipeline 短路与 batch 独立执行）→ 回填。 */
+  async #process(nodes: readonly ToolCallNode[]): Promise<void> {
     if (this.#signal.aborted) return; // 全局中断：丢弃批次
     const batchSignal =
       this.#timeoutMs > 0
         ? AbortSignal.any([this.#signal, AbortSignal.timeout(this.#timeoutMs)])
         : this.#signal;
 
-    const verdict = await this.reflect(calls);
+    const flatCalls = flattenToolCalls(nodes);
+    const verdict = await this.reflect(flatCalls);
     const pending = verdict.pending;
 
     // 批量审批：一条请求含全部待授权调用；批中止时作废审批条目并清除兜底定时器
@@ -247,42 +231,80 @@ export class GeminiBridgeThinking extends BaseThinking {
     const blockedMap = new Map(verdict.blocked.map((item) => [item.call, item.result] as const));
     const decisions = decision?.allowed ?? [];
     const lines: string[] = [];
-    let index = 0;
+    let lineIndex = 0;
     let pendingIndex = 0;
-    for (const call of calls) {
-      // 原 calls 顺序执行与输出（执行顺序 = 原顺序，逐条串行）
-      let toRun: ToolCall | undefined;
-      let blockedResult: ActionResult<unknown> | undefined;
-      if (blockedMap.has(call)) {
-        blockedResult = blockedMap.get(call);
-      } else if (allowedSet.has(call)) {
-        toRun = call;
-      } else if (pendingSet.has(call)) {
-        const allowed = decisions[pendingIndex++] ?? false;
-        if (allowed) {
+
+    const executeNode = async (node: ToolCallNode, isBlockedByParent: boolean): Promise<boolean> => {
+      if (batchSignal.aborted) return false;
+      if ("name" in node && typeof (node as ToolCall).name === "string") {
+        const call = node as ToolCall;
+        lineIndex++;
+        const idx = lineIndex;
+        if (isBlockedByParent) {
+          const blockedRes = fail("DEPENDENCY_BLOCKED", "前序依赖步骤执行失败或被拒绝，已跳过");
+          lines.push(serializeBlockedLine(idx, call, blockedRes));
+          return false;
+        }
+        let toRun: ToolCall | undefined;
+        let blockedResult: ActionResult<unknown> | undefined;
+        if (blockedMap.has(call)) {
+          blockedResult = blockedMap.get(call);
+        } else if (allowedSet.has(call)) {
           toRun = call;
-        } else {
-          blockedResult = fail("USER_DENIED", decision?.timedOut === true ? "审批超时，未执行" : "用户未授权，未执行");
+        } else if (pendingSet.has(call)) {
+          const allowed = decisions[pendingIndex++] ?? false;
+          if (allowed) {
+            toRun = call;
+          } else {
+            blockedResult = fail("USER_DENIED", decision?.timedOut === true ? "审批超时，未执行" : "用户未授权，未执行");
+          }
         }
-      }
-      if (toRun !== undefined) {
-        index++;
-        if (batchSignal.aborted) break; // 批中止：停止执行
-        let result: ActionResult<unknown>;
-        try {
-          result = await Promise.race([
-            executeTool(this.#organs, toRun.name, toRun.arguments, batchSignal),
-            abortSignalPromise(batchSignal),
-          ]);
-        } catch {
-          break; // 批 signal 已中止（执行未在超时前返回）
+
+        if (toRun !== undefined) {
+          let result: ActionResult<unknown>;
+          try {
+            result = await Promise.race([
+              executeTool(this.#organs, toRun.name, toRun.arguments, batchSignal),
+              abortSignalPromise(batchSignal),
+            ]);
+          } catch {
+            return false;
+          }
+          lines.push(serializeResultLine(idx, toRun, result));
+          return result.success;
+        } else if (blockedResult !== undefined) {
+          lines.push(serializeBlockedLine(idx, call, blockedResult));
+          return blockedResult.success;
         }
-        lines.push(serializeResultLine(index, toRun, result));
-      } else if (blockedResult !== undefined) {
-        index++;
-        lines.push(serializeBlockedLine(index, call, blockedResult));
+        return false;
       }
+
+      if ("mode" in node && node.mode === "pipeline") {
+        let pipelineFailed = isBlockedByParent;
+        for (const child of node.calls) {
+          const childSuccess = await executeNode(child, pipelineFailed);
+          if (!childSuccess) {
+            pipelineFailed = true;
+          }
+        }
+        return !pipelineFailed;
+      } else if ("mode" in node && node.mode === "batch") {
+        let batchAllSuccess = true;
+        for (const child of node.calls) {
+          const childSuccess = await executeNode(child, isBlockedByParent);
+          if (!childSuccess) {
+            batchAllSuccess = false;
+          }
+        }
+        return batchAllSuccess && !isBlockedByParent;
+      }
+      return false;
+    };
+
+    for (const node of nodes) {
+      await executeNode(node, false);
     }
+
     if (this.#signal.aborted) return; // 全局中断：丢弃批次不排队
     if (batchSignal.aborted) {
       this.#pushMessage(`⚠️ 工具执行超时（超过 ${this.#timeoutMs}ms），已终止`);
@@ -302,7 +324,7 @@ export class GeminiBridgeThinking extends BaseThinking {
     if (waiter !== undefined) waiter();
   }
 
-  /** 审批请求入队并返回裁决 promise 与 cancel（作废条目 + 清除兜底定时器）；兜底超时（approvalTimeoutMs）全部按拒绝。 */
+  /** 审批请求入队并返回裁决 promise 与 cancel；兜底超时（approvalTimeoutMs）全部按拒绝。 */
   #requestApproval(calls: readonly ToolCall[]): {
     id: number;
     promise: Promise<ApprovalDecision>;
@@ -333,7 +355,7 @@ export class GeminiBridgeThinking extends BaseThinking {
     };
   }
 
-  /** 收扩展审批结果：校验 allowed 与 whitelist → 放行（whitelist 条目落盘）→ settle；未知 id（已超时/已处理）→ 404。 */
+  /** 收扩展审批结果：校验 allowed 与 whitelist → 放行 → settle；未知 id → 404。 */
   #handleApprovalRequest(req: http.IncomingMessage, res: http.ServerResponse): void {
     readJsonBody(req).then(
       (body) => {
@@ -372,7 +394,7 @@ export class GeminiBridgeThinking extends BaseThinking {
     );
   }
 
-  /** 校验：每条目必须对应本批中 allowed=true 的调用（exact：tool+key 与匹配键完全一致；path：此路径或此目录）。 */
+  /** 校验：每条目必须对应本批中 allowed=true 的调用。 */
   #isValidWhitelist(raw: unknown[], calls: readonly ToolCall[], allowed: boolean[]): boolean {
     const allowedCalls = calls.filter((_, i) => allowed[i] === true);
     return raw.every((item) => {
@@ -385,19 +407,19 @@ export class GeminiBridgeThinking extends BaseThinking {
         if (entry.kind === "exact") {
           return toolMatches(entry.tool, call.name) && entry.key === matchKeyFor(call);
         }
-        if (call.name !== "write_file" && call.name !== "apply_patch") return false;
+        if (call.name !== "write_file" && call.name !== "apply_patch" && call.name !== "edit_file") return false;
         const path = typeof call.arguments.path === "string" ? normalizePath(call.arguments.path) : "";
         if (!toolMatches(entry.tool, call.name)) return false;
         if (entry.key === path) return true; // 文件条目
         const i = path.lastIndexOf("/");
-        if (i <= 0 || (i === 2 && path[1] === ":")) return false; // 根级/盘符根：仅文件条目，dir 条目拒绝
+        if (i <= 0 || (i === 2 && path[1] === ":")) return false;
         return entry.key === `${path.slice(0, i)}/`;
       });
     });
   }
 }
 
-/** 批 signal 中止即拒绝（与工具执行赛跑：超时/中断时快速放弃本轮，不阻塞回填）。 */
+/** 批 signal 中止即拒绝。 */
 function abortSignalPromise(signal: AbortSignal): Promise<never> {
   return new Promise((_, reject) => {
     if (signal.aborted) reject(new DOMException("aborted", "AbortError"));
@@ -414,14 +436,16 @@ function abortSignalPromise(signal: AbortSignal): Promise<never> {
 /** 回填消息格式：`N. 工具 {name} 参数 {args} → 成功/失败`，附 ActionResult JSON 代码块。 */
 function serializeResultLine(index: number, call: ToolCall, result: ActionResult<unknown>): string {
   const status = result.success ? "成功" : "失败";
-  return `${index}. 工具 ${call.name} 参数 ${JSON.stringify(call.arguments)} → ${status}：\n\`\`\`json\n${JSON.stringify(result)}\n\`\`\``;
+  const fence = "```";
+  return `${index}. 工具 ${call.name} 参数 ${JSON.stringify(call.arguments)} → ${status}：\n${fence}json\n${JSON.stringify(result)}\n${fence}`;
 }
 
-/** 拒绝行：`已拒绝（{错误码}：{原因}）`；原因统一取 error.message（含「用户未授权，未执行」/「审批超时，未执行」等）。 */
+/** 拒绝/阻断行：`已拒绝/已阻断（{错误码}：{原因}）`。 */
 function serializeBlockedLine(index: number, call: ToolCall, result: ActionResult<unknown>): string {
   const code = result.error?.code ?? "UNKNOWN";
   const reason = result.error?.message ?? JSON.stringify(result);
-  return `${index}. 工具 ${call.name} 参数 ${JSON.stringify(call.arguments)} → 已拒绝（${code}：${reason}）`;
+  const status = code === "DEPENDENCY_BLOCKED" ? "已阻断" : "已拒绝";
+  return `${index}. 工具 ${call.name} 参数 ${JSON.stringify(call.arguments)} → ${status}（${code}：${reason}）`;
 }
 
 function serializeFeedback(lines: string[]): string {

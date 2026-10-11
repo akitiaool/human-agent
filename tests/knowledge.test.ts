@@ -3,12 +3,13 @@ import { z } from "zod";
 import { schemas, serializeToolProtocol, TOOLS } from "../src/brain/knowledge.js";
 
 describe("brain/knowledge", () => {
-  it("知识库包含 7 个工具且名称齐全", () => {
+  it("知识库包含 8 个工具且名称齐全（含 edit_file）", () => {
     expect(TOOLS.map((tool) => tool.name)).toEqual([
       "read_file",
       "read_dir",
       "search_code",
       "write_file",
+      "edit_file",
       "apply_patch",
       "terminal",
       "fetch_page",
@@ -29,12 +30,24 @@ describe("brain/knowledge", () => {
     }
   });
 
-  it("read_file 的 schema 要求 path 为字符串", () => {
+  it("read_file 的 schema 要求 path 为字符串，且支持 start_line 与 line_count", () => {
     const jsonSchema = z.toJSONSchema(schemas.read_file) as {
       properties: Record<string, unknown>;
       required?: string[];
     };
-    expect(jsonSchema.properties.path).toEqual({ type: "string" });
+    expect(jsonSchema.properties.path).toEqual({ type: "string", description: "文件路径" });
+    expect(jsonSchema.properties.start_line).toBeDefined();
+    expect(jsonSchema.properties.line_count).toBeDefined();
+    expect(jsonSchema.required).toEqual(["path"]);
+  });
+
+  it("edit_file 的 schema 要求 path 为字符串，base_version 为可选字符串", () => {
+    const jsonSchema = z.toJSONSchema(schemas.edit_file) as {
+      properties: Record<string, unknown>;
+      required?: string[];
+    };
+    expect(jsonSchema.properties.path).toBeDefined();
+    expect(jsonSchema.properties.base_version).toBeDefined();
     expect(jsonSchema.required).toEqual(["path"]);
   });
 
@@ -47,8 +60,12 @@ describe("brain/knowledge", () => {
     const protocol = serializeToolProtocol();
     expect(protocol).toContain("【human-agent 工具协议】");
     expect(protocol).toContain("read_file");
+    expect(protocol).toContain("edit_file");
     expect(protocol).toContain("fetch_page");
-    expect(protocol).toContain("一次只调用一个工具");
-    expect(protocol).toContain("```tool_call");
+    expect(protocol).toContain("纯粹性铁律");
+    expect(protocol).toContain("<::: TOOL_CALL[1]");
+    expect(protocol).toContain("<::: BEFORE[1]");
+    expect(protocol).toContain("<::> AFTER[1]");
+    expect(protocol).toContain(":::> AFTER[2]");
   });
 });

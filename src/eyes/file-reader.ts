@@ -1,6 +1,7 @@
 import { readdir, readFile } from "node:fs/promises";
 import { join, relative } from "node:path";
-import { fail, ok, type ActionResult } from "../types/index.js";
+import { fail, ok, type ActionResult, type ReadFileResult } from "../types/index.js";
+import { computeVersionId } from "../hands/diff-engine.js";
 
 const SKIP_DIRS = new Set(["node_modules", ".git", "dist"]);
 
@@ -17,9 +18,42 @@ function errnoMessage(err: unknown): string {
 }
 
 export class FileReader {
-  async readFile(path: string): Promise<ActionResult<string>> {
+  async readFile(
+    path: string,
+    options?: { startLine?: number | undefined; lineCount?: number | undefined },
+  ): Promise<ActionResult<ReadFileResult>> {
     try {
-      return ok(await readFile(path, "utf-8"));
+      const raw = await readFile(path, "utf-8");
+      const versionId = computeVersionId(raw);
+      const lines = raw.split("\n");
+      const totalLines = lines.length;
+
+      if (options?.startLine !== undefined || options?.lineCount !== undefined) {
+        const start = Math.max(1, options?.startLine ?? 1);
+        const count = Math.max(1, options?.lineCount ?? totalLines);
+        const end = Math.min(totalLines, start + count - 1);
+        const slice = lines.slice(start - 1, end);
+
+        // 带行号格式化，便于大模型精确定位
+        const padLen = String(end).length;
+        const numbered = slice
+          .map((line, idx) => `${String(start + idx).padStart(padLen, " ")} | ${line}`)
+          .join("\n");
+
+        return ok({
+          content: numbered,
+          versionId,
+          totalLines,
+          startLine: start,
+          endLine: end,
+        });
+      }
+
+      return ok({
+        content: raw,
+        versionId,
+        totalLines,
+      });
     } catch (err) {
       return fail(errnoCode(err, "READ_ERROR"), errnoMessage(err));
     }

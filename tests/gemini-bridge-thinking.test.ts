@@ -1,9 +1,10 @@
 import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { afterAll, afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { afterAll, afterEach, beforeEach, describe, expect, it } from "vitest";
 import { GeminiBridgeThinking, parseToolCalls } from "../src/brain/gemini-bridge-thinking.js";
 import type { ActionResult, EyesContract, HandsContract, WhitelistEntry } from "../src/types/index.js";
+import { fail } from "../src/types/index.js";
 
 const tmpDir = mkdtempSync(join(tmpdir(), "bridge-wl-"));
 const tmpFile = join(tmpDir, "whitelist.json");
@@ -15,11 +16,15 @@ function seedWhitelist(workspace: string, entries: WhitelistEntry[]): void {
   writeFileSync(tmpFile, JSON.stringify({ [workspace]: entries }), "utf8");
 }
 
-// 记录型 stub 器官：断言"执行了哪些工具"而不真跑命令
+// 记录型 stub 器官
 function makeRecordingOrgans() {
   const calls: Array<{ name: string; args: Record<string, unknown> }> = [];
   const eyes: EyesContract = {
-    readFile: async (path) => { calls.push({ name: "read_file", args: { path } }); return ok({ content: `内容:${path}` }); },
+    readFile: async (path, options) => {
+      calls.push({ name: "read_file", args: { path, ...options } });
+      if (path === "bad.txt") return fail("FILE_NOT_FOUND", "文件不存在");
+      return ok({ content: `内容:${path}`, versionId: "v-test1234", totalLines: 10 });
+    },
     readDir: async (path) => { calls.push({ name: "read_dir", args: { path } }); return ok(["a.txt"]); },
     searchCode: async (pattern, dir) => { calls.push({ name: "search_code", args: { pattern, dir } }); return ok([]); },
     fetchPageAsMarkdown: async (url) => { calls.push({ name: "fetch_page", args: { url } }); return ok("# 网页"); },
@@ -27,9 +32,14 @@ function makeRecordingOrgans() {
   const hands: HandsContract = {
     writeFile: async (path, content) => { calls.push({ name: "write_file", args: { path, content } }); return ok(undefined); },
     applyPatch: async (path, patch) => { calls.push({ name: "apply_patch", args: { path, patch } }); return ok(undefined); },
+    editFile: async (path, hunks, baseVersion) => {
+      calls.push({ name: "edit_file", args: { path, hunks, baseVersion } });
+      return ok({ path, newVersionId: "v-new1234", hunksApplied: hunks.length });
+    },
     executeCommand: async (command, _signal, timeoutMs) => {
       calls.push({ name: "terminal", args: { command, timeoutMs } });
       if (command === "slow") await new Promise((r) => setTimeout(r, 10_000));
+      if (command === "fail-cmd") return fail("COMMAND_FAILED", "命令失败");
       return ok({ stdout: `输出:${command}`, exitCode: 0 });
     },
   };
@@ -68,14 +78,12 @@ type OutboxBody =
   | { type: "message"; message: string }
   | { type: "approval"; id: number; calls: Array<{ name: string; arguments: Record<string, unknown> }> };
 
-/** 长轮询取一条出队消息；无消息时服务端 25s 后 204（测试不等待该路径）。 */
 async function getMessage(port: number): Promise<OutboxBody | null> {
   const res = await fetch(`http://127.0.0.1:${port}/task`);
   if (res.status === 204) return null;
   return (await res.json()) as OutboxBody;
 }
 
-/** 限时取一条出队消息；超时返回 null（挂起的 GET /task 由 afterEach bridge.close() 释放）。 */
 async function tryGetMessage(port: number, ms: number): Promise<OutboxBody | null> {
   return Promise.race([
     getMessage(port),
@@ -83,7 +91,6 @@ async function tryGetMessage(port: number, ms: number): Promise<OutboxBody | nul
   ]);
 }
 
-/** 取回填文本消息（非审批类型时抛错）。 */
 async function getMessageText(port: number): Promise<string> {
   const body = await getMessage(port);
   if (body === null) throw new Error("expected message, got 204");
@@ -91,7 +98,6 @@ async function getMessageText(port: number): Promise<string> {
   return body.message;
 }
 
-/** 提交审批结果（可携带 whitelist 条目），返回 HTTP 状态码。 */
 async function postApproval(port: number, id: number, allowed: boolean[], whitelist?: WhitelistEntry[]): Promise<number> {
   const body: Record<string, unknown> = { id, allowed };
   if (whitelist !== undefined && whitelist.length > 0) body.whitelist = whitelist;
@@ -113,45 +119,137 @@ async function postReply(port: number, reply: string): Promise<{ ok: boolean; pr
   return (await res.json()) as { ok: boolean; processed: boolean };
 }
 
-const toolCall = (name: string, args: object) =>
-  ["```tool_call", JSON.stringify({ name, arguments: args }), "```"].join("\n");
+/** 构造标准的全新语法指令 */
+function toolCall(tool: string, args: Record<string, unknown>, id = "1"): string {
+  const lines = ["{", `<::: TOOL_CALL[${id}]`, `tool: ${tool}`];
+  for (const [k, v] of Object.entries(args)) {
+    if (k === "content") {
+      lines.push("<::: CONTENT", String(v), ":::> CONTENT");
+    } else if (k === "command") {
+      lines.push("<::: COMMAND", String(v), ":::> COMMAND");
+    } else if (k === "patch") {
+      lines.push("<::: CONTENT", String(v), ":::> CONTENT");
+    } else {
+      lines.push(`${k}: ${v}`);
+    }
+  }
+  lines.push(`:::> TOOL_CALL[${id}]`, "}");
+  return lines.join("\n");
+}
 
-describe("parseToolCalls", () => {
+describe("parseToolCalls AST 状态机解析器", () => {
   it("纯文本不产生 toolCalls", () => {
     const result = parseToolCalls("你好，我是 human-agent");
     expect(result.text).toBe("你好，我是 human-agent");
     expect(result.toolCalls).toBeUndefined();
   });
 
-  it("解析 tool_call 代码块，说明文字保留为 text", () => {
-    const reply = ["让我先看看文件。", "```tool_call", '{"name": "read_file", "arguments": {"path": "a.txt"}}', "```"].join("\n");
+  it("零歧义铁律：包含说明文字的回复视为普通对话，不产生 toolCalls", () => {
+    const reply = [
+      "让我先看看文件：",
+      "{",
+      "<::: TOOL_CALL[1]",
+      "tool: read_file",
+      "path: a.txt",
+      ":::> TOOL_CALL[1]",
+      "}",
+    ].join("\n");
     const result = parseToolCalls(reply);
-    expect(result.text).toBe("让我先看看文件。");
+    expect(result.text).toContain("让我先看看文件：");
+    expect(result.toolCalls).toBeUndefined();
+  });
+
+  it("标准工具调用正确解析为 toolCalls", () => {
+    const reply = [
+      "{",
+      "<::: TOOL_CALL[1]",
+      "tool: read_file",
+      "path: a.txt",
+      ":::> TOOL_CALL[1]",
+      "}",
+    ].join("\n");
+    const result = parseToolCalls(reply);
+    expect(result.text).toBe("");
     expect(result.toolCalls).toEqual([{ name: "read_file", arguments: { path: "a.txt" } }]);
   });
 
-  it("坏 JSON 块丢弃且原文拼回 text", () => {
-    const reply = ["```tool_call", '{"name": "read_file", "arguments": {"path": }}', "```", "后面还有说明"].join("\n");
+  it("未闭合的块返回 null 并判定为普通文本", () => {
+    const reply = [
+      "{",
+      "<::: TOOL_CALL[1]",
+      "tool: read_file",
+      "path: a.txt",
+      "}",
+    ].join("\n");
     const result = parseToolCalls(reply);
     expect(result.toolCalls).toBeUndefined();
-    expect(result.text).toBe("后面还有说明");
   });
 
-  it("多个块逐一解析，坏块不影响好块", () => {
+  it("多个纯块逐一解析", () => {
     const reply = [
-      "```tool_call",
-      '{"name": "read_file", "arguments": {"path": "a.txt"}}',
-      "```",
-      "```tool_call",
-      "not json",
-      "```",
-      "```tool_call",
-      '{"name": "terminal", "arguments": {"command": "echo hi"}}',
-      "```",
+      "{",
+      "<::: TOOL_CALL[1]",
+      "tool: read_file",
+      "path: a.txt",
+      ":::> TOOL_CALL[1]",
+      "<::: TOOL_CALL[2]",
+      "tool: terminal",
+      "<::: COMMAND",
+      "echo hi",
+      ":::> COMMAND",
+      ":::> TOOL_CALL[2]",
+      "}",
     ].join("\n");
     const result = parseToolCalls(reply);
     expect(result.toolCalls).toHaveLength(2);
     expect(result.toolCalls![1]).toEqual({ name: "terminal", arguments: { command: "echo hi" } });
+  });
+
+  it("解析 PIPELINE 复合结构", () => {
+    const reply = [
+      "{",
+      "<::: PIPELINE[p1]",
+      "  <::: TOOL_CALL[1]",
+      "  tool: write_file",
+      "  path: a.ts",
+      "  <::: CONTENT",
+      "  x",
+      "  :::> CONTENT",
+      "  :::> TOOL_CALL[1]",
+      "  <::: TOOL_CALL[2]",
+      "  tool: terminal",
+      "  <::: COMMAND",
+      "  pnpm test",
+      "  :::> COMMAND",
+      "  :::> TOOL_CALL[2]",
+      ":::> PIPELINE[p1]",
+      "}",
+    ].join("\n");
+    const result = parseToolCalls(reply);
+    expect(result.toolCalls).toHaveLength(2);
+    expect(result.toolTree).toHaveLength(1);
+    expect(result.toolTree![0]).toMatchObject({ mode: "pipeline" });
+  });
+
+  it("解析 BATCH 复合结构", () => {
+    const reply = [
+      "{",
+      "<::: BATCH[b1]",
+      "  <::: TOOL_CALL[1]",
+      "  tool: read_file",
+      "  path: a.txt",
+      "  :::> TOOL_CALL[1]",
+      "  <::: TOOL_CALL[2]",
+      "  tool: read_file",
+      "  path: b.txt",
+      "  :::> TOOL_CALL[2]",
+      ":::> BATCH[b1]",
+      "}",
+    ].join("\n");
+    const result = parseToolCalls(reply);
+    expect(result.toolCalls).toHaveLength(2);
+    expect(result.toolTree).toHaveLength(1);
+    expect(result.toolTree![0]).toMatchObject({ mode: "batch" });
   });
 });
 
@@ -169,7 +267,7 @@ describe("GeminiBridgeThinking 执行型桥服务", () => {
     expect(await tryGetMessage(port, 300)).toBeNull(); // 协议不再作为任务消息入队
   });
 
-  it("含 tool_call 的内容执行后回填结果消息", async () => {
+  it("含工具调用的内容执行后回填结果消息", async () => {
     seedWhitelist("/ws-test", [{ tool: "read_file", key: '{"path":"a.txt"}', kind: "exact" }]);
     const { port, organs } = await makeBridge();
     const res = await postReply(port, toolCall("read_file", { path: "a.txt" }));
@@ -181,22 +279,32 @@ describe("GeminiBridgeThinking 执行型桥服务", () => {
     expect(organs.calls).toEqual([{ name: "read_file", args: { path: "a.txt" } }]);
   });
 
-  it("无 tool_call 的内容不回填", async () => {
+  it("无工具调用的内容不回填", async () => {
     const { port, organs } = await makeBridge();
     const res = await postReply(port, "纯文本回复");
     expect(res.processed).toBe(false);
     expect(organs.calls).toEqual([]);
   });
 
-  it("多个 tool_call 汇总为一条消息并全部执行", async () => {
+  it("多个工具调用汇总为一条消息并全部执行", async () => {
     seedWhitelist("/ws-test", [
       { tool: "read_file", key: '{"path":"a.txt"}', kind: "exact" },
       { tool: "terminal", key: "echo hi", kind: "exact" },
     ]);
     const { port, organs } = await makeBridge();
     const reply = [
-      toolCall("read_file", { path: "a.txt" }),
-      toolCall("terminal", { command: "echo hi" }),
+      "{",
+      "<::: TOOL_CALL[1]",
+      "tool: read_file",
+      "path: a.txt",
+      ":::> TOOL_CALL[1]",
+      "<::: TOOL_CALL[2]",
+      "tool: terminal",
+      "<::: COMMAND",
+      "echo hi",
+      ":::> COMMAND",
+      ":::> TOOL_CALL[2]",
+      "}",
     ].join("\n");
     const res = await postReply(port, reply);
     expect(res.processed).toBe(true);
@@ -206,20 +314,96 @@ describe("GeminiBridgeThinking 执行型桥服务", () => {
     expect(organs.calls).toHaveLength(2);
   });
 
+  it("pipeline 模式：前序工具失败后阻断后续工具执行（DEPENDENCY_BLOCKED）", async () => {
+    seedWhitelist("/ws-test", [
+      { tool: "read_file", key: '{"path":"bad.txt"}', kind: "exact" },
+      { tool: "terminal", key: "echo next", kind: "exact" },
+    ]);
+    const { port, organs } = await makeBridge();
+    const reply = [
+      "{",
+      "<::: PIPELINE[p1]",
+      "  <::: TOOL_CALL[1]",
+      "  tool: read_file",
+      "  path: bad.txt",
+      "  :::> TOOL_CALL[1]",
+      "  <::: TOOL_CALL[2]",
+      "  tool: terminal",
+      "  <::: COMMAND",
+      "  echo next",
+      "  :::> COMMAND",
+      "  :::> TOOL_CALL[2]",
+      ":::> PIPELINE[p1]",
+      "}",
+    ].join("\n");
+    const res = await postReply(port, reply);
+    expect(res.processed).toBe(true);
+    const message = await getMessageText(port);
+    expect(message).toContain("1. 工具 read_file");
+    expect(message).toContain("失败");
+    expect(message).toContain("2. 工具 terminal");
+    expect(message).toContain("已阻断（DEPENDENCY_BLOCKED");
+    expect(organs.calls).toEqual([{ name: "read_file", args: { path: "bad.txt" } }]);
+  });
+
+  it("batch 模式：前序工具失败不影响后续工具独立执行", async () => {
+    seedWhitelist("/ws-test", [
+      { tool: "read_file", key: '{"path":"bad.txt"}', kind: "exact" },
+      { tool: "terminal", key: "echo next", kind: "exact" },
+    ]);
+    const { port, organs } = await makeBridge();
+    const reply = [
+      "{",
+      "<::: BATCH[b1]",
+      "  <::: TOOL_CALL[1]",
+      "  tool: read_file",
+      "  path: bad.txt",
+      "  :::> TOOL_CALL[1]",
+      "  <::: TOOL_CALL[2]",
+      "  tool: terminal",
+      "  <::: COMMAND",
+      "  echo next",
+      "  :::> COMMAND",
+      "  :::> TOOL_CALL[2]",
+      ":::> BATCH[b1]",
+      "}",
+    ].join("\n");
+    const res = await postReply(port, reply);
+    expect(res.processed).toBe(true);
+    const message = await getMessageText(port);
+    expect(message).toContain("1. 工具 read_file");
+    expect(message).toContain("失败");
+    expect(message).toContain("2. 工具 terminal");
+    expect(message).toContain("成功");
+    expect(organs.calls).toHaveLength(2);
+  });
+
   it("未列入白名单的调用下发审批，未授权不执行", async () => {
     const { port, organs } = await makeBridge({ workspace: "/ws-test" });
     const res = await postReply(port, toolCall("terminal", { command: "echo hi" }));
     expect(res.processed).toBe(true);
     const body = await getMessage(port);
-    expect(body?.type).toBe("approval"); // 审批请求而非自动执行
-    expect(organs.calls).toEqual([]); // 未授权前不执行
+    expect(body?.type).toBe("approval");
+    expect(organs.calls).toEqual([]);
   });
 
   it("多个未列调用合并为一条审批请求", async () => {
     const { port } = await makeBridge({ workspace: "/ws-test" });
     const reply = [
-      toolCall("terminal", { command: "git push --force origin main" }),
-      toolCall("terminal", { command: "echo hi" }),
+      "{",
+      "<::: TOOL_CALL[1]",
+      "tool: terminal",
+      "<::: COMMAND",
+      "git push --force origin main",
+      ":::> COMMAND",
+      ":::> TOOL_CALL[1]",
+      "<::: TOOL_CALL[2]",
+      "tool: terminal",
+      "<::: COMMAND",
+      "echo hi",
+      ":::> COMMAND",
+      ":::> TOOL_CALL[2]",
+      "}",
     ].join("\n");
     const res = await postReply(port, reply);
     expect(res.processed).toBe(true);
@@ -248,8 +432,20 @@ describe("GeminiBridgeThinking 执行型桥服务", () => {
   it("审批逐条裁决：允许的执行、拒绝的生成拒绝行", async () => {
     const { port, organs } = await makeBridge({ workspace: "/ws-test" });
     const reply = [
-      toolCall("terminal", { command: "ls -la" }),
-      toolCall("terminal", { command: "echo ok" }),
+      "{",
+      "<::: TOOL_CALL[1]",
+      "tool: terminal",
+      "<::: COMMAND",
+      "ls -la",
+      ":::> COMMAND",
+      ":::> TOOL_CALL[1]",
+      "<::: TOOL_CALL[2]",
+      "tool: terminal",
+      "<::: COMMAND",
+      "echo ok",
+      ":::> COMMAND",
+      ":::> TOOL_CALL[2]",
+      "}",
     ].join("\n");
     await postReply(port, reply);
     const body = await getMessage(port);
@@ -274,7 +470,7 @@ describe("GeminiBridgeThinking 执行型桥服务", () => {
     await postReply(port, toolCall("terminal", { command: "echo hi" }));
     const body = await getMessage(port);
     expect(body?.type).toBe("approval");
-    const message = await getMessageText(port); // 50ms 兜底超时后回填拒绝行
+    const message = await getMessageText(port);
     expect(message).toContain("审批超时");
     expect(message).toContain("已拒绝");
     expect(organs.calls).toEqual([]);
@@ -287,7 +483,7 @@ describe("GeminiBridgeThinking 执行型桥服务", () => {
     expect(body?.type).toBe("approval");
     bridge.close();
     await new Promise((r) => setTimeout(r, 50));
-    expect(organs.calls).toEqual([]); // 未执行；若审批未释放则测试进程悬挂（afterEach close 兜底）
+    expect(organs.calls).toEqual([]);
   });
 
   it("全局中断作废审批并丢弃批次", async () => {
@@ -300,14 +496,15 @@ describe("GeminiBridgeThinking 执行型桥服务", () => {
     controller.abort();
     await new Promise((r) => setTimeout(r, 50));
     expect(organs.calls).toEqual([]);
-    expect(await postApproval(port, id, [true])).toBe(404); // 审批条目已作废
+    expect(await postApproval(port, id, [true])).toBe(404);
   });
 
   it("参数非法的危险命令不进审批，直接 INVALID_ARGS 拒绝", async () => {
     const { port } = await makeBridge();
-    const res = await postReply(port, toolCall("terminal", {}));
+    const reply = ["{", "<::: TOOL_CALL[1]", "tool: terminal", ":::> TOOL_CALL[1]", "}"].join("\n");
+    const res = await postReply(port, reply);
     expect(res.processed).toBe(true);
-    const message = await getMessageText(port); // 直接 message 类型，无审批请求
+    const message = await getMessageText(port);
     expect(message).toContain("参数不合法");
   });
 
@@ -317,7 +514,7 @@ describe("GeminiBridgeThinking 执行型桥服务", () => {
     const message = await getMessageText(port);
     expect(message).toContain("BLACKLIST");
     expect(message).toContain("系统破坏操作，禁止执行");
-    expect(await tryGetMessage(port, 300)).toBeNull(); // 无审批请求
+    expect(await tryGetMessage(port, 300)).toBeNull();
     expect(organs.calls).toEqual([]);
   });
 
@@ -338,7 +535,7 @@ describe("GeminiBridgeThinking 执行型桥服务", () => {
     expect(body?.type).toBe("approval");
     const id = (body as { id: number }).id;
     expect(await postApproval(port, id, [true], [{ tool: "terminal", key: "ls -la", kind: "exact" }])).toBe(200);
-    await getMessageText(port); // 执行结果
+    await getMessageText(port);
     const raw = JSON.parse(readFileSync(tmpFile, "utf8")) as Record<string, WhitelistEntry[]>;
     expect(raw["/ws-test"]).toContainEqual({ tool: "terminal", key: "ls -la", kind: "exact" });
   });
@@ -351,7 +548,7 @@ describe("GeminiBridgeThinking 执行型桥服务", () => {
     const id = (body as { id: number }).id;
     const res = await postApproval(port, id, [true], [{ tool: "write_file", key: "/etc/passwd", kind: "path" }]);
     expect(res).toBe(400);
-    expect(organs.calls).toEqual([]); // 未执行
+    expect(organs.calls).toEqual([]);
   });
 
   it("根级路径不接受 dir 条目：write_file /x.txt + key / → 400 且不执行", async () => {
@@ -361,8 +558,8 @@ describe("GeminiBridgeThinking 执行型桥服务", () => {
     expect(body?.type).toBe("approval");
     const id = (body as { id: number }).id;
     const res = await postApproval(port, id, [true], [{ tool: "write_file", key: "/", kind: "path" }]);
-    expect(res).toBe(400); // 根级/盘符根：仅文件条目，dir 条目拒绝
-    expect(organs.calls).toEqual([]); // 未执行
+    expect(res).toBe(400);
+    expect(organs.calls).toEqual([]);
   });
 
   it("盘符根 dir 条目 → 400（整盘放行拒绝）", async () => {
@@ -393,7 +590,16 @@ describe("GeminiBridgeThinking 执行型桥服务", () => {
 
   it("未知工具与参数非法拒绝", async () => {
     const { port } = await makeBridge();
-    const reply = [toolCall("hack_planet", {}), toolCall("read_file", {})].join("\n");
+    const reply = [
+      "{",
+      "<::: TOOL_CALL[1]",
+      "tool: hack_planet",
+      ":::> TOOL_CALL[1]",
+      "<::: TOOL_CALL[2]",
+      "tool: read_file",
+      ":::> TOOL_CALL[2]",
+      "}",
+    ].join("\n");
     const res = await postReply(port, reply);
     expect(res.processed).toBe(true);
     const message = await getMessageText(port);
@@ -401,16 +607,17 @@ describe("GeminiBridgeThinking 执行型桥服务", () => {
     expect(message).toContain("参数不合法");
   });
 
-  it("相同内容重复提交只处理一次", async () => {
+  it("相同内容再次提交仍会处理（服务端不做静默去重——重复控制属模型侧）", async () => {
     seedWhitelist("/ws-test", [{ tool: "read_file", key: '{"path":"a.txt"}', kind: "exact" }]);
     const { port, organs } = await makeBridge();
     const reply = toolCall("read_file", { path: "a.txt" });
     const first = await postReply(port, reply);
     expect(first.processed).toBe(true);
     const second = await postReply(port, reply);
-    expect(second.processed).toBe(false);
-    await getMessageText(port); // 取走结果消息，保证批执行完成
-    expect(organs.calls).toHaveLength(1);
+    expect(second.processed).toBe(true);
+    await getMessageText(port);
+    await getMessageText(port);
+    expect(organs.calls).toHaveLength(2);
   });
 
   it("批超时队列执行超时说明", async () => {
@@ -420,7 +627,7 @@ describe("GeminiBridgeThinking 执行型桥服务", () => {
     expect(res.processed).toBe(true);
     const message = await getMessageText(port);
     expect(message).toContain("超时");
-    expect(organs.calls.some((c) => c.args.command === "slow")).toBe(true); // 已开始执行
+    expect(organs.calls.some((c) => c.args.command === "slow")).toBe(true);
   });
 
   it("全局中断丢弃批次", async () => {
@@ -428,13 +635,20 @@ describe("GeminiBridgeThinking 执行型桥服务", () => {
     const { port, organs } = await makeBridge({ signal: controller.signal });
     controller.abort();
     const reply = [
-      toolCall("read_file", { path: "a.txt" }),
-      toolCall("read_file", { path: "b.txt" }),
+      "{",
+      "<::: TOOL_CALL[1]",
+      "tool: read_file",
+      "path: a.txt",
+      ":::> TOOL_CALL[1]",
+      "<::: TOOL_CALL[2]",
+      "tool: read_file",
+      "path: b.txt",
+      ":::> TOOL_CALL[2]",
+      "}",
     ].join("\n");
     const res = await postReply(port, reply);
     expect(res.processed).toBe(true);
     await new Promise((r) => setTimeout(r, 50));
-    // 批执行被中止：第二个工具未执行（calls 不完整）
     expect(organs.calls.some((c) => c.args.path === "b.txt")).toBe(false);
   });
 
@@ -442,7 +656,7 @@ describe("GeminiBridgeThinking 执行型桥服务", () => {
     const { bridge, port } = await makeBridge();
     const poll = getMessage(port);
     bridge.close();
-    await expect(poll).resolves.toBeNull(); // 204 结束
+    await expect(poll).resolves.toBeNull();
   });
 
   it("非法 reply 返回 400", async () => {

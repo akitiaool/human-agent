@@ -28,6 +28,7 @@ export function buildHands(): HandsContract {
   return {
     writeFile: (path, content) => writer.writeFile(path, content),
     applyPatch: (path, patch) => writer.applyPatch(path, patch),
+    editFile: (path, hunks, baseVersion) => writer.editFile(path, hunks, baseVersion),
     executeCommand: (command, signal, timeoutMs) =>
       terminal.executeCommand(command, signal, timeoutMs),
   };
@@ -37,7 +38,7 @@ export function buildEyes(options: { fetchImpl?: typeof fetch } = {}): EyesContr
   const reader = new FileReader();
   const crawler = new WebCrawler(options);
   return {
-    readFile: (path) => reader.readFile(path),
+    readFile: (path, opt) => reader.readFile(path, opt),
     readDir: (path) => reader.readDir(path),
     searchCode: (pattern, dir) => reader.searchCode(pattern, dir),
     fetchPageAsMarkdown: (url) => crawler.fetchPageAsMarkdown(url),

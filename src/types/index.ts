@@ -6,6 +6,7 @@ export type {
   AgentStatus,
   ApprovalChoice,
   ApprovalPrompt,
+  EditFileResult,
   EnvSnapshot,
   EarsContract,
   EyesContract,
@@ -13,6 +14,7 @@ export type {
   MouthContract,
   NoseContract,
   PortStatus,
+  ReadFileResult,
   RiskLevel,
   WhitelistEntry,
 } from "./organ.js";

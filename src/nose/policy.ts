@@ -9,7 +9,7 @@ import { BLACKLIST_PATTERNS } from "./blacklist.js";
 
 export type Classification = "blacklist" | "whitelist" | "unlisted";
 
-const WRITE_TOOLS = new Set(["write_file", "apply_patch"]);
+const WRITE_TOOLS = new Set(["write_file", "apply_patch", "edit_file"]);
 
 /** 段级解析：折叠 . 与 ..（盘符根/根之上不可越）——防 c:/ws/../../windows 穿越绕过黑名单锚定/工作区边界。 */
 function resolvePathSegments(p: string): string {

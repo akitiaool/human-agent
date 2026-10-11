@@ -1,4 +1,5 @@
 // 各器官的标准入参/出参契约（设计文档 §3、§6.1）
+import type { DiffHunk } from "../brain/llm.js";
 
 // ---------- 通用工具结果契约：双手/眼睛无论成败必须返回，严禁抛错 (§6.1) ----------
 
@@ -54,8 +55,22 @@ export type AgentPhase =
 
 // ---------- 器官契约：方法与文档 §3 一一对应 ----------
 
+export interface ReadFileResult {
+  content: string;
+  versionId: string;
+  totalLines: number;
+  startLine?: number | undefined;
+  endLine?: number | undefined;
+}
+
+export interface EditFileResult {
+  path: string;
+  newVersionId: string;
+  hunksApplied: number;
+}
+
 export interface EyesContract {
-  readFile(path: string): Promise<ActionResult<string>>;
+  readFile(path: string, options?: { startLine?: number | undefined; lineCount?: number | undefined }): Promise<ActionResult<string | ReadFileResult>>;
   readDir(path: string): Promise<ActionResult<string[]>>;
   searchCode(pattern: string, dir?: string): Promise<ActionResult<string[]>>;
   fetchPageAsMarkdown(url: string): Promise<ActionResult<string>>;
@@ -102,7 +117,8 @@ export interface AgentOutput {
 export interface HandsContract {
   writeFile(path: string, content: string): Promise<ActionResult<void>>;
   applyPatch(path: string, patch: string): Promise<ActionResult<void>>;
-  executeCommand(command: string, signal?: AbortSignal, timeoutMs?: number): Promise<ActionResult<string>>;
+  editFile(path: string, hunks: readonly DiffHunk[], baseVersion?: string | undefined): Promise<ActionResult<EditFileResult>>;
+  executeCommand(command: string, signal?: AbortSignal, timeoutMs?: number | undefined): Promise<ActionResult<string>>;
 }
 
 export interface NoseContract {

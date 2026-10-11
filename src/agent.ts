@@ -140,7 +140,7 @@ function buildDefaultEyes(): EyesContract {
   const reader = new FileReader();
   const crawler = new WebCrawler();
   return {
-    readFile: (path) => reader.readFile(path),
+    readFile: (path, options) => reader.readFile(path, options),
     readDir: (path) => reader.readDir(path),
     searchCode: (pattern, dir) => reader.searchCode(pattern, dir),
     fetchPageAsMarkdown: (url) => crawler.fetchPageAsMarkdown(url),
@@ -153,6 +153,7 @@ function buildDefaultHands(): HandsContract {
   return {
     writeFile: (path, content) => writer.writeFile(path, content),
     applyPatch: (path, patch) => writer.applyPatch(path, patch),
+    editFile: (path, hunks, baseVersion) => writer.editFile(path, hunks, baseVersion),
     executeCommand: (command, signal, timeoutMs) =>
       terminal.executeCommand(command, signal, timeoutMs),
   };
