@@ -54,7 +54,6 @@ let pendingInjectText = ""; // 已取得、待投递循环回填的协议文本�
 // 初始 done：页面加载不自动检查——旧对话刷新时渲染未完成会被误判为空对话从而重放（事故护栏）。
 let autoInjectState = "done";
 let autoInjectWaitLogged = false; // 「容器存在但暂无消息」保守等待日志只记一次（新对话事件复位）
-let lastPostedReply = ""; // 最近一次成功回传的回复（网络捕获去重用，服务侧亦去重）
 let delivering = false; // 投递循环串行占用标志（同一时刻只回填一条消息）
 let inflightPoll = null; // 在途的 get-task 长轮询（跨 tick 保留，消费前不置空——返回的消息不丢）
 let pendingTask = null; // 输入框未就绪时暂存的消息 {text, source}，就绪后补投
@@ -176,6 +175,12 @@ panel.innerHTML = `
   margin-top: 6px; padding: 4px 8px; border-radius: 6px;
   background: #111827; border: 1px solid #374151;
   color: var(--dot, #93c5fd);
+  display: flex; align-items: center; justify-content: space-between; gap: 8px;
+}
+#ha-panel .ha-status-dot {
+  flex: none; width: 8px; height: 8px; border-radius: 50%;
+  background: var(--dot, #3b82f6); box-shadow: 0 0 6px var(--dot, #3b82f6);
+  animation: ha-pulse 1.8s ease-in-out infinite; /* 与悬浮球同款呼吸律动 */
 }
 #ha-panel #ha-retry {
   margin-top: 6px; width: 100%; background: #111; color: #fca5a5;
@@ -189,6 +194,16 @@ panel.innerHTML = `
   font: inherit; cursor: pointer;
 }
 #ha-panel #ha-inject-protocol:hover { border-color: #2563eb; color: #bfdbfe; }
+#ha-panel #ha-submit-now {
+  margin-left: auto; background: #111; color: #93c5fd;
+  border: 1px solid #1d4ed8; border-radius: 4px; padding: 1px 8px;
+  font: inherit; font-size: 11px; cursor: pointer; flex: none;
+}
+#ha-panel #ha-submit-now:hover { border-color: #2563eb; color: #bfdbfe; }
+#ha-panel #ha-submit-now:disabled {
+  color: #6b7280; border-color: #374151; background: #161616;
+  cursor: not-allowed; opacity: .6;
+}
 /* 状态色调：待命蓝 / 已抓取青 / 回填橙 / 倒计时绿 / 等待紫 / 桥断琥珀 / 错误红 */
 .ha-tone-idle  { --dot: #3b82f6; }
 .ha-tone-ready { --dot: #22d3ee; }
@@ -249,9 +264,10 @@ panel.innerHTML = `
 </div>
 <div class="ha-group-card">
   <div class="ha-group-title">自动模式</div>
-  <label class="ha-row">
-    <input type="checkbox" id="ha-auto-mode"> 自动提交回填消息
-  </label>
+  <div class="ha-row">
+    <label><input type="checkbox" id="ha-auto-mode"> 自动提交回填消息</label>
+    <button id="ha-submit-now" title="立即提交输入框当前内容（非空即提交，无论内容来源；回填进行中暂不可用）">立即提交</button>
+  </div>
   <label class="ha-row">
     <input type="checkbox" id="ha-auto-inject"> 新对话自动注入协议
   </label>
@@ -301,7 +317,7 @@ panel.innerHTML = `
   <input type="text" id="ha-base-url" spellcheck="false" placeholder="http://127.0.0.1:8765">
 </div>
 <button id="ha-inject-protocol" title="手动把工具协议（规则）文本填入输入框（自动提交开=填好后自动提交）">填入规则文本</button>
-<div class="ha-status" id="ha-status">待命</div>
+<div class="ha-status" id="ha-status"><span id="ha-status-text">待命</span><span class="ha-status-dot" title="状态指示灯"></span></div>
 <button id="ha-retry" hidden>手动重试</button>
 <div class="ha-log-bar">
   <button id="ha-log-export" title="导出日志为文本文件">导出</button>
@@ -319,8 +335,10 @@ ball.innerHTML = `<span class="ha-dot" id="ha-ball-dot"></span>`;
 document.documentElement.appendChild(ball);
 
 const statusEl = panel.querySelector("#ha-status");
+const statusTextEl = panel.querySelector("#ha-status-text");
 const logEl = panel.querySelector("#ha-log");
 const ballDot = ball.querySelector("#ha-ball-dot");
+const submitNowBtn = panel.querySelector("#ha-submit-now");
 const retryBtn = panel.querySelector("#ha-retry");
 
 // 手动重试：重置计数并唤醒挂起的投递循环
@@ -366,20 +384,25 @@ const TONE_CLASSES = [
 ];
 
 // 状态 → 色调：面板状态栏与悬浮球圆点共用一套
+// 状态标准（跨网页通用：描述「捕获 → 后端执行 → 回填 → 提交」桥流水线，与具体前端无关；
+// 将来接 ChatGPT 等其他网页复用同一套，自动/手动的差异只体现在「待提交」阶段的渲染上）：
+// 待命（蓝·静息）→ 回填中（橙）→ 待提交（绿：自动=倒计时 / 手动=「待提交（手动发送）」）
+// → 等待回复（紫：请求发出即置位，原文到手结束）→ 已抓取回复（等待执行）（青：后端处理）→ 回填中（下一轮）
+// 横向：等待授权 / 桥未连接（琥珀）、错误（红，投递循环空闲时清回待命）
 function statusTone(text) {
   if (text === "错误") return "ha-tone-err";
   if (text === "桥未连接" || text === "桥未连接（重试中）") return "ha-tone-warn";
   if (text === "等待授权") return "ha-tone-warn";
   if (text.includes("回填中")) return "ha-tone-busy";
-  if (text.includes("自动提交")) return "ha-tone-go";
-  if (text.includes("等待 Gemini")) return "ha-tone-wait";
+  if (text.includes("自动提交") || text.includes("待提交")) return "ha-tone-go";
+  if (text.includes("等待回复")) return "ha-tone-wait";
   if (text.includes("已抓取")) return "ha-tone-ready";
   return "ha-tone-idle";
 }
 
 function setStatus(text) {
   currentStatus = text;
-  statusEl.textContent = text;
+  statusTextEl.textContent = text; // 写内层文本节点：状态元素还挂着右侧呼吸灯
   const tone = statusTone(text);
   statusEl.classList.remove(...TONE_CLASSES);
   statusEl.classList.add(tone);
@@ -555,6 +578,22 @@ function setupPanelEvents() {
     settings.autoMode = e.target.checked;
     scheduleSaveSettings();
     log(`自动提交回填消息：${settings.autoMode ? "开" : "关"}`);
+  });
+  // 立即提交：无条件手动动作（点击即授权）——输入框非空就点页面发送，无论内容是回填还是用户自输入；
+  // 回填进行中按钮被禁用（deliverMessage 置灰），点击事件不会到达这里
+  panel.querySelector("#ha-submit-now").addEventListener("click", async () => {
+    const input = findInput();
+    if (!input || !input.value.trim()) {
+      log("立即提交：输入框为空，无需提交");
+      return;
+    }
+    if (await clickSendWhenReady()) {
+      setStatus("等待回复");
+      log("已提交（立即提交），等待回复…");
+    } else {
+      setStatus("待提交（手动发送）");
+      log("未找到发送按钮且 Ctrl+Enter 回退失败，请手动提交");
+    }
   });
   panel.querySelector("#ha-auto-inject").addEventListener("change", (e) => {
     settings.autoInject = e.target.checked;
@@ -986,8 +1025,17 @@ function showApprovalDialog(item) {
 
 // ---------- 投递循环：GET /task → 模拟输入 → 自动/手动提交 ----------
 
+// 「立即提交」可用性：输入框为空（或不存在）→ 禁用；回填期间跳过（由 deliverMessage 控制禁用）。
+// 轮询而非监听/观察器：输入框元素随页面渲染频繁重建，观察器路线此前已裁定删除（轮询是房子风格）。
+function updateSubmitNowState() {
+  if (delivering) return;
+  const input = findInput();
+  submitNowBtn.disabled = !input || !input.value.trim();
+}
+
 async function deliverMessage(text, source) {
   delivering = true;
+  submitNowBtn.disabled = true; // 回填进行中禁用「立即提交」：防发出半截消息（倒计时阶段同禁，防重复提交）
   try {
     setStatus(settings.simulateTyping ? "回填中（模拟粘贴）" : "回填中");
     log(`${source === "reinject" ? "协议文本注入" : "任务消息到达"}：${truncate(text.replace(/\n/g, " "), 80)}`);
@@ -998,7 +1046,7 @@ async function deliverMessage(text, source) {
       return;
     }
     if (!settings.autoMode) {
-      setStatus("待命");
+      setStatus("待提交（手动发送）");
       log("自动提交未开：已回填输入框，请点击页面发送按钮提交");
       return;
     }
@@ -1011,19 +1059,20 @@ async function deliverMessage(text, source) {
     clearInterval(countdown);
     // 竞态守卫：延迟回调触发时开关已关闭 → 跳过点击（A7）
     if (!settings.autoMode) {
-      setStatus("待命");
+      setStatus("待提交（手动发送）");
       log("延迟期间自动提交已关闭，跳过提交（请在输入框手动发送）");
       return;
     }
     if (await clickSendWhenReady()) {
-      setStatus("等待 Gemini 回复");
-      log("已提交，等待 Gemini 回复…");
+      setStatus("等待回复");
+      log("已提交，等待回复…");
     } else {
-      setStatus("错误");
+      setStatus("待提交（手动发送）"); // 消息已在输入框，等待用户手动发送（与手动模式同一阶段状态）
       log("未找到发送按钮且 Ctrl+Enter 回退失败，请手动提交");
     }
   } finally {
     delivering = false;
+    updateSubmitNowState(); // 按输入框实际状态恢复（提交后页面可能已清空输入框，而非无条件启用）
   }
 }
 
@@ -1186,7 +1235,6 @@ async function postResult(reply, stats) {
   }
   if (resp.ok) {
     noteBridgeSuccess();
-    lastPostedReply = reply; // 仅成功回传才更新去重标记
     log(
       `网络捕获：已回传（${reply.length} 字符，${stats.deltaCount} deltas，滤 ${stats.thoughtCount} thought，` +
         `${resp.processed ? "已入队执行" : "服务侧忽略（无工具调用/重复）"}）`,
@@ -1201,29 +1249,36 @@ async function postResult(reply, stats) {
 
 function setupCaptureListener() {
   window.addEventListener("message", (ev) => {
-    if (ev.source !== window) return; // 只收本窗口消息
-    const d = ev.data;
-    if (!d || d.__ha !== CAPTURE_MARKER || d.v !== 1) return; // 非捕获协议一律忽略（含本脚本自己发的 ping）
-    if (d.kind === "hello") {
-      noteCaptureMounted("注入侧握手");
-    } else if (d.kind === "start") {
-      noteCaptureMounted("经捕获消息");
-      log("网络捕获：检测到 GenerateContent 请求");
-    } else if (d.kind === "error") {
-      noteCaptureMounted("经捕获消息");
-      log(`网络捕获异常：${d.reason ?? "未知原因"}（…${d.urlTail ?? ""}）`);
-    } else if (d.kind === "done") {
-      noteCaptureMounted("经捕获消息");
-      const decoded = haDecodeGenerateContent(d.raw);
-      if (decoded === null) {
-        log(`网络捕获解码失败（原文 ${typeof d.raw === "string" ? d.raw.length : 0} 字符），本轮不投递`);
-        return;
+    try {
+      if (ev.source !== window) return; // 只收本窗口消息
+      const d = ev.data;
+      if (!d || d.__ha !== CAPTURE_MARKER || d.v !== 1) return; // 非捕获协议一律忽略（含本脚本自己发的 ping）
+      if (d.kind === "hello") {
+        noteCaptureMounted("注入侧握手");
+      } else if (d.kind === "start") {
+        noteCaptureMounted("经捕获消息");
+        // 状态标准统一入口：请求发出 = 回复在途（与提交方式无关、与前端页面无关）
+        setStatus("等待回复");
+        log("网络捕获：检测到 GenerateContent 请求");
+      } else if (d.kind === "error") {
+        noteCaptureMounted("经捕获消息");
+        log(`网络捕获异常：${d.reason ?? "未知原因"}（…${d.urlTail ?? ""}）`);
+      } else if (d.kind === "done") {
+        noteCaptureMounted("经捕获消息");
+        // 诊断留痕：完成信号已送达隔离世界（控制台 [ha-capture] 可过滤）
+        console.log("[ha-capture] content 收到完成信号", typeof d.raw === "string" ? `${d.raw.length} 字符` : typeof d.raw);
+        const decoded = haDecodeGenerateContent(d.raw);
+        if (decoded === null) {
+          setStatus("待命"); // 回复已结束但本轮无产出：回静息态（详情在日志，响亮停滞）
+          log(`网络捕获解码失败（原文 ${typeof d.raw === "string" ? d.raw.length : 0} 字符），本轮不投递`);
+          return;
+        }
+        postResult(decoded.answer, decoded);
       }
-      if (decoded.answer === lastPostedReply) {
-        log("网络捕获：与上次回传内容相同，跳过投递");
-        return;
-      }
-      postResult(decoded.answer, decoded);
+    } catch (err) {
+      // 响亮停滞：处理器自身异常不再无声，控制台 + 面板双通道留痕
+      console.error("[ha-capture] 捕获消息处理异常", err);
+      log(`捕获消息处理异常：${err instanceof Error ? err.message : String(err)}`);
     }
   });
   // inject.js 在 document_start 已发过 hello，本监听 document_idle 才就位（错过首包）——发 ping 请它补答
@@ -1301,6 +1356,8 @@ async function init() {
   }
   applySettingsToPanel();
   setupPanelEvents();
+  updateSubmitNowState(); // 「立即提交」初始可用性（页面加载时输入框通常为空 → 置灰）
+  setInterval(updateSubmitNowState, 500); // 轮询输入框空/存在性：元素随渲染重建，观察器路线已废弃
   setupNewConversationWatcher();
   setStatus("待命");
   log(

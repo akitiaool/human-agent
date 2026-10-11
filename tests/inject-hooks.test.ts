@@ -1,4 +1,4 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { installCaptureHooks } from "../extensions/gemini-bridge/inject.js";
 
 const MARKER = "gemini-bridge-capture";
@@ -15,16 +15,26 @@ function makeFakeXHRClass() {
     listeners: Record<string, Array<() => void>> = {};
     responseText = "";
     responseType = "";
+    readyState = 0;
+    status = 0;
     openedUrl: unknown = null;
     sent = false;
+    aborted = false;
     open(_method: unknown, url: unknown): void {
       this.openedUrl = url;
     }
     send(): void {
       this.sent = true;
     }
+    abort(): void {
+      this.aborted = true;
+    }
     addEventListener(type: string, fn: () => void): void {
       (this.listeners[type] ??= []).push(fn);
+    }
+    fireReadyState(n: number): void {
+      this.readyState = n;
+      for (const fn of this.listeners.readystatechange ?? []) fn();
     }
     fireLoadEnd(): void {
       for (const fn of this.listeners.loadend ?? []) fn();
@@ -79,6 +89,7 @@ describe("installCaptureHooks：握手", () => {
     const xhr = new win.XMLHttpRequest();
     xhr.open("POST", HIT_URL);
     xhr.send();
+    xhr.responseText = '{"sample":true}';
     xhr.fireLoadEnd();
     expect(win.posted.filter((m) => m.kind === "start").length).toBe(1);
     expect(win.posted.filter((m) => m.kind === "done").length).toBe(1);
@@ -127,6 +138,125 @@ describe("installCaptureHooks：XHR 主通道", () => {
     expect(err).toBeTruthy();
     expect(String(err?.reason)).toContain("arraybuffer");
     expect(win.posted.some((m) => m.kind === "done")).toBe(false);
+  });
+
+  it("loadend 兜底：原文未构成完整 JSON → 发 error（done 只承载完整 JSON）", () => {
+    const win = new FakeWindow();
+    installCaptureHooks(win);
+    const xhr = new win.XMLHttpRequest();
+    xhr.open("POST", HIT_URL);
+    xhr.send();
+    xhr.responseText = '[[null,"text"';
+    xhr.fireLoadEnd();
+    const err = win.posted.find((m) => m.kind === "error");
+    expect(err).toBeTruthy();
+    expect(String(err?.reason)).toContain("原文非完整 JSON");
+    expect(win.posted.some((m) => m.kind === "done")).toBe(false);
+  });
+});
+
+describe("installCaptureHooks：快照兜底（对象被静默重置前的原文抢占）", () => {
+  it("readyState 3 且 responseText 已是完整 JSON：不等 loadend 即发 done", () => {
+    const win = new FakeWindow();
+    installCaptureHooks(win);
+    const xhr = new win.XMLHttpRequest();
+    xhr.open("POST", HIT_URL);
+    xhr.send();
+    xhr.responseText = '[[null,"text"]]';
+    xhr.fireReadyState(3);
+    const done = win.posted.find((m) => m.kind === "done");
+    expect(done).toBeTruthy();
+    expect(done?.raw).toBe('[[null,"text"]]');
+    expect(done?.reqId).toBe(win.posted.find((m) => m.kind === "start")?.reqId);
+  });
+
+  it("残片不发；补全后快照发 done，随后 loadend 到达不重复", () => {
+    const win = new FakeWindow();
+    installCaptureHooks(win);
+    const xhr = new win.XMLHttpRequest();
+    xhr.open("POST", HIT_URL);
+    xhr.send();
+    xhr.responseText = '[[null,"text"'; // 未完整
+    xhr.fireReadyState(3);
+    expect(win.posted.filter((m) => m.kind === "done")).toEqual([]);
+    xhr.responseText = '[[null,"text"]]'; // 补全
+    xhr.fireReadyState(3);
+    expect(win.posted.filter((m) => m.kind === "done").length).toBe(1);
+    xhr.fireLoadEnd(); // 对象后续正常走完也不重复发
+    expect(win.posted.filter((m) => m.kind === "done").length).toBe(1);
+  });
+
+  it("readyState 归零（静默重置）不再产出任何 done/error（坐实事件被吞）", () => {
+    const win = new FakeWindow();
+    installCaptureHooks(win);
+    const xhr = new win.XMLHttpRequest();
+    xhr.open("POST", HIT_URL);
+    xhr.send();
+    xhr.responseText = '[[null,"text"';
+    xhr.fireReadyState(3);
+    xhr.responseText = "";
+    xhr.fireReadyState(0); // 重置：无 loadend、无其它事件
+    expect(win.posted.some((m) => m.kind === "done")).toBe(false);
+    expect(win.posted.some((m) => m.kind === "error")).toBe(false);
+  });
+
+  it("abort() 拦截：页面完成瞬间 abort 时原文完整 → 先取证发 done，再放行原 abort", () => {
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+    try {
+      const win = new FakeWindow();
+      installCaptureHooks(win);
+      const xhr = new win.XMLHttpRequest();
+      xhr.open("POST", HIT_URL);
+      xhr.send();
+      xhr.responseText = '[[null,"text","done"]]';
+      xhr.readyState = 4;
+      xhr.abort();
+      expect(xhr.aborted).toBe(true); // 原 abort 仍被放行（不干扰页面）
+      const done = win.posted.find((m) => m.kind === "done");
+      expect(done?.raw).toBe('[[null,"text","done"]]');
+      expect(done?.reqId).toBe(win.posted.find((m) => m.kind === "start")?.reqId);
+      expect(win.posted.some((m) => m.kind === "error")).toBe(false);
+      expect(warnSpy.mock.calls.some((c) => String(c[0]).includes("abort() 在原文到手前"))).toBe(false);
+    } finally {
+      warnSpy.mockRestore();
+    }
+  });
+
+  it("abort() 拦截：原文未完整（流中被打断）→ 不发 done，响亮告警", () => {
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+    try {
+      const win = new FakeWindow();
+      installCaptureHooks(win);
+      const xhr = new win.XMLHttpRequest();
+      xhr.open("POST", HIT_URL);
+      xhr.send();
+      xhr.responseText = '[[null,"text"';
+      xhr.readyState = 3;
+      xhr.abort();
+      expect(win.posted.filter((m) => m.kind === "done")).toEqual([]);
+      expect(warnSpy.mock.calls.some((c) => String(c[0]).includes("abort() 在原文到手前被调用"))).toBe(true);
+    } finally {
+      warnSpy.mockRestore();
+    }
+  });
+
+  it("同一 XHR 对象复用发第二个请求：取证标志按请求复位，第二轮照常捕获", () => {
+    const win = new FakeWindow();
+    installCaptureHooks(win);
+    const xhr = new win.XMLHttpRequest();
+    xhr.open("POST", HIT_URL);
+    xhr.send();
+    xhr.responseText = '[[null,"a"]]';
+    xhr.readyState = 4;
+    xhr.abort(); // 第一轮：abort 拦截取证
+    expect(win.posted.filter((m) => m.kind === "done").length).toBe(1);
+    xhr.open("POST", HIT_URL); // 复用同一实例发第二轮
+    xhr.send();
+    xhr.responseText = '[[null,"b"]]';
+    xhr.fireReadyState(3);
+    const dones = win.posted.filter((m) => m.kind === "done");
+    expect(dones.length).toBe(2);
+    expect(dones[1]?.raw).toBe('[[null,"b"]]');
   });
 });
 
