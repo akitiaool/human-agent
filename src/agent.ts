@@ -109,6 +109,8 @@ export interface BridgeServiceOptions {
   logger?: (text: string) => void;
   /** 白名单文件；缺省 ~/.human-agent/whitelist.json（注入隔离测试/多实例用） */
   whitelistFile?: string;
+  /** 信任候选档案文件；缺省 ~/.human-agent/candidates.json（注入隔离测试/多实例用） */
+  candidatesFile?: string;
   /** 工作区（启动 realpath 规范化）；缺省 process.cwd()。 */
   workspace?: string;
 }
@@ -131,6 +133,7 @@ export function buildBridgeService(options: BridgeServiceOptions = {}): GeminiBr
     ...(options.timeoutMs !== undefined ? { timeoutMs: options.timeoutMs } : {}),
     ...(options.logger !== undefined ? { logger: options.logger } : {}),
     ...(options.whitelistFile !== undefined ? { whitelistFile: options.whitelistFile } : {}),
+    ...(options.candidatesFile !== undefined ? { candidatesFile: options.candidatesFile } : {}),
     ...(options.workspace !== undefined ? { workspace: options.workspace } : {}),
   });
 }

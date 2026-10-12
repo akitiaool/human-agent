@@ -7,7 +7,8 @@
 import http from "node:http";
 import type { AddressInfo } from "node:net";
 import { executeTool, type ToolOrgans } from "../heart/executor.js";
-import { normalizePath, toolMatches } from "../nose/policy.js";
+import { dirEntryKey, isPathTool, keyMatches, normalizeEntryKey, toolMatches, WRITE_TOOLS, READ_TOOLS } from "../nose/policy.js";
+import { CandidatesArchive, type CandidateRecord } from "../nose/candidates.js";
 import { ASTParser, flattenToolCalls } from "./ast-parser.js";
 import type { ActionResult, EyesContract, HandsContract, WhitelistEntry } from "../types/index.js";
 import { fail } from "../types/index.js";
@@ -25,6 +26,8 @@ export interface GeminiBridgeThinkingOptions extends BaseThinkingOptions {
   timeoutMs?: number;
   /** 审批兜底超时（毫秒）：扩展未在面板超时前应答时全部按拒绝；默认 600s。 */
   approvalTimeoutMs?: number;
+  /** 信任候选档案文件；缺省 ~/.human-agent/candidates.json */
+  candidatesFile?: string;
   /** 可选状态日志回调（宿主 cli 打印）。 */
   logger?: (message: string) => void;
 }
@@ -64,6 +67,7 @@ export class GeminiBridgeThinking extends BaseThinking {
   readonly #approvals = new Map<number, { settle: (decision: ApprovalDecision) => void; count: number; calls: ToolCall[] }>();
   #nextApprovalId = 1;
   readonly #approvalTimeoutMs: number;
+  readonly #candidates: CandidatesArchive;
   /** 单批串行队列：一次只处理一批，避免并发批交错。 */
   #busy: Promise<void> = Promise.resolve();
   /** close() 后置位：此后到达的长轮询请求立即 204（close 时请求可能尚未到达服务端）。 */
@@ -72,6 +76,10 @@ export class GeminiBridgeThinking extends BaseThinking {
   constructor(options: GeminiBridgeThinkingOptions) {
     super(options); // 内部建 policy + ensureWorkspace + Reflection
     this.#approvalTimeoutMs = options.approvalTimeoutMs ?? 600_000;
+    this.#candidates = new CandidatesArchive({
+      workspace: this.workspace,
+      ...(options.candidatesFile !== undefined ? { file: options.candidatesFile } : {}),
+    });
     this.#organs = { eyes: options.eyes, hands: options.hands };
     this.#signal = options.signal ?? new AbortController().signal;
     this.#timeoutMs = options.timeoutMs ?? 300_000;
@@ -115,6 +123,22 @@ export class GeminiBridgeThinking extends BaseThinking {
     }
     if (req.method === "GET" && url.pathname === "/protocol") {
       this.#handleProtocolRequest(res);
+      return;
+    }
+    if (req.method === "GET" && url.pathname === "/info") {
+      this.#handleInfoRequest(res);
+      return;
+    }
+    if (req.method === "GET" && url.pathname === "/candidates") {
+      this.#handleCandidatesRequest(res);
+      return;
+    }
+    if (req.method === "POST" && url.pathname === "/whitelist") {
+      this.#handleWhitelistAddRequest(req, res);
+      return;
+    }
+    if (req.method === "POST" && url.pathname === "/candidates/dismiss") {
+      this.#handleCandidatesDismissRequest(req, res);
       return;
     }
     if (req.method === "POST" && url.pathname === "/result") {
@@ -166,6 +190,135 @@ export class GeminiBridgeThinking extends BaseThinking {
     }
     res.writeHead(200, { "Content-Type": "application/json" });
     res.end(JSON.stringify({ ok: true, protocol: this.toolProtocol() }));
+  }
+
+  /** 当前工作区（无状态幂等）；服务已关闭时 204。 */
+  #handleInfoRequest(res: http.ServerResponse): void {
+    if (this.#closed) {
+      res.writeHead(204).end();
+      return;
+    }
+    res.writeHead(200, { "Content-Type": "application/json" });
+    res.end(JSON.stringify({ ok: true, workspace: this.workspace }));
+  }
+
+  /** 信任候选列表：返回前滤除已被白名单覆盖的条目；服务已关闭时 204。 */
+  #handleCandidatesRequest(res: http.ServerResponse): void {
+    if (this.#closed) {
+      res.writeHead(204).end();
+      return;
+    }
+    const entries = this.whitelistEntries();
+    const candidates = this.#candidates
+      .list()
+      .filter((r) => !entries.some((e) => toolMatches(e.tool, r.tool) && keyMatches(e, r.key)));
+    res.writeHead(200, { "Content-Type": "application/json" });
+    res.end(JSON.stringify({ ok: true, candidates }));
+  }
+
+  /** 候选批量入库：全量校验 all-or-nothing（任一不合法 400 全部不落盘）；成功后入库 + 核销。 */
+  #handleWhitelistAddRequest(req: http.IncomingMessage, res: http.ServerResponse): void {
+    readJsonBody(req).then(
+      (body) => {
+        const record = (typeof body === "object" && body !== null ? body : {}) as Record<string, unknown>;
+        const raw = Array.isArray(record.entries) ? record.entries : null;
+        if (raw === null || raw.length === 0) {
+          res.writeHead(400, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ error: "entries 必须为非空数组" }));
+          return;
+        }
+        const validated: WhitelistEntry[] = [];
+        for (const item of raw) {
+          const entry = this.#validateWhitelistAdd(item);
+          if (entry === null) {
+            res.writeHead(400, { "Content-Type": "application/json" });
+            res.end(JSON.stringify({ error: "whitelist 条目不合法" }));
+            return;
+          }
+          validated.push(entry);
+        }
+        for (const entry of validated) {
+          void this.addWhitelistEntry(entry);
+          this.#candidates.removeCovered(entry); // 入库即核销
+        }
+        res.writeHead(200, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ ok: true }));
+      },
+      () => {
+        res.writeHead(400, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ error: "请求体必须为合法 JSON" }));
+      },
+    );
+  }
+
+  /** 清除所选候选（持久化删除，不写白名单）。 */
+  #handleCandidatesDismissRequest(req: http.IncomingMessage, res: http.ServerResponse): void {
+    readJsonBody(req).then(
+      (body) => {
+        const record = (typeof body === "object" && body !== null ? body : {}) as Record<string, unknown>;
+        const raw = Array.isArray(record.items) ? record.items : null;
+        if (raw === null || raw.length === 0) {
+          res.writeHead(400, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ error: "items 必须为非空数组" }));
+          return;
+        }
+        const items: Array<{ tool: string; key: string }> = [];
+        for (const item of raw) {
+          if (typeof item !== "object" || item === null) {
+            res.writeHead(400, { "Content-Type": "application/json" });
+            res.end(JSON.stringify({ error: "items 条目不合法" }));
+            return;
+          }
+          const r = item as Record<string, unknown>;
+          if (typeof r.tool !== "string" || typeof r.key !== "string") {
+            res.writeHead(400, { "Content-Type": "application/json" });
+            res.end(JSON.stringify({ error: "items 条目不合法" }));
+            return;
+          }
+          items.push({ tool: r.tool, key: r.key });
+        }
+        this.#candidates.remove(items);
+        res.writeHead(200, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ ok: true }));
+      },
+      () => {
+        res.writeHead(400, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ error: "请求体必须为合法 JSON" }));
+      },
+    );
+  }
+
+  /**
+   * /whitelist 条目校验：形态合法 → 工具与粒度匹配（路径类限 path、其余限 exact）→ 归一 →
+   * 根级目录条目拒绝 → 必须对应现存候选（文件 = 键相等；目录 = dirEntryKey 段级前缀对应）。
+   */
+  #validateWhitelistAdd(item: unknown): WhitelistEntry | null {
+    if (typeof item !== "object" || item === null) return null;
+    const w = item as Record<string, unknown>;
+    if (typeof w.tool !== "string" || typeof w.key !== "string" || w.key === "") return null;
+    if (w.kind !== "exact" && w.kind !== "path") return null;
+    const pathTool = WRITE_TOOLS.has(w.tool) || READ_TOOLS.has(w.tool);
+    if (w.kind === "exact" && pathTool) return null;
+    if (w.kind === "path" && !pathTool) return null;
+    const normalized: WhitelistEntry = {
+      tool: w.tool,
+      key: normalizeEntryKey({ tool: w.tool, key: w.key }),
+      kind: w.kind,
+    };
+    if (w.kind === "path" && (normalized.key === "/" || /^[a-z]:\/$/i.test(normalized.key))) return null;
+    const corresponds = this.#candidates
+      .list()
+      .some((r) => this.#entryCorresponds(normalized, r));
+    return corresponds ? normalized : null;
+  }
+
+  /** 条目与候选的对应性：文件粒度 = 键相等；目录粒度 = dirEntryKey（段级前缀，含 read_dir 自身 + /）。 */
+  #entryCorresponds(entry: WhitelistEntry, candidate: CandidateRecord): boolean {
+    if (!toolMatches(entry.tool, candidate.tool)) return false;
+    if (entry.kind === "exact") return entry.key === candidate.key;
+    if (entry.key === candidate.key) return true;
+    const dirKey = dirEntryKey(candidate.tool, candidate.key);
+    return dirKey !== null && entry.key === dirKey;
   }
 
   /** 收网页内容：校验 → 解析 tool_call → 有则入串行队列；响应立即返回。 */
@@ -335,7 +488,14 @@ export class GeminiBridgeThinking extends BaseThinking {
     const id = this.#nextApprovalId++;
     let settle!: (decision: ApprovalDecision) => void;
     const timer = setTimeout(() => {
-      if (this.#approvals.delete(id)) settle({ allowed: calls.map(() => false), timedOut: true });
+      if (this.#approvals.delete(id)) {
+        // 桥自记：兜底超时 settle 全拒时入档（覆盖扩展盲区）
+        for (const call of calls) {
+          const key = this.keyFor(call);
+          if (key !== undefined && key !== "") this.#candidates.record(call.name, key, "denied");
+        }
+        settle({ allowed: calls.map(() => false), timedOut: true });
+      }
     }, this.#approvalTimeoutMs);
     const promise = new Promise<ApprovalDecision>((resolve) => {
       settle = (decision) => {
@@ -357,7 +517,7 @@ export class GeminiBridgeThinking extends BaseThinking {
     };
   }
 
-  /** 收扩展审批结果：校验 allowed 与 whitelist → 放行 → settle；未知 id → 404。 */
+  /** 收扩展审批结果：校验 allowed 与 whitelist → 桥自记候选 → 白名单落盘+核销 → settle；未知 id → 404。 */
   #handleApprovalRequest(req: http.IncomingMessage, res: http.ServerResponse): void {
     readJsonBody(req).then(
       (body) => {
@@ -375,14 +535,27 @@ export class GeminiBridgeThinking extends BaseThinking {
           res.end(JSON.stringify({ error: "allowed 必须与调用数一致" }));
           return;
         }
+        let whitelistEntries: unknown[] = [];
         if (record.whitelist !== undefined) {
-          const entries = Array.isArray(record.whitelist) ? record.whitelist : null;
-          if (entries === null || !this.#isValidWhitelist(entries, entry.calls, allowed)) {
+          const raw = Array.isArray(record.whitelist) ? record.whitelist : null;
+          if (raw === null || !this.#isValidWhitelist(raw, entry.calls, allowed)) {
             res.writeHead(400, { "Content-Type": "application/json" });
             res.end(JSON.stringify({ error: "whitelist 条目不合法" }));
             return;
           }
-          for (const w of entries) void this.addWhitelistEntry(w as WhitelistEntry);
+          whitelistEntries = raw;
+        }
+        // 桥自记：裁决落地即入档（档位无关——人工、倒计时全拒、档位代答、600s 超时同形）；先记账后核销
+        entry.calls.forEach((call, i) => {
+          const key = this.keyFor(call);
+          if (key !== undefined && key !== "") {
+            this.#candidates.record(call.name, key, allowed[i] === true ? "allowed" : "denied");
+          }
+        });
+        for (const w of whitelistEntries) {
+          const whitelistEntry = w as WhitelistEntry;
+          void this.addWhitelistEntry(whitelistEntry);
+          this.#candidates.removeCovered(whitelistEntry); // 入库即核销
         }
         this.#approvals.delete(id);
         entry.settle({ allowed, timedOut: false });
@@ -396,7 +569,7 @@ export class GeminiBridgeThinking extends BaseThinking {
     );
   }
 
-  /** 校验：每条目必须对应本批中 allowed=true 的调用。 */
+  /** 校验：每条目必须对应本批中 allowed=true 的调用（路径类限 path 文件/目录两粒度；非路径类限 exact）。 */
   #isValidWhitelist(raw: unknown[], calls: readonly ToolCall[], allowed: boolean[]): boolean {
     const allowedCalls = calls.filter((_, i) => allowed[i] === true);
     return raw.every((item) => {
@@ -406,16 +579,15 @@ export class GeminiBridgeThinking extends BaseThinking {
       if (w.kind !== "exact" && w.kind !== "path") return false;
       const entry: WhitelistEntry = { tool: w.tool, key: w.key, kind: w.kind };
       return allowedCalls.some((call) => {
-        if (entry.kind === "exact") {
-          return toolMatches(entry.tool, call.name) && entry.key === this.keyFor(call);
-        }
-        if (call.name !== "write_file" && call.name !== "apply_patch" && call.name !== "edit_file") return false;
-        const path = typeof call.arguments.path === "string" ? normalizePath(call.arguments.path) : "";
+        const key = this.keyFor(call);
+        if (key === undefined || key === "") return false;
         if (!toolMatches(entry.tool, call.name)) return false;
-        if (entry.key === path) return true; // 文件条目
-        const i = path.lastIndexOf("/");
-        if (i <= 0 || (i === 2 && path[1] === ":")) return false;
-        return entry.key === `${path.slice(0, i)}/`;
+        if (entry.kind === "exact") return !isPathTool(entry.tool) && entry.key === key;
+        if (!isPathTool(call.name)) return false;
+        const entryKey = normalizeEntryKey(entry);
+        if (entryKey === key) return true; // 文件条目 = 调用路径自身 matchKey
+        const dirKey = dirEntryKey(call.name, key);
+        return dirKey !== null && entryKey === dirKey; // 目录条目（写/读文件 = 父目录 + /；读目录类 = 自身 + /）
       });
     });
   }
