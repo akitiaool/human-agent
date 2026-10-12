@@ -1,7 +1,18 @@
 import { ExecaError, execa } from "execa";
 import { fail, ok, type ActionResult } from "../types/index.js";
 
+export interface TerminalOptions {
+  /** 命令工作目录（钉到工作区；缺省继承进程 CWD）。 */
+  cwd?: string;
+}
+
 export class Terminal {
+  readonly #cwd: string | undefined;
+
+  constructor(options: TerminalOptions = {}) {
+    this.#cwd = options.cwd;
+  }
+
   async executeCommand(
     command: string,
     signal?: AbortSignal,
@@ -11,6 +22,7 @@ export class Terminal {
       const { stdout, stderr } = await execa({
         shell: true,
         encoding: "utf8",
+        ...(this.#cwd !== undefined ? { cwd: this.#cwd } : {}),
         ...(signal !== undefined ? { cancelSignal: signal } : {}),
         ...(timeoutMs !== undefined ? { timeout: timeoutMs } : {}),
       })`${command}`;

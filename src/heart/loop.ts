@@ -253,6 +253,7 @@ export class AgentLoop {
           call.name,
           call.arguments,
           turnSignal,
+          { workspace: this.#workspace },
         );
         this.#finish(call.name, result);
         this.#context.add({ role: "tool", name: call.name, content: JSON.stringify(result) });
@@ -283,6 +284,7 @@ export class AgentLoop {
           call.name,
           call.arguments,
           turnSignal,
+          { workspace: this.#workspace },
         );
         this.#finish(call.name, result);
         this.#context.add({ role: "tool", name: call.name, content: JSON.stringify(result) });

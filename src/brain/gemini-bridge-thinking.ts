@@ -264,7 +264,9 @@ export class GeminiBridgeThinking extends BaseThinking {
           let result: ActionResult<unknown>;
           try {
             result = await Promise.race([
-              executeTool(this.#organs, toRun.name, toRun.arguments, batchSignal),
+              executeTool(this.#organs, toRun.name, toRun.arguments, batchSignal, {
+                workspace: this.workspace,
+              }),
               abortSignalPromise(batchSignal),
             ]);
           } catch {

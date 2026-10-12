@@ -37,6 +37,8 @@ export interface HumanAgentOptions {
   timeoutMs?: number;
   /** 白名单文件；缺省 ~/.human-agent/whitelist.json（注入隔离测试/多实例用） */
   whitelistFile?: string;
+  /** 工作区（启动 realpath 规范化）；缺省 process.cwd()。 */
+  workspace?: string;
 }
 
 /** 人体合一组装类：构造注入各器官（设计文档 §5.3），默认提供完整默认组装。 */
@@ -52,11 +54,13 @@ export class HumanAgent {
   readonly context: ConversationContext;
   readonly maxIterations: number;
   readonly timeoutMs: number | undefined;
+  readonly #loopWorkspace: string | undefined;
 
   constructor(options: HumanAgentOptions = {}) {
     this.interrupt = new InterruptController();
     this.eyes = options.eyes ?? buildDefaultEyes();
-    this.hands = options.hands ?? buildDefaultHands();
+    this.hands = options.hands ?? buildDefaultHands(options.workspace);
+    this.#loopWorkspace = options.workspace;
     this.nose = options.nose ?? buildDefaultNose();
     this.mouth = options.mouth ?? new AskUser();
     this.ears = options.ears ?? new TextInput();
@@ -64,7 +68,7 @@ export class HumanAgent {
     this.context = options.context ?? new ConversationContext({ maxTokens: 8000 });
     this.maxIterations = options.maxIterations ?? 10;
     this.timeoutMs = options.timeoutMs;
-    this.brain = options.brain ?? buildDefaultBrain(options.whitelistFile);
+    this.brain = options.brain ?? buildDefaultBrain(options.whitelistFile, options.workspace);
   }
 
   async run(): Promise<AgentStatus> {
@@ -82,17 +86,19 @@ export class HumanAgent {
       context: this.context,
       maxIterations: this.maxIterations,
       ...(this.timeoutMs !== undefined ? { timeoutMs: this.timeoutMs } : {}),
+      ...(this.#loopWorkspace !== undefined ? { workspace: this.#loopWorkspace } : {}),
     });
     await loop.run();
     return loop.getStatus();
   }
 }
 
-function buildDefaultBrain(whitelistFile?: string): BrainInference {
+function buildDefaultBrain(whitelistFile?: string, workspace?: string): BrainInference {
   return new OllamaThinking({
     ...(process.env.OLLAMA_BASE_URL !== undefined ? { baseUrl: process.env.OLLAMA_BASE_URL } : {}),
     ...(process.env.OLLAMA_MODEL !== undefined ? { model: process.env.OLLAMA_MODEL } : {}),
     ...(whitelistFile !== undefined ? { whitelistFile } : {}),
+    ...(workspace !== undefined ? { workspace } : {}),
   });
 }
 
@@ -103,11 +109,13 @@ export interface BridgeServiceOptions {
   logger?: (text: string) => void;
   /** 白名单文件；缺省 ~/.human-agent/whitelist.json（注入隔离测试/多实例用） */
   whitelistFile?: string;
+  /** 工作区（启动 realpath 规范化）；缺省 process.cwd()。 */
+  workspace?: string;
 }
 
 /** 桥模式组装：网页对话 + 智能体仅执行工具。port 缺省读 GEMINI_BRIDGE_PORT（非法回退 8765）。 */
 export function buildBridgeService(options: BridgeServiceOptions = {}): GeminiBridgeThinking {
-  const hands = buildDefaultHands();
+  const hands = buildDefaultHands(options.workspace);
   const eyes = buildDefaultEyes();
   const port = options.port ?? (() => {
     const raw = process.env.GEMINI_BRIDGE_PORT;
@@ -123,6 +131,7 @@ export function buildBridgeService(options: BridgeServiceOptions = {}): GeminiBr
     ...(options.timeoutMs !== undefined ? { timeoutMs: options.timeoutMs } : {}),
     ...(options.logger !== undefined ? { logger: options.logger } : {}),
     ...(options.whitelistFile !== undefined ? { whitelistFile: options.whitelistFile } : {}),
+    ...(options.workspace !== undefined ? { workspace: options.workspace } : {}),
   });
 }
 
@@ -147,9 +156,9 @@ function buildDefaultEyes(): EyesContract {
   };
 }
 
-function buildDefaultHands(): HandsContract {
+function buildDefaultHands(workspace?: string): HandsContract {
   const writer = new FileWriter();
-  const terminal = new Terminal();
+  const terminal = new Terminal({ ...(workspace !== undefined ? { cwd: workspace } : {}) });
   return {
     writeFile: (path, content) => writer.writeFile(path, content),
     applyPatch: (path, patch) => writer.applyPatch(path, patch),
