@@ -29,6 +29,8 @@ export interface AgentLoopOptions {
   /** 单轮任务超时（毫秒），0 表示禁用；超时后终止本轮并继续监听。 */
   timeoutMs?: number;
   onPhase?: (phase: AgentPhase, detail?: string) => void;
+  /** 工作区（判定基准；缺省 process.cwd()）。 */
+  workspace?: string;
 }
 
 /** 解析超时时长：纯数字按毫秒；s/m/h 后缀按秒/分/时；0 或 off 表示禁用；非法返回 null。 */
@@ -58,6 +60,7 @@ export class AgentLoop {
   readonly #maxIterations: number;
   #timeoutMs: number;
   readonly #onPhase: ((phase: AgentPhase, detail?: string) => void) | undefined;
+  readonly #workspace: string;
 
   #status: AgentStatus = "IDLE";
   #turnTimedOut = false;
@@ -74,6 +77,7 @@ export class AgentLoop {
     this.#maxIterations = options.maxIterations ?? 10;
     this.#timeoutMs = options.timeoutMs ?? 300_000;
     this.#onPhase = options.onPhase;
+    this.#workspace = options.workspace ?? process.cwd();
   }
 
   getStatus(): AgentStatus {
@@ -259,7 +263,7 @@ export class AgentLoop {
         const kind = isPathTool(call.name) ? "path" : "exact";
         const prompt: ApprovalPrompt = {
           tool: call.name,
-          key: matchKeyFor(call, process.cwd()) ?? "",
+          key: matchKeyFor(call, this.#workspace) ?? "",
           kind,
         };
         const choice = await this.#mouth.askApproval(prompt);

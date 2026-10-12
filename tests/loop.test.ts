@@ -1,4 +1,6 @@
-import { rmSync } from "node:fs";
+import { mkdtempSync, realpathSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { describe, expect, it, vi } from "vitest";
 import { ConversationContext } from "../src/brain/context.js";
 import { AgentLoop } from "../src/heart/loop.js";
@@ -6,6 +8,7 @@ import { TextOutput } from "../src/mouth/text-output.js";
 import { fail, type AgentPhase, type EarsContract, type MouthContract } from "../src/types/index.js";
 import type { ApprovalChoice, ApprovalPrompt, WhitelistEntry } from "../src/types/index.js";
 import type { BrainInference, BrainInferenceResult, ReflectionVerdict, ToolCall, ToolInfo } from "../src/brain/llm.js";
+import { normalizeMatchKey } from "../src/nose/workspace-path.js";
 import {
   FakeEars,
   FakeWritable,
@@ -99,6 +102,7 @@ function makeLoop(options: {
   maxIterations?: number;
   timeoutMs?: number;
   onPhase?: (phase: AgentPhase, detail?: string) => void;
+  workspace?: string;
 }) {
   return new AgentLoop({
     brain: options.brain,
@@ -111,6 +115,7 @@ function makeLoop(options: {
     maxIterations: options.maxIterations,
     timeoutMs: options.timeoutMs,
     onPhase: options.onPhase,
+    workspace: options.workspace,
   });
 }
 
@@ -642,30 +647,112 @@ describe("AgentLoop", () => {
     expect(parsed.error?.code).toBe("USER_DENIED");
   });
 
-  it("pending 加入白名单：条目落盘后执行", async () => {
-    const call = { name: "write_file", arguments: { path: "src/a.ts", content: "x" } };
-    const brain = pendingBrain(call);
-    const entry: WhitelistEntry = { tool: "write_file", key: "src/a.ts", kind: "path" };
-    const loop = new AgentLoop({
-      brain,
-      ears: new FakeEars(["任务", "/exit"]),
-      eyes: buildEyes(),
-      hands: buildHands(),
-      output: new TextOutput({ stdout: new FakeWritable(), intervalMs: 0 }),
-      signal: new AbortController().signal,
-      mouth: {
-        confirm: async () => true,
-        askApproval: async (prompt: ApprovalPrompt) =>
-          prompt.kind === "path" ? { action: "whitelist", entry } : { action: "allow" },
-      },
-    });
-    await loop.run();
+  it("pending 加入白名单：提示键为管道匹配键，条目落盘后执行（临时工作区）", async () => {
+    const ws = mkdtempSync(join(tmpdir(), "loop-ws-"));
     try {
+      const wsReal = realpathSync(ws);
+      const call = { name: "write_file", arguments: { path: "src/a.ts", content: "x" } };
+      const brain = pendingBrain(call);
+      const entry: WhitelistEntry = {
+        tool: "write_file",
+        key: normalizeMatchKey(join(wsReal, "src", "a.ts")),
+        kind: "path",
+      };
+      const prompts: ApprovalPrompt[] = [];
+      const loop = new AgentLoop({
+        brain,
+        ears: new FakeEars(["任务", "/exit"]),
+        eyes: buildEyes(),
+        hands: buildHands(),
+        output: new TextOutput({ stdout: new FakeWritable(), intervalMs: 0 }),
+        signal: new AbortController().signal,
+        workspace: wsReal,
+        mouth: {
+          confirm: async () => true,
+          askApproval: async (prompt: ApprovalPrompt) => {
+            prompts.push(prompt);
+            return prompt.kind === "path" ? { action: "whitelist", entry } : { action: "allow" };
+          },
+        },
+      });
+      await loop.run();
+      expect(prompts).toEqual([{ tool: "write_file", key: entry.key, kind: "path" }]);
       expect(brain.addedWhitelist).toEqual([entry]);
       expect(brain.messagesOf(1).find((m) => m.role === "tool")).toBeDefined();
     } finally {
-      // 清理真实写入（CWD 相对路径），防止测试产物污染 src/ 导致 tsc 失败
+      rmSync(ws, { recursive: true, force: true });
+      // Task 4 前执行器仍按 CWD 解析相对路径：兜底清理真实写入的 src/a.ts（Task 4 接入 workspace 后成为空操作）
       rmSync("src/a.ts", { force: true });
+    }
+  });
+
+  it("edit_file 属写类：审批提示 kind=path（WRITE_TOOLS 漏项回归）", async () => {
+    const ws = mkdtempSync(join(tmpdir(), "loop-ws-"));
+    try {
+      const wsReal = realpathSync(ws);
+      const call = { name: "edit_file", arguments: { path: "x.ts", hunks: [{ search: "a", replace: "b" }] } };
+      const brain = pendingBrain(call);
+      const prompts: ApprovalPrompt[] = [];
+      const loop = new AgentLoop({
+        brain,
+        ears: new FakeEars(["任务", "/exit"]),
+        eyes: buildEyes(),
+        hands: buildHands(),
+        output: new TextOutput({ stdout: new FakeWritable(), intervalMs: 0 }),
+        signal: new AbortController().signal,
+        workspace: wsReal,
+        mouth: {
+          confirm: async () => true,
+          askApproval: async (prompt: ApprovalPrompt) => {
+            prompts.push(prompt);
+            return { action: "deny" };
+          },
+        },
+      });
+      await loop.run();
+      expect(prompts[0]).toEqual({
+        tool: "edit_file",
+        key: normalizeMatchKey(join(wsReal, "x.ts")),
+        kind: "path",
+      });
+    } finally {
+      rmSync(ws, { recursive: true, force: true });
+    }
+  });
+
+  it("读类调用审批：提示 kind=path，此目录条目 = read_dir 自身 + /", async () => {
+    const ws = mkdtempSync(join(tmpdir(), "loop-ws-"));
+    try {
+      const wsReal = realpathSync(ws);
+      const call = { name: "read_dir", arguments: { path: "sub" } };
+      const brain = pendingBrain(call);
+      const expected: WhitelistEntry = {
+        tool: "read_dir",
+        key: `${normalizeMatchKey(join(wsReal, "sub"))}/`,
+        kind: "path",
+      };
+      const prompts: ApprovalPrompt[] = [];
+      const loop = new AgentLoop({
+        brain,
+        ears: new FakeEars(["任务", "/exit"]),
+        eyes: buildEyes(),
+        hands: buildHands(),
+        output: new TextOutput({ stdout: new FakeWritable(), intervalMs: 0 }),
+        signal: new AbortController().signal,
+        workspace: wsReal,
+        mouth: {
+          confirm: async () => true,
+          askApproval: async (prompt: ApprovalPrompt) => {
+            prompts.push(prompt);
+            return { action: "whitelist", entry: expected };
+          },
+        },
+      });
+      await loop.run();
+      expect(prompts[0]).toEqual({ tool: "read_dir", key: normalizeMatchKey(join(wsReal, "sub")), kind: "path" });
+      expect(brain.addedWhitelist).toEqual([expected]);
+    } finally {
+      rmSync(ws, { recursive: true, force: true });
     }
   });
 });

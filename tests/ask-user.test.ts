@@ -106,6 +106,18 @@ describe("askApproval 三选", () => {
       entry: { tool: "write_file", key: "/x", kind: "path" },
     });
   });
+  it("读类 d 分支：read_dir 此目录 = 自身 + /；read_file = 父目录 + /", async () => {
+    const ask1 = new AskUser({ input: inputFrom("d\n") });
+    expect(await ask1.askApproval({ tool: "read_dir", key: "c:/ws/src", kind: "path" })).toEqual({
+      action: "whitelist",
+      entry: { tool: "read_dir", key: "c:/ws/src/", kind: "path" },
+    });
+    const ask2 = new AskUser({ input: inputFrom("d\n") });
+    expect(await ask2.askApproval({ tool: "read_file", key: "c:/ws/src/a.ts", kind: "path" })).toEqual({
+      action: "whitelist",
+      entry: { tool: "read_file", key: "c:/ws/src/", kind: "path" },
+    });
+  });
   it("非法输入循环追问（x 后 y 生效）", async () => {
     const ask = new AskUser({ input: inputFrom("x\ny\n") });
     const choice = await ask.askApproval({ tool: "terminal", key: "ls", kind: "exact" });

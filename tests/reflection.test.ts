@@ -1,6 +1,10 @@
+import { mkdtempSync, realpathSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { describe, expect, it } from "vitest";
 import { PermissionPolicy } from "../src/nose/policy.js";
 import { Reflection } from "../src/brain/reflection.js";
+import { normalizeMatchKey } from "../src/nose/workspace-path.js";
 
 function policy(entries = []) {
   return new PermissionPolicy({ workspace: "/ws", entries });
@@ -50,5 +54,26 @@ describe("Reflection 权限集成裁决", () => {
       { name: "terminal", arguments: { command: "git push --force origin main" } },
     ]);
     expect(verdict.pending).toHaveLength(1);
+  });
+
+  it("读界内 allowed（写 path-dir 覆盖读）、读界外 pending", async () => {
+    const ws = mkdtempSync(join(tmpdir(), "reflect-ws-"));
+    try {
+      const wsReal = realpathSync(ws);
+      const p = new PermissionPolicy({
+        workspace: wsReal,
+        entries: [{ tool: "write_file", key: `${normalizeMatchKey(wsReal)}/`, kind: "path" }],
+      });
+      const outside = process.platform === "win32" ? "D:\\secrets.txt" : "/etc/secrets.txt";
+      const verdict = await new Reflection(p).reflect([
+        { name: "read_file", arguments: { path: "src/a.ts" } },
+        { name: "read_file", arguments: { path: outside } },
+      ]);
+      expect(verdict.allowed).toHaveLength(1);
+      expect(verdict.pending).toHaveLength(1);
+      expect(verdict.blocked).toEqual([]);
+    } finally {
+      rmSync(ws, { recursive: true, force: true });
+    }
   });
 });

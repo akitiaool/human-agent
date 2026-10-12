@@ -1,5 +1,6 @@
 import { createInterface } from "node:readline/promises";
 import type { Readable, Writable } from "node:stream";
+import { dirEntryKey } from "../nose/policy.js";
 import type { ApprovalChoice, ApprovalPrompt } from "../types/index.js";
 
 export interface AskUserOptions {
@@ -51,17 +52,11 @@ export class AskUser {
           return { action: "whitelist", entry: { tool: prompt.tool, key: prompt.key, kind: prompt.kind } };
         }
         if (answer === "d" && isPath) {
-          const i = prompt.key.lastIndexOf("/");
-          // 根级/盘符根：dir 条目=全部绝对路径/整盘超授权，降级为文件条目（与 buildWhitelistEntry 一致）
-          if (i <= 0 || (i === 2 && prompt.key[1] === ":")) {
-            return {
-              action: "whitelist",
-              entry: { tool: prompt.tool, key: prompt.key, kind: "path" },
-            };
-          }
+          // 根级/盘符根：dir 条目=全部绝对路径/整盘超授权 → 降级文件条目；读目录类 = 自身 + /
+          const dirKey = dirEntryKey(prompt.tool, prompt.key);
           return {
             action: "whitelist",
-            entry: { tool: prompt.tool, key: `${prompt.key.slice(0, i)}/`, kind: "path" },
+            entry: { tool: prompt.tool, key: dirKey ?? prompt.key, kind: "path" },
           };
         }
         this.#output?.write(`请输入 y / n / w${isPath ? " / d" : ""}。\n`);
