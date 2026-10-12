@@ -36,7 +36,7 @@ describe("BaseThinking 通用确定性层", () => {
       { name: "terminal", arguments: { command: "rm -rf /" } },
       { name: "terminal", arguments: { command: "ls -la" } },
     ]);
-    expect(verdict.blocked[0]!.result.error?.code).toBe("BLACKLIST");
+    expect(verdict.blocked[0]!.result.error?.code).toBe("blacklist");
     expect(verdict.pending).toHaveLength(1);
   });
 

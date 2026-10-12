@@ -11,7 +11,7 @@ const wsReal = realpathSync(ws);
 afterAll(() => rmSync(ws, { recursive: true, force: true }));
 
 function ok<T>(data: T): ActionResult<T> {
-  return { success: true, data };
+  return { status: "ok", data };
 }
 
 function makeRecordingOrgans() {
@@ -91,7 +91,7 @@ describe("executeTool 执行一致性（执行落点 = 判定落点）", () => {
   it("terminal cwd 钉到工作区（相对命令目标落在工作区内）", async () => {
     const terminal = new Terminal({ cwd: wsReal });
     const result = await terminal.executeCommand('node -e "console.log(process.cwd())"');
-    expect(result.success).toBe(true);
+    expect(result.status).toBe("ok");
     expect(realpathSync(String(result.data).trim())).toBe(wsReal);
   });
 

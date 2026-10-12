@@ -3,29 +3,16 @@ import type { DiffHunk } from "../brain/llm.js";
 
 // ---------- 通用工具结果契约：双手/眼睛无论成败必须返回，严禁抛错 (§6.1) ----------
 
-export interface ActionResult<T = unknown> {
-  success: boolean;
-  data?: T;
-  error?: {
-    code: string;
-    message: string;
-    stack?: string;
-  };
+export type ActionResult<T = unknown> =
+  | { status: "ok"; data?: T }
+  | { status: "error"; error: { code: string; message: string; stack?: string } };
+
+export function ok<T>(data?: T): ActionResult<T> {
+  return data === undefined ? { status: "ok" } : { status: "ok", data };
 }
 
-export function ok<T>(data: T): ActionResult<T> {
-  return { success: true, data };
-}
-
-export function fail<T = never>(code: string, message: string, stack?: string): ActionResult<T> {
-  return {
-    success: false,
-    error: {
-      code,
-      message,
-      ...(stack !== undefined ? { stack } : {}),
-    },
-  };
+export function fail(code: string, message: string, stack?: string): ActionResult<never> {
+  return { status: "error", error: stack !== undefined ? { code, message, stack } : { code, message } };
 }
 
 // ---------- 鼻子：嗅探与预警 (§3.7) ----------

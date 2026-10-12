@@ -55,7 +55,7 @@ export class FileReader {
         totalLines,
       });
     } catch (err) {
-      return fail(errnoCode(err, "READ_ERROR"), errnoMessage(err));
+      return fail(errnoCode(err, "read-error"), errnoMessage(err));
     }
   }
 
@@ -63,7 +63,7 @@ export class FileReader {
     try {
       return ok((await readdir(path)).sort());
     } catch (err) {
-      return fail(errnoCode(err, "READ_ERROR"), errnoMessage(err));
+      return fail(errnoCode(err, "read-error"), errnoMessage(err));
     }
   }
 
@@ -75,14 +75,14 @@ export class FileReader {
     try {
       regex = new RegExp(pattern);
     } catch (err) {
-      return fail("INVALID_PATTERN", `非法正则表达式: ${pattern}`);
+      return fail("invalid-pattern", `非法正则表达式: ${pattern}`);
     }
     const matches: string[] = [];
     try {
       await this.#walk(dir, dir, regex, matches);
       return ok(matches);
     } catch (err) {
-      return fail(errnoCode(err, "READ_ERROR"), errnoMessage(err));
+      return fail(errnoCode(err, "read-error"), errnoMessage(err));
     }
   }
 

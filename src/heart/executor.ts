@@ -69,6 +69,6 @@ export async function executeTool(
     case "fetch_page":
       return organs.eyes.fetchPageAsMarkdown(args.url as string);
     default:
-      return fail("UNKNOWN_TOOL", `未知工具: ${name}`);
+      return fail("unknown-tool", `未知工具: ${name}`);
   }
 }

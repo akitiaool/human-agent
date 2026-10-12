@@ -22,13 +22,13 @@ export class Reflection {
       if (verdict.status === "blacklist") {
         blocked.push({
           call,
-          result: fail("BLACKLIST", `系统破坏操作，禁止执行：${verdict.key ?? call.name}`),
+          result: fail("blacklist", `系统破坏操作，禁止执行：${verdict.key ?? call.name}`),
         });
         continue;
       }
       const schema = schemas[call.name as keyof typeof schemas];
       if (schema === undefined) {
-        blocked.push({ call, result: fail("UNKNOWN_TOOL", `未知工具: ${call.name}`) });
+        blocked.push({ call, result: fail("unknown-tool", `未知工具: ${call.name}`) });
         continue;
       }
       const parsed = schema.safeParse(call.arguments);
@@ -38,7 +38,7 @@ export class Reflection {
           .join("; ");
         blocked.push({
           call,
-          result: fail("INVALID_ARGS", `工具 ${call.name} 参数不合法: ${issues}`),
+          result: fail("invalid-args", `工具 ${call.name} 参数不合法: ${issues}`),
         });
         continue;
       }

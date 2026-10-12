@@ -11,14 +11,14 @@ function policy(entries = []) {
 }
 
 describe("Reflection 权限集成裁决", () => {
-  it("黑名单命中 → BLACKLIST 拦截（无审批无白名单）", async () => {
+  it("黑名单命中 → blacklist 拦截（无审批无白名单）", async () => {
     const verdict = await new Reflection(policy()).reflect([
       { name: "terminal", arguments: { command: "rm -rf /" } },
     ]);
     expect(verdict.allowed).toEqual([]);
     expect(verdict.pending).toEqual([]);
     expect(verdict.blocked).toHaveLength(1);
-    expect(verdict.blocked[0]!.result.error?.code).toBe("BLACKLIST");
+    expect(verdict.blocked[0]!.result.error?.code).toBe("blacklist");
   });
 
   it("白名单命中 → 放行（不进 pending）", async () => {
@@ -45,7 +45,7 @@ describe("Reflection 权限集成裁决", () => {
       { name: "ghost_tool", arguments: {} },
       { name: "terminal", arguments: {} },
     ]);
-    expect(verdict.blocked.map((b) => b.result.error?.code)).toEqual(["UNKNOWN_TOOL", "INVALID_ARGS"]);
+    expect(verdict.blocked.map((b) => b.result.error?.code)).toEqual(["unknown-tool", "invalid-args"]);
     expect(verdict.pending).toEqual([]);
   });
 

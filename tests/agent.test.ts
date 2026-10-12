@@ -78,11 +78,11 @@ describe("HumanAgent", () => {
     const toolMessage = brain.messagesOf(1).find((m) => m.role === "tool");
     expect(toolMessage).toBeDefined();
     const parsed = JSON.parse(toolMessage!.content) as {
-      success: boolean;
+      status: string;
       error?: { code: string };
     };
-    expect(parsed.success).toBe(false);
-    expect(parsed.error?.code).toBe("EXEC_TIMEOUT");
+    expect(parsed.status).toBe("error");
+    expect(parsed.error?.code).toBe("exec-timeout");
   });
 
   it("可注入自定义器官覆盖默认实现", async () => {
@@ -105,8 +105,8 @@ describe("HumanAgent", () => {
     const status = await agent.run();
     expect(status).toBe("IDLE");
     const toolMessage = brain.messagesOf(1).find((m) => m.role === "tool");
-    const parsed = JSON.parse(toolMessage!.content) as { success: boolean };
-    expect(parsed.success).toBe(true);
+    const parsed = JSON.parse(toolMessage!.content) as { status: string };
+    expect(parsed.status).toBe("ok");
   });
 
   it("默认组装的大脑为 OllamaThinking", async () => {

@@ -104,7 +104,7 @@ describe("OllamaBrain", () => {
           content: "",
           toolCalls: [{ name: "terminal", arguments: { command: "echo x" } }],
         },
-        { role: "tool", name: "terminal", content: '{"success":true}' },
+        { role: "tool", name: "terminal", content: '{"status":"ok"}' },
       ),
       TOOLS,
     );
@@ -120,7 +120,7 @@ describe("OllamaBrain", () => {
         content: "",
         tool_calls: [{ function: { name: "terminal", arguments: { command: "echo x" } } }],
       },
-      { role: "tool", content: '{"success":true}' },
+      { role: "tool", content: '{"status":"ok"}' },
     ]);
     expect(body.tools).toEqual([
       {
@@ -174,7 +174,7 @@ describe("OllamaBrain", () => {
   it("reflect 继承 BaseThinking：黑名单拦截 / 未列命令进 pending", async () => {
     const brain = new OllamaThinking({ fetchImpl: vi.fn(), whitelistFile, workspace: "/ws-test" });
     const verdict = await brain.reflect([{ name: "terminal", arguments: { command: "rm -rf /" } }]);
-    expect(verdict.blocked[0]?.result.error?.code).toBe("BLACKLIST");
+    expect(verdict.blocked[0]?.result.error?.code).toBe("blacklist");
     const pending = await brain.reflect([{ name: "terminal", arguments: { command: "ls -la" } }]);
     expect(pending.pending).toHaveLength(1);
   });

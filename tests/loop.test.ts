@@ -156,8 +156,8 @@ describe("AgentLoop", () => {
     const secondCall = brain.messagesOf(1);
     const toolMessage = secondCall.find((m) => m.role === "tool");
     expect(toolMessage).toBeDefined();
-    const parsed = JSON.parse(toolMessage!.content) as { success: boolean; data?: string };
-    expect(parsed.success).toBe(true);
+    const parsed = JSON.parse(toolMessage!.content) as { status: string; data?: string };
+    expect(parsed.status).toBe("ok");
     expect(parsed.data).toContain("loop-hi");
   });
 
@@ -187,8 +187,8 @@ describe("AgentLoop", () => {
     await loop.run();
     const toolMessage = brain.messagesOf(1).find((m) => m.role === "tool");
     expect(toolMessage).toBeDefined();
-    const parsed = JSON.parse(toolMessage!.content) as { success: boolean; data?: string };
-    expect(parsed.success).toBe(true);
+    const parsed = JSON.parse(toolMessage!.content) as { status: string; data?: string };
+    expect(parsed.status).toBe("ok");
     expect(parsed.data).toContain("# 抓到的标题");
   });
 
@@ -226,7 +226,7 @@ describe("AgentLoop", () => {
       {
         allowed: [],
         pending: [],
-        blocked: [{ call, result: fail("USER_DENIED", "用户拒绝了命令") }],
+        blocked: [{ call, result: fail("user-denied", "用户拒绝了命令") }],
       },
     );
     const signal = new AbortController().signal;
@@ -234,9 +234,9 @@ describe("AgentLoop", () => {
     await loop.run();
     const toolMessage = brain.messagesOf(1).find((m) => m.role === "tool");
     expect(toolMessage).toBeDefined();
-    const parsed = JSON.parse(toolMessage!.content) as { success: boolean; error?: { code: string } };
-    expect(parsed.success).toBe(false);
-    expect(parsed.error?.code).toBe("USER_DENIED");
+    const parsed = JSON.parse(toolMessage!.content) as { status: string; error?: { code: string } };
+    expect(parsed.status).toBe("error");
+    expect(parsed.error?.code).toBe("user-denied");
   });
 
   it("多个工具调用按原数组顺序依次执行与写入上下文（保持时序不乱序）", async () => {
@@ -253,7 +253,7 @@ describe("AgentLoop", () => {
       {
         allowed: [call2],
         pending: [call1],
-        blocked: [{ call: call3, result: fail("BLACKLIST", "黑名单禁止") }],
+        blocked: [{ call: call3, result: fail("blacklist", "黑名单禁止") }],
       },
     );
 
@@ -285,7 +285,7 @@ describe("AgentLoop", () => {
     expect(toolMessages[0]!.name).toBe("terminal");
     expect(toolMessages[1]!.name).toBe("terminal");
     expect(toolMessages[2]!.name).toBe("terminal");
-    expect(JSON.parse(toolMessages[2]!.content)).toMatchObject({ success: false, error: { code: "BLACKLIST" } });
+    expect(JSON.parse(toolMessages[2]!.content)).toMatchObject({ status: "error", error: { code: "blacklist" } });
   });
 
   it("多个工具中部分被拒绝/失败不中断其他正常工具的独立执行", async () => {
@@ -322,8 +322,8 @@ describe("AgentLoop", () => {
     const secondCall = brain.messagesOf(1);
     const toolMessages = secondCall.filter((m) => m.role === "tool");
     expect(toolMessages).toHaveLength(2);
-    expect(JSON.parse(toolMessages[0]!.content)).toMatchObject({ success: false, error: { code: "USER_DENIED" } });
-    expect(JSON.parse(toolMessages[1]!.content)).toMatchObject({ success: true });
+    expect(JSON.parse(toolMessages[0]!.content)).toMatchObject({ status: "error", error: { code: "user-denied" } });
+    expect(JSON.parse(toolMessages[1]!.content)).toMatchObject({ status: "ok" });
   });
 
   it("输入为空或 /exit 时退出且不调用大脑", async () => {
@@ -431,8 +431,8 @@ describe("AgentLoop", () => {
     const loop = makeLoop({ brain, ears: new FakeEars(["任务", "继续", "/exit"]), signal, timeoutMs: 20 });
     await loop.run();
     const toolMessage = brain.messagesOf(1).find((m) => m.role === "tool");
-    const parsed = JSON.parse(toolMessage!.content) as { success: boolean };
-    expect(parsed.success).toBe(false);
+    const parsed = JSON.parse(toolMessage!.content) as { status: string };
+    expect(parsed.status).toBe("error");
   });
 
   it("推理期间被中断时状态为 INTERRUPTED 而非 ERROR", async () => {
@@ -534,11 +534,11 @@ describe("AgentLoop", () => {
     const toolMessage = brain.messagesOf(1).find((m) => m.role === "tool");
     expect(toolMessage).toBeDefined();
     const parsed = JSON.parse(toolMessage!.content) as {
-      success: boolean;
+      status: string;
       error?: { code: string };
     };
-    expect(parsed.success).toBe(false);
-    expect(parsed.error?.code).toBe("EXEC_TIMEOUT");
+    expect(parsed.status).toBe("error");
+    expect(parsed.error?.code).toBe("exec-timeout");
   });
 
   it("上下文在会话中持续累积", async () => {
@@ -625,10 +625,10 @@ describe("AgentLoop", () => {
     await loop.run();
     expect(prompts).toEqual([{ tool: "terminal", key: "ls -la", kind: "exact" }]);
     const toolMessage = brain.messagesOf(1).find((m) => m.role === "tool");
-    expect(JSON.parse(toolMessage!.content) as { success: boolean }).toMatchObject({ success: true });
+    expect(JSON.parse(toolMessage!.content) as { status: string }).toMatchObject({ status: "ok" });
   });
 
-  it("pending 拒绝：USER_DENIED 反馈，不执行", async () => {
+  it("pending 拒绝：user-denied 反馈，不执行", async () => {
     const call = { name: "terminal", arguments: { command: "ls -la" } };
     const brain = pendingBrain(call);
     const loop = new AgentLoop({
@@ -642,9 +642,9 @@ describe("AgentLoop", () => {
     });
     await loop.run();
     const toolMessage = brain.messagesOf(1).find((m) => m.role === "tool");
-    const parsed = JSON.parse(toolMessage!.content) as { success: boolean; error?: { code: string } };
-    expect(parsed.success).toBe(false);
-    expect(parsed.error?.code).toBe("USER_DENIED");
+    const parsed = JSON.parse(toolMessage!.content) as { status: string; error?: { code: string } };
+    expect(parsed.status).toBe("error");
+    expect(parsed.error?.code).toBe("user-denied");
   });
 
   it("pending 加入白名单：提示键为管道匹配键，条目落盘后执行（临时工作区）", async () => {

@@ -31,18 +31,18 @@ export class Terminal {
       if (err instanceof ExecaError) {
         if (err.timedOut) {
           return fail(
-            "EXEC_TIMEOUT",
+            "exec-timeout",
             `命令执行超时（${timeoutMs}ms）: ${err.shortMessage}`,
           );
         }
         return fail(
-          "EXEC_ERROR",
+          "exec-error",
           err.shortMessage,
           err.stderr || err.stdout || undefined,
         );
       }
       return fail(
-        "EXEC_ERROR",
+        "exec-error",
         err instanceof Error ? err.message : String(err),
       );
     }

@@ -60,11 +60,11 @@ describe("ConversationContext", () => {
 
   it("tool 消息可携带工具名", () => {
     const context = new ConversationContext({ maxTokens: 1000 });
-    context.add({ role: "tool", name: "terminal", content: "{\"success\":true}" });
+    context.add({ role: "tool", name: "terminal", content: "{\"status\":\"ok\"}" });
     expect(context.getAll()[0]).toEqual({
       role: "tool",
       name: "terminal",
-      content: '{"success":true}',
+      content: '{"status":"ok"}',
     });
   });
 });

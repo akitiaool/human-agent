@@ -269,7 +269,7 @@ export class AgentLoop {
         };
         const choice = await this.#mouth.askApproval(prompt);
         if (choice.action === "deny") {
-          const denied = fail("USER_DENIED", `用户拒绝了工具调用: ${call.name}`);
+          const denied = fail("user-denied", `用户拒绝了工具调用: ${call.name}`);
           this.#finish(call.name, denied);
           this.#context.add({ role: "tool", name: call.name, content: JSON.stringify(denied) });
           continue;

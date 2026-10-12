@@ -44,13 +44,13 @@ export function applyHunks(originalContent: string, hunks: readonly DiffHunk[]):
     const replace = normalizeCrlf(hunk.replace);
 
     if (search === "") {
-      return fail("EMPTY_SEARCH", `第 ${i + 1} 个 Diff 块的 search 内容不能为空`);
+      return fail("empty-search", `第 ${i + 1} 个 Diff 块的 search 内容不能为空`);
     }
 
     const firstIndex = content.indexOf(search);
     if (firstIndex === -1) {
       return fail(
-        "HUNK_NOT_FOUND",
+        "hunk-not-found",
         `第 ${i + 1} 个 Diff 块在目标文件中未找到匹配代码：\n${truncateSnippet(search, 120)}`,
       );
     }
@@ -58,7 +58,7 @@ export function applyHunks(originalContent: string, hunks: readonly DiffHunk[]):
     const secondIndex = content.indexOf(search, firstIndex + search.length);
     if (secondIndex !== -1) {
       return fail(
-        "AMBIGUOUS_MATCH",
+        "ambiguous-match",
         `第 ${i + 1} 个 Diff 块在目标文件中匹配到多处，请增加上下文行以唯一定位`,
       );
     }

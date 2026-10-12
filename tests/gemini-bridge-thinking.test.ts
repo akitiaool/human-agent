@@ -41,7 +41,7 @@ function makeRecordingOrgans() {
   const eyes: EyesContract = {
     readFile: async (path, options) => {
       calls.push({ name: "read_file", args: { path, ...options } });
-      if (path.endsWith("bad.txt")) return fail("FILE_NOT_FOUND", "文件不存在");
+      if (path.endsWith("bad.txt")) return fail("file-not-found", "文件不存在");
       return ok({ content: `内容:${path}`, versionId: "v-test1234", totalLines: 10 });
     },
     readDir: async (path) => { calls.push({ name: "read_dir", args: { path } }); return ok(["a.txt"]); },
@@ -58,14 +58,14 @@ function makeRecordingOrgans() {
     executeCommand: async (command, _signal, timeoutMs) => {
       calls.push({ name: "terminal", args: { command, timeoutMs } });
       if (command === "slow") await new Promise((r) => setTimeout(r, 10_000));
-      if (command === "fail-cmd") return fail("COMMAND_FAILED", "命令失败");
+      if (command === "fail-cmd") return fail("command-failed", "命令失败");
       return ok({ stdout: `输出:${command}`, exitCode: 0 });
     },
   };
   return { calls, eyes, hands };
 }
 
-function ok<T>(data: T): ActionResult<T> { return { success: true, data }; }
+function ok<T>(data: T): ActionResult<T> { return { status: "ok", data }; }
 
 const openBridges: GeminiBridgeThinking[] = [];
 afterEach(() => { for (const bridge of openBridges.splice(0)) bridge.close(); });
@@ -336,7 +336,7 @@ describe("GeminiBridgeThinking 执行型桥服务", () => {
     expect(organs.calls).toHaveLength(2);
   });
 
-  it("pipeline 模式：前序工具失败后阻断后续工具执行（DEPENDENCY_BLOCKED）", async () => {
+  it("pipeline 模式：前序工具失败后阻断后续工具执行（dependency-blocked）", async () => {
     seedWhitelist(wsReal, [
       { tool: "read_file", key: keyOf("bad.txt"), kind: "path" },
       { tool: "terminal", key: "echo next", kind: "exact" },
@@ -364,7 +364,7 @@ describe("GeminiBridgeThinking 执行型桥服务", () => {
     expect(message).toContain("1. 工具 read_file");
     expect(message).toContain("失败");
     expect(message).toContain("2. 工具 terminal");
-    expect(message).toContain("已阻断（DEPENDENCY_BLOCKED");
+    expect(message).toContain("已阻断（dependency-blocked");
     expect(organs.calls).toEqual([{ name: "read_file", args: { path: join(wsReal, "bad.txt") } }]);
   });
 
@@ -521,7 +521,7 @@ describe("GeminiBridgeThinking 执行型桥服务", () => {
     expect(await postApproval(port, id, [true])).toBe(404);
   });
 
-  it("参数非法的危险命令不进审批，直接 INVALID_ARGS 拒绝", async () => {
+  it("参数非法的危险命令不进审批，直接 invalid-args 拒绝", async () => {
     const { port } = await makeBridge();
     const reply = ["{", "<::: TOOL_CALL[1]", "tool: terminal", ":::> TOOL_CALL[1]", "}"].join("\n");
     const res = await postReply(port, reply);
@@ -534,7 +534,7 @@ describe("GeminiBridgeThinking 执行型桥服务", () => {
     const { port, organs } = await makeBridge();
     await postReply(port, toolCall("terminal", { command: "rm -rf /" }));
     const message = await getMessageText(port);
-    expect(message).toContain("BLACKLIST");
+    expect(message).toContain("blacklist");
     expect(message).toContain("系统破坏操作，禁止执行");
     expect(await tryGetMessage(port, 300)).toBeNull();
     expect(organs.calls).toEqual([]);

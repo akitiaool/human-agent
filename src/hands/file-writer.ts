@@ -22,7 +22,7 @@ export class FileWriter {
       await writeFile(path, content, "utf-8");
       return ok(undefined);
     } catch (err) {
-      return fail(errnoCode(err, "WRITE_ERROR"), errnoMessage(err));
+      return fail(errnoCode(err, "write-error"), errnoMessage(err));
     }
   }
 
@@ -34,7 +34,7 @@ export class FileWriter {
     try {
       current = await readFile(path, "utf-8");
     } catch (err) {
-      return fail(errnoCode(err, "READ_ERROR"), errnoMessage(err));
+      return fail(errnoCode(err, "read-error"), errnoMessage(err));
     }
 
     const ops = patch
@@ -63,7 +63,7 @@ export class FileWriter {
     }
     if (opIndex < ops.length) {
       return fail(
-        "PATCH_NOT_FOUND",
+        "patch-not-found",
         `未匹配到要删除的行: "${ops[opIndex]!.slice(1)}"`,
       );
     }
@@ -73,7 +73,7 @@ export class FileWriter {
       try {
         await writeFile(path, newContent, "utf-8");
       } catch (err) {
-        return fail(errnoCode(err, "WRITE_ERROR"), errnoMessage(err));
+        return fail(errnoCode(err, "write-error"), errnoMessage(err));
       }
     }
     return ok(undefined);
@@ -91,20 +91,20 @@ export class FileWriter {
     try {
       current = await readFile(path, "utf-8");
     } catch (err) {
-      return fail(errnoCode(err, "READ_ERROR"), errnoMessage(err));
+      return fail(errnoCode(err, "read-error"), errnoMessage(err));
     }
 
     const currentVersion = computeVersionId(current);
     if (baseVersion !== undefined && baseVersion !== currentVersion) {
       return fail(
-        "VERSION_MISMATCH",
+        "version-mismatch",
         `文件版本不匹配：声明的 base_version 为 ${baseVersion}，但磁盘当前版本为 ${currentVersion}。请重新读取该文件。`,
       );
     }
 
     const applyRes = applyHunks(current, hunks);
-    if (!applyRes.success) {
-      return fail(applyRes.error!.code, applyRes.error!.message);
+    if (applyRes.status === "error") {
+      return fail(applyRes.error.code, applyRes.error.message);
     }
 
     const newContent = applyRes.data!;
@@ -112,7 +112,7 @@ export class FileWriter {
       try {
         await writeFile(path, newContent, "utf-8");
       } catch (err) {
-        return fail(errnoCode(err, "WRITE_ERROR"), errnoMessage(err));
+        return fail(errnoCode(err, "write-error"), errnoMessage(err));
       }
     }
 

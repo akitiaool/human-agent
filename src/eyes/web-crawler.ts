@@ -21,13 +21,13 @@ export class WebCrawler {
         headers: { "User-Agent": "human-agent/0.1.0" },
       });
       if (!response.ok) {
-        return fail("FETCH_ERROR", `HTTP ${response.status} ${response.statusText}`);
+        return fail("fetch-error", `HTTP ${response.status} ${response.statusText}`);
       }
       const html = await response.text();
       return ok(this.#turndown.turndown(html));
     } catch (err) {
       return fail(
-        "FETCH_ERROR",
+        "fetch-error",
         err instanceof Error ? err.message : String(err),
         err instanceof Error ? err.stack : undefined,
       );

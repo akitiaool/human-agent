@@ -19,18 +19,18 @@ describe("WebCrawler", () => {
     );
     const crawler = makeCrawler(fetchImpl);
     const result = await crawler.fetchPageAsMarkdown("https://example.com/page");
-    expect(result.success).toBe(true);
+    expect(result.status).toBe("ok");
     expect(String(result.data)).toContain("# 标题");
     expect(String(result.data)).toContain("[链接](https://example.com)");
     expect(String(fetchImpl.mock.calls[0]![0])).toBe("https://example.com/page");
   });
 
-  it("非 200 响应返回 FETCH_ERROR", async () => {
+  it("非 200 响应返回 fetch-error", async () => {
     const fetchImpl = vi.fn().mockResolvedValue(htmlResponse("Not Found", 404));
     const crawler = makeCrawler(fetchImpl);
     const result = await crawler.fetchPageAsMarkdown("https://example.com/missing");
-    expect(result.success).toBe(false);
-    expect(result.error?.code).toBe("FETCH_ERROR");
+    expect(result.status).toBe("error");
+    expect(result.error?.code).toBe("fetch-error");
     expect(result.error?.message).toContain("404");
   });
 
@@ -38,8 +38,8 @@ describe("WebCrawler", () => {
     const fetchImpl = vi.fn().mockRejectedValue(new Error("ECONNREFUSED"));
     const crawler = makeCrawler(fetchImpl);
     const result = await crawler.fetchPageAsMarkdown("https://example.com");
-    expect(result.success).toBe(false);
-    expect(result.error?.code).toBe("FETCH_ERROR");
+    expect(result.status).toBe("error");
+    expect(result.error?.code).toBe("fetch-error");
     expect(result.error?.message).toContain("ECONNREFUSED");
   });
 
@@ -47,7 +47,7 @@ describe("WebCrawler", () => {
     const fetchImpl = vi.fn().mockResolvedValue(htmlResponse("<html><body></body></html>"));
     const crawler = makeCrawler(fetchImpl);
     const result = await crawler.fetchPageAsMarkdown("https://example.com/empty");
-    expect(result.success).toBe(true);
+    expect(result.status).toBe("ok");
     expect(String(result.data).trim()).toBe("");
   });
 });

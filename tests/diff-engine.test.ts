@@ -35,7 +35,7 @@ describe("diff-engine", () => {
     const original = "line 1\nline 2\nline 3";
     const hunks = [{ search: "line 2", replace: "line two" }];
     const result = applyHunks(original, hunks);
-    expect(result.success).toBe(true);
+    expect(result.status).toBe("ok");
     expect(result.data).toBe("line 1\nline two\nline 3");
   });
 
@@ -46,31 +46,31 @@ describe("diff-engine", () => {
       { search: "const y = 2;", replace: "const y = 20;" },
     ];
     const result = applyHunks(original, hunks);
-    expect(result.success).toBe(true);
+    expect(result.status).toBe("ok");
     expect(result.data).toBe("const x = 10;\nconst y = 20;");
   });
 
-  it("applyHunks 在未找到匹配时返回 HUNK_NOT_FOUND 且不修改", () => {
+  it("applyHunks 在未找到匹配时返回 hunk-not-found 且不修改", () => {
     const original = "const x = 1;";
     const hunks = [{ search: "const not_found = 2;", replace: "new" }];
     const result = applyHunks(original, hunks);
-    expect(result.success).toBe(false);
-    expect(result.error?.code).toBe("HUNK_NOT_FOUND");
+    expect(result.status).toBe("error");
+    expect(result.error?.code).toBe("hunk-not-found");
   });
 
-  it("applyHunks 在出现多处歧义时返回 AMBIGUOUS_MATCH 且完整回滚", () => {
+  it("applyHunks 在出现多处歧义时返回 ambiguous-match 且完整回滚", () => {
     const original = "const x = 1;\nconst x = 1;";
     const hunks = [{ search: "const x = 1;", replace: "const x = 2;" }];
     const result = applyHunks(original, hunks);
-    expect(result.success).toBe(false);
-    expect(result.error?.code).toBe("AMBIGUOUS_MATCH");
+    expect(result.status).toBe("error");
+    expect(result.error?.code).toBe("ambiguous-match");
   });
 
   it("applyHunks 支持 CRLF 换行符并在返回时保留 CRLF 格式", () => {
     const original = "line 1\r\nline 2\r\nline 3";
     const hunks = [{ search: "line 2", replace: "line 2 (modified)" }];
     const result = applyHunks(original, hunks);
-    expect(result.success).toBe(true);
+    expect(result.status).toBe("ok");
     expect(result.data).toBe("line 1\r\nline 2 (modified)\r\nline 3");
   });
 });

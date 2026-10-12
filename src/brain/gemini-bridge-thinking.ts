@@ -394,7 +394,7 @@ export class GeminiBridgeThinking extends BaseThinking {
         lineIndex++;
         const idx = lineIndex;
         if (isBlockedByParent) {
-          const blockedRes = fail("DEPENDENCY_BLOCKED", "前序依赖步骤执行失败或被拒绝，已跳过");
+          const blockedRes = fail("dependency-blocked", "前序依赖步骤执行失败或被拒绝，已跳过");
           lines.push(serializeBlockedLine(idx, call, blockedRes));
           return false;
         }
@@ -409,7 +409,7 @@ export class GeminiBridgeThinking extends BaseThinking {
           if (allowed) {
             toRun = call;
           } else {
-            blockedResult = fail("USER_DENIED", decision?.timedOut === true ? "审批超时，未执行" : "用户未授权，未执行");
+            blockedResult = fail("user-denied", decision?.timedOut === true ? "审批超时，未执行" : "用户未授权，未执行");
           }
         }
 
@@ -426,10 +426,10 @@ export class GeminiBridgeThinking extends BaseThinking {
             return false;
           }
           lines.push(serializeResultLine(idx, toRun, result));
-          return result.success;
+          return result.status === "ok";
         } else if (blockedResult !== undefined) {
           lines.push(serializeBlockedLine(idx, call, blockedResult));
-          return blockedResult.success;
+          return blockedResult.status === "ok";
         }
         return false;
       }
@@ -609,16 +609,16 @@ function abortSignalPromise(signal: AbortSignal): Promise<never> {
 
 /** 回填消息格式：`N. 工具 {name} 参数 {args} → 成功/失败`，附 ActionResult JSON 代码块。 */
 function serializeResultLine(index: number, call: ToolCall, result: ActionResult<unknown>): string {
-  const status = result.success ? "成功" : "失败";
+  const status = result.status === "ok" ? "成功" : "失败";
   const fence = "```";
   return `${index}. 工具 ${call.name} 参数 ${JSON.stringify(call.arguments)} → ${status}：\n${fence}json\n${JSON.stringify(result)}\n${fence}`;
 }
 
 /** 拒绝/阻断行：`已拒绝/已阻断（{错误码}：{原因}）`。 */
 function serializeBlockedLine(index: number, call: ToolCall, result: ActionResult<unknown>): string {
-  const code = result.error?.code ?? "UNKNOWN";
-  const reason = result.error?.message ?? JSON.stringify(result);
-  const status = code === "DEPENDENCY_BLOCKED" ? "已阻断" : "已拒绝";
+  const code = result.status === "error" ? result.error.code : "unknown";
+  const reason = result.status === "error" ? result.error.message : JSON.stringify(result);
+  const status = code === "dependency-blocked" ? "已阻断" : "已拒绝";
   return `${index}. 工具 ${call.name} 参数 ${JSON.stringify(call.arguments)} → ${status}（${code}：${reason}）`;
 }
 
