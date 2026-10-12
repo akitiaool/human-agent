@@ -1,5 +1,5 @@
 // 黑名单：确定性系统破坏操作模式（随版本内置；用户可手动编辑，责任自负）。
-// 匹配对象为归一化文本（反斜杠已转正斜杠，空白折叠；terminal 不转小写，模式一律 /i）。
+// 匹配对象为归一化文本（反斜杠已转正斜杠，空白折叠；command_run 不转小写，模式一律 /i）。
 export const commandPatterns: readonly RegExp[] = [
   // rm -rf 跟 根（"/" 或 "/*"）
   /\brm\s+-[^\s]*(?:r[^\s]*f|f[^\s]*r)[^\s]*\s+\/(?:\s|$|\*)/i,
@@ -44,7 +44,7 @@ export const commandPatterns: readonly RegExp[] = [
   /\bchmod\s+-R\s+000\s+\/(?:\s|$|\*|(?:etc|usr|bin|sbin|lib(?:64)?)(?:\s|$|\/))/i,
 ];
 
-/** 写类工具写系统目录：仅当调用为写类工具时由 policy 应用于路径匹配键（读类不硬拒，走信任门禁）。 */
+/** 写类工具写系统目录：仅当调用为写类工具时由 verdict 应用于路径匹配键（读类不硬拒，走信任门禁）。 */
 export const writePathPatterns: readonly RegExp[] = [
   /^[a-z]:\/windows\/(?:system32|boot)(?:\/|$)/i,
   /^[a-z]:\/system\s+volume\s+information(?:\/|$)/i,

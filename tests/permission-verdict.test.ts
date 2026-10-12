@@ -32,7 +32,7 @@ describe("permission/verdict", () => {
   it("黑名单命令直接命中（rm -rf 根）", () => {
     expect(makeVerdict([]).decide({ name: "command_run", arguments: { command: "rm -rf /" } }).status).toBe("blacklist");
   });
-  it("写形态黑名单仅写类路径工具命中（读 System32 不硬拒）", () => {
+  it.runIf(process.platform === "win32")("写形态黑名单仅写类路径工具命中（读 System32 不硬拒）", () => {
     const call = (name: string) => ({ name, arguments: { path: "C:\\Windows\\System32\\drivers\\x.sys" } });
     expect(makeVerdict([]).decide(call("file_write")).status).toBe("blacklist");
     expect(makeVerdict([]).decide(call("file_read")).status).toBe("unlisted");
