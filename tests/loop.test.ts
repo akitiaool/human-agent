@@ -1,21 +1,54 @@
+// AgentLoop 新面：构造收 { permission }（tmp 白名单/候选文件隔离）；工具名新词根；
+// 结果联合一律以 status 收窄访问；pending/白名单动作断言 permission.whitelist.list()。
 import { mkdtempSync, realpathSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { describe, expect, it, vi } from "vitest";
+import { afterAll, describe, expect, it, vi } from "vitest";
 import { ConversationContext } from "../src/brain/context.js";
+import type {
+  BrainInference,
+  BrainInferenceResult,
+  ReflectionVerdict,
+  ToolCall,
+  ToolInfo,
+} from "../src/brain/llm.js";
 import { AgentLoop } from "../src/heart/loop.js";
 import { TextOutput } from "../src/mouth/text-output.js";
-import { fail, type AgentPhase, type EarsContract, type MouthContract } from "../src/types/index.js";
-import type { ApprovalChoice, ApprovalPrompt, WhitelistEntry } from "../src/types/index.js";
-import type { BrainInference, BrainInferenceResult, ReflectionVerdict, ToolCall, ToolInfo } from "../src/brain/llm.js";
-import { normalizeMatchKey } from "../src/nose/workspace-path.js";
-import {
-  FakeEars,
-  FakeWritable,
-  ScriptedBrain,
-  buildEyes,
-  buildHands,
-} from "./helpers.js";
+import { createPermission, normalizeMatchKey, type Permission } from "../src/permission/index.js";
+import { covers, type TrustEntry } from "../src/tool/index.js";
+import { fail } from "../src/types/index.js";
+import type {
+  ActionResult,
+  AgentPhase,
+  ApprovalPrompt,
+  EarsContract,
+  MouthContract,
+} from "../src/types/index.js";
+import { FakeEars, FakeWritable, ScriptedBrain, buildEyes, buildHands } from "./helpers.js";
+
+const wsDir = mkdtempSync(join(tmpdir(), "loop-ws-"));
+const wsReal = realpathSync.native(wsDir);
+const wsKey = normalizeMatchKey(wsReal);
+const fixtureDir = mkdtempSync(join(tmpdir(), "loop-fixture-"));
+let seq = 0;
+afterAll(() => {
+  rmSync(wsDir, { recursive: true, force: true });
+  rmSync(fixtureDir, { recursive: true, force: true });
+});
+
+/** 每例独立 permission（tmp 白名单/候选文件），避免跨用例白名单串扰。 */
+function makePermission(): Permission {
+  const base = join(fixtureDir, `case-${seq++}`);
+  return createPermission({
+    workspace: wsReal,
+    whitelistFile: `${base}-whitelist.json`,
+    candidatesFile: `${base}-candidates.json`,
+  });
+}
+
+function parseResult(content: string): ActionResult<unknown> {
+  return JSON.parse(content) as ActionResult<unknown>;
+}
 
 /** 共享嘴巴替身：confirm 一律放行、审批一律允许。 */
 const autoAllowMouth: MouthContract = {
@@ -53,13 +86,7 @@ class AbortableBrain implements BrainInference {
   }
 
   async reflect(calls: readonly ToolCall[]): Promise<ReflectionVerdict> {
-    return { allowed: [...calls], blocked: [] };
-  }
-
-  async addWhitelistEntry(): Promise<void> {}
-
-  workspaceConstraint(): string {
-    return "test";
+    return { allowed: [...calls], pending: [], blocked: [] };
   }
 }
 
@@ -84,13 +111,7 @@ class TimeoutThenAnswerBrain implements BrainInference {
   }
 
   async reflect(calls: readonly ToolCall[]): Promise<ReflectionVerdict> {
-    return { allowed: [...calls], blocked: [] };
-  }
-
-  async addWhitelistEntry(): Promise<void> {}
-
-  workspaceConstraint(): string {
-    return "test";
+    return { allowed: [...calls], pending: [], blocked: [] };
   }
 }
 
@@ -102,7 +123,7 @@ function makeLoop(options: {
   maxIterations?: number;
   timeoutMs?: number;
   onPhase?: (phase: AgentPhase, detail?: string) => void;
-  workspace?: string;
+  permission?: Permission;
 }) {
   return new AgentLoop({
     brain: options.brain,
@@ -112,10 +133,10 @@ function makeLoop(options: {
     output: new TextOutput({ stdout: new FakeWritable(), intervalMs: 0 }),
     signal: options.signal,
     mouth: options.mouth ?? autoAllowMouth,
-    maxIterations: options.maxIterations,
-    timeoutMs: options.timeoutMs,
-    onPhase: options.onPhase,
-    workspace: options.workspace,
+    permission: options.permission ?? makePermission(),
+    ...(options.maxIterations !== undefined ? { maxIterations: options.maxIterations } : {}),
+    ...(options.timeoutMs !== undefined ? { timeoutMs: options.timeoutMs } : {}),
+    ...(options.onPhase !== undefined ? { onPhase: options.onPhase } : {}),
   });
 }
 
@@ -145,7 +166,7 @@ describe("AgentLoop", () => {
       {
         result: {
           text: "",
-          toolCalls: [{ name: "terminal", arguments: { command: "echo loop-hi" } }],
+          toolCalls: [{ name: "command_run", arguments: { command: "echo loop-hi" } }],
         },
       },
       { result: { text: "执行完成" } },
@@ -156,17 +177,17 @@ describe("AgentLoop", () => {
     const secondCall = brain.messagesOf(1);
     const toolMessage = secondCall.find((m) => m.role === "tool");
     expect(toolMessage).toBeDefined();
-    const parsed = JSON.parse(toolMessage!.content) as { status: string; data?: string };
+    const parsed = parseResult(toolMessage!.content);
     expect(parsed.status).toBe("ok");
-    expect(parsed.data).toContain("loop-hi");
+    if (parsed.status === "ok") expect(String(parsed.data)).toContain("loop-hi");
   });
 
-  it("fetch_page 工具调用经眼睛抓取网页并反馈 Markdown", async () => {
+  it("page_fetch 工具调用经眼睛抓取网页并反馈 Markdown", async () => {
     const brain = new ScriptedBrain([
       {
         result: {
           text: "",
-          toolCalls: [{ name: "fetch_page", arguments: { url: "https://example.com" } }],
+          toolCalls: [{ name: "page_fetch", arguments: { url: "https://example.com" } }],
         },
       },
       { result: { text: "抓取完成" } },
@@ -183,13 +204,14 @@ describe("AgentLoop", () => {
       output: new TextOutput({ stdout: new FakeWritable(), intervalMs: 0 }),
       signal,
       mouth: autoAllowMouth,
+      permission: makePermission(),
     });
     await loop.run();
     const toolMessage = brain.messagesOf(1).find((m) => m.role === "tool");
     expect(toolMessage).toBeDefined();
-    const parsed = JSON.parse(toolMessage!.content) as { status: string; data?: string };
+    const parsed = parseResult(toolMessage!.content);
     expect(parsed.status).toBe("ok");
-    expect(parsed.data).toContain("# 抓到的标题");
+    if (parsed.status === "ok") expect(String(parsed.data)).toContain("# 抓到的标题");
   });
 
   it("工具调用后，assistant 消息（含 toolCalls）与 tool 结果都写入上下文", async () => {
@@ -197,7 +219,7 @@ describe("AgentLoop", () => {
       {
         result: {
           text: "",
-          toolCalls: [{ name: "terminal", arguments: { command: "echo chain-test" } }],
+          toolCalls: [{ name: "command_run", arguments: { command: "echo chain-test" } }],
         },
       },
       { result: { text: "完成" } },
@@ -209,7 +231,7 @@ describe("AgentLoop", () => {
     const assistant = secondCall.find((m) => m.role === "assistant");
     expect(assistant).toBeDefined();
     expect((assistant as { toolCalls?: unknown }).toolCalls).toEqual([
-      { name: "terminal", arguments: { command: "echo chain-test" } },
+      { name: "command_run", arguments: { command: "echo chain-test" } },
     ]);
     expect(secondCall.find((m) => m.role === "tool")).toBeDefined();
     const firstCall = brain.messagesOf(0);
@@ -217,7 +239,7 @@ describe("AgentLoop", () => {
   });
 
   it("被反思层拦截的调用作为失败结果反馈给大脑", async () => {
-    const call = { name: "terminal", arguments: { command: "echo rm -rf /" } };
+    const call = { name: "command_run", arguments: { command: "echo rm -rf /" } };
     const brain = new ScriptedBrain(
       [
         { result: { text: "", toolCalls: [call] } },
@@ -234,16 +256,16 @@ describe("AgentLoop", () => {
     await loop.run();
     const toolMessage = brain.messagesOf(1).find((m) => m.role === "tool");
     expect(toolMessage).toBeDefined();
-    const parsed = JSON.parse(toolMessage!.content) as { status: string; error?: { code: string } };
+    const parsed = parseResult(toolMessage!.content);
     expect(parsed.status).toBe("error");
-    expect(parsed.error?.code).toBe("user-denied");
+    if (parsed.status === "error") expect(parsed.error.code).toBe("user-denied");
   });
 
   it("多个工具调用按原数组顺序依次执行与写入上下文（保持时序不乱序）", async () => {
     const executionOrder: string[] = [];
-    const call1 = { name: "terminal", arguments: { command: "echo step1-pending" } };
-    const call2 = { name: "terminal", arguments: { command: "echo step2-allowed" } };
-    const call3 = { name: "terminal", arguments: { command: "echo step3-blocked" } };
+    const call1 = { name: "command_run", arguments: { command: "echo step1-pending" } };
+    const call2 = { name: "command_run", arguments: { command: "echo step2-allowed" } };
+    const call3 = { name: "command_run", arguments: { command: "echo step3-blocked" } };
 
     const brain = new ScriptedBrain(
       [
@@ -273,6 +295,7 @@ describe("AgentLoop", () => {
       output: new TextOutput({ stdout: new FakeWritable(), intervalMs: 0 }),
       signal,
       mouth: autoAllowMouth,
+      permission: makePermission(),
     });
 
     await loop.run();
@@ -282,15 +305,17 @@ describe("AgentLoop", () => {
     const secondCall = brain.messagesOf(1);
     const toolMessages = secondCall.filter((m) => m.role === "tool");
     expect(toolMessages).toHaveLength(3);
-    expect(toolMessages[0]!.name).toBe("terminal");
-    expect(toolMessages[1]!.name).toBe("terminal");
-    expect(toolMessages[2]!.name).toBe("terminal");
-    expect(JSON.parse(toolMessages[2]!.content)).toMatchObject({ status: "error", error: { code: "blacklist" } });
+    expect(toolMessages[0]!.name).toBe("command_run");
+    expect(toolMessages[1]!.name).toBe("command_run");
+    expect(toolMessages[2]!.name).toBe("command_run");
+    const last = parseResult(toolMessages[2]!.content);
+    expect(last.status).toBe("error");
+    if (last.status === "error") expect(last.error.code).toBe("blacklist");
   });
 
   it("多个工具中部分被拒绝/失败不中断其他正常工具的独立执行", async () => {
-    const call1 = { name: "terminal", arguments: { command: "echo deny-this" } };
-    const call2 = { name: "terminal", arguments: { command: "echo allow-this" } };
+    const call1 = { name: "command_run", arguments: { command: "echo deny-this" } };
+    const call2 = { name: "command_run", arguments: { command: "echo allow-this" } };
 
     const brain = new ScriptedBrain(
       [
@@ -312,6 +337,7 @@ describe("AgentLoop", () => {
       hands: buildHands(),
       output: new TextOutput({ stdout: new FakeWritable(), intervalMs: 0 }),
       signal,
+      permission: makePermission(),
       mouth: {
         confirm: async () => true,
         askApproval: async (prompt) => (prompt.key.includes("deny") ? { action: "deny" } : { action: "allow" }),
@@ -322,8 +348,10 @@ describe("AgentLoop", () => {
     const secondCall = brain.messagesOf(1);
     const toolMessages = secondCall.filter((m) => m.role === "tool");
     expect(toolMessages).toHaveLength(2);
-    expect(JSON.parse(toolMessages[0]!.content)).toMatchObject({ status: "error", error: { code: "user-denied" } });
-    expect(JSON.parse(toolMessages[1]!.content)).toMatchObject({ status: "ok" });
+    const denied = parseResult(toolMessages[0]!.content);
+    expect(denied.status).toBe("error");
+    if (denied.status === "error") expect(denied.error.code).toBe("user-denied");
+    expect(parseResult(toolMessages[1]!.content).status).toBe("ok");
   });
 
   it("输入为空或 /exit 时退出且不调用大脑", async () => {
@@ -367,6 +395,7 @@ describe("AgentLoop", () => {
       output: new TextOutput({ stdout: stream, intervalMs: 0 }),
       signal,
       mouth: autoAllowMouth,
+      permission: makePermission(),
       timeoutMs: 300_000,
     });
     await loop.run();
@@ -387,6 +416,7 @@ describe("AgentLoop", () => {
       output: new TextOutput({ stdout: stream, intervalMs: 0 }),
       signal,
       mouth: autoAllowMouth,
+      permission: makePermission(),
     });
     await loop.run();
     expect(stream.output).toContain("无法解析超时时长");
@@ -404,6 +434,7 @@ describe("AgentLoop", () => {
       output: new TextOutput({ stdout: stream, intervalMs: 0 }),
       signal,
       mouth: autoAllowMouth,
+      permission: makePermission(),
       timeoutMs: 20,
     });
     await loop.run();
@@ -419,7 +450,7 @@ describe("AgentLoop", () => {
           text: "",
           toolCalls: [
             {
-              name: "terminal",
+              name: "command_run",
               arguments: { command: 'node -e "setTimeout(() => {}, 10000)"' },
             },
           ],
@@ -431,8 +462,7 @@ describe("AgentLoop", () => {
     const loop = makeLoop({ brain, ears: new FakeEars(["任务", "继续", "/exit"]), signal, timeoutMs: 20 });
     await loop.run();
     const toolMessage = brain.messagesOf(1).find((m) => m.role === "tool");
-    const parsed = JSON.parse(toolMessage!.content) as { status: string };
-    expect(parsed.status).toBe("error");
+    expect(parseResult(toolMessage!.content).status).toBe("error");
   });
 
   it("推理期间被中断时状态为 INTERRUPTED 而非 ERROR", async () => {
@@ -456,6 +486,7 @@ describe("AgentLoop", () => {
       output,
       signal,
       mouth: autoAllowMouth,
+      permission: makePermission(),
     });
     await loop.run();
     expect(loop.getStatus()).toBe("ERROR");
@@ -463,8 +494,8 @@ describe("AgentLoop", () => {
 
   it("大脑持续调用工具时达到最大迭代次数停止", async () => {
     const brain = new ScriptedBrain([
-      { result: { text: "", toolCalls: [{ name: "terminal", arguments: { command: "echo x" } }] } },
-      { result: { text: "", toolCalls: [{ name: "terminal", arguments: { command: "echo x" } }] } },
+      { result: { text: "", toolCalls: [{ name: "command_run", arguments: { command: "echo x" } }] } },
+      { result: { text: "", toolCalls: [{ name: "command_run", arguments: { command: "echo x" } }] } },
     ]);
     const signal = new AbortController().signal;
     const stream = new FakeWritable();
@@ -477,6 +508,7 @@ describe("AgentLoop", () => {
       output,
       signal,
       mouth: autoAllowMouth,
+      permission: makePermission(),
       maxIterations: 2,
     });
     await loop.run();
@@ -491,7 +523,7 @@ describe("AgentLoop", () => {
       {
         result: {
           text: "",
-          toolCalls: [{ name: "terminal", arguments: { command: "echo phase-test" } }],
+          toolCalls: [{ name: "command_run", arguments: { command: "echo phase-test" } }],
         },
       },
       { result: { text: "结束" } },
@@ -513,14 +545,14 @@ describe("AgentLoop", () => {
     ]);
   });
 
-  it("terminal 工具的 timeoutMs 参数透传给命令超时控制", async () => {
+  it("command_run 工具的 timeoutMs 参数透传给命令超时控制", async () => {
     const brain = new ScriptedBrain([
       {
         result: {
           text: "",
           toolCalls: [
             {
-              name: "terminal",
+              name: "command_run",
               arguments: { command: 'node -e "setTimeout(() => {}, 3000)"', timeoutMs: 500 },
             },
           ],
@@ -533,12 +565,9 @@ describe("AgentLoop", () => {
     await loop.run();
     const toolMessage = brain.messagesOf(1).find((m) => m.role === "tool");
     expect(toolMessage).toBeDefined();
-    const parsed = JSON.parse(toolMessage!.content) as {
-      status: string;
-      error?: { code: string };
-    };
+    const parsed = parseResult(toolMessage!.content);
     expect(parsed.status).toBe("error");
-    expect(parsed.error?.code).toBe("exec-timeout");
+    if (parsed.status === "error") expect(parsed.error.code).toBe("exec-timeout");
   });
 
   it("上下文在会话中持续累积", async () => {
@@ -558,6 +587,7 @@ describe("AgentLoop", () => {
       output,
       signal,
       mouth: autoAllowMouth,
+      permission: makePermission(),
       context,
     });
     await loop.run();
@@ -573,16 +603,11 @@ describe("AgentLoop", () => {
       async infer(): Promise<BrainInferenceResult> {
         return {
           text: "",
-          toolCalls: [{ name: "terminal", arguments: { command: "echo boom" } }],
+          toolCalls: [{ name: "command_run", arguments: { command: "echo boom" } }],
         };
       }
       async reflect(): Promise<ReflectionVerdict> {
         throw new Error("reflect boom");
-      }
-      async addWhitelistEntry(): Promise<void> {}
-
-      workspaceConstraint(): string {
-        return "test";
       }
     }
     const signal = new AbortController().signal;
@@ -596,6 +621,7 @@ describe("AgentLoop", () => {
       output,
       signal,
       mouth: autoAllowMouth,
+      permission: makePermission(),
     });
     await loop.run();
     expect(loop.getStatus()).toBe("ERROR");
@@ -604,7 +630,7 @@ describe("AgentLoop", () => {
   });
 
   it("pending 允许：嘴巴三选 allow → 执行并反馈 tool 消息", async () => {
-    const call = { name: "terminal", arguments: { command: "ls -la" } };
+    const call = { name: "command_run", arguments: { command: "ls -la" } };
     const brain = pendingBrain(call);
     const prompts: ApprovalPrompt[] = [];
     const loop = new AgentLoop({
@@ -614,6 +640,7 @@ describe("AgentLoop", () => {
       hands: buildHands(),
       output: new TextOutput({ stdout: new FakeWritable(), intervalMs: 0 }),
       signal: new AbortController().signal,
+      permission: makePermission(),
       mouth: {
         confirm: async () => true,
         askApproval: async (prompt) => {
@@ -623,13 +650,15 @@ describe("AgentLoop", () => {
       },
     });
     await loop.run();
-    expect(prompts).toEqual([{ tool: "terminal", key: "ls -la", kind: "exact" }]);
+    expect(prompts).toEqual([
+      { tool: "command_run", key: "ls -la", options: [{ tool: "command_run", key: "ls -la", scope: "self" }] },
+    ]);
     const toolMessage = brain.messagesOf(1).find((m) => m.role === "tool");
-    expect(JSON.parse(toolMessage!.content) as { status: string }).toMatchObject({ status: "ok" });
+    expect(parseResult(toolMessage!.content).status).toBe("ok");
   });
 
   it("pending 拒绝：user-denied 反馈，不执行", async () => {
-    const call = { name: "terminal", arguments: { command: "ls -la" } };
+    const call = { name: "command_run", arguments: { command: "ls -la" } };
     const brain = pendingBrain(call);
     const loop = new AgentLoop({
       brain,
@@ -638,25 +667,32 @@ describe("AgentLoop", () => {
       hands: buildHands(),
       output: new TextOutput({ stdout: new FakeWritable(), intervalMs: 0 }),
       signal: new AbortController().signal,
+      permission: makePermission(),
       mouth: { confirm: async () => true, askApproval: async () => ({ action: "deny" }) },
     });
     await loop.run();
     const toolMessage = brain.messagesOf(1).find((m) => m.role === "tool");
-    const parsed = JSON.parse(toolMessage!.content) as { status: string; error?: { code: string } };
+    const parsed = parseResult(toolMessage!.content);
     expect(parsed.status).toBe("error");
-    expect(parsed.error?.code).toBe("user-denied");
+    if (parsed.status === "error") expect(parsed.error.code).toBe("user-denied");
   });
 
-  it("pending 加入白名单：提示键为管道匹配键，条目落盘后执行（临时工作区）", async () => {
-    const ws = mkdtempSync(join(tmpdir(), "loop-ws-"));
+  it("pending 加入白名单：提示键为管道匹配键，入库后执行", async () => {
+    const permission = makePermission();
+    const outsideDir = mkdtempSync(join(tmpdir(), "loop-outside-"));
     try {
-      const wsReal = realpathSync(ws);
-      const call = { name: "write_file", arguments: { path: "src/a.ts", content: "x" } };
+      const outsideReal = realpathSync.native(outsideDir);
+      const call = { name: "file_write", arguments: { path: join(outsideReal, "a.ts"), content: "x" } };
       const brain = pendingBrain(call);
-      const entry: WhitelistEntry = {
-        tool: "write_file",
-        key: normalizeMatchKey(join(wsReal, "src", "a.ts")),
-        kind: "path",
+      const expected: TrustEntry = {
+        tool: "file_write",
+        key: normalizeMatchKey(join(outsideReal, "a.ts")),
+        scope: "self",
+      };
+      const subtree: TrustEntry = {
+        tool: "file_write",
+        key: `${normalizeMatchKey(outsideReal)}/`,
+        scope: "subtree",
       };
       const prompts: ApprovalPrompt[] = [];
       const loop = new AgentLoop({
@@ -666,93 +702,77 @@ describe("AgentLoop", () => {
         hands: buildHands(),
         output: new TextOutput({ stdout: new FakeWritable(), intervalMs: 0 }),
         signal: new AbortController().signal,
-        workspace: wsReal,
+        permission,
         mouth: {
           confirm: async () => true,
           askApproval: async (prompt: ApprovalPrompt) => {
             prompts.push(prompt);
-            return prompt.kind === "path" ? { action: "whitelist", entry } : { action: "allow" };
+            return { action: "whitelist", entry: prompt.options[0]! };
           },
         },
       });
       await loop.run();
-      expect(prompts).toEqual([{ tool: "write_file", key: entry.key, kind: "path" }]);
-      expect(brain.addedWhitelist).toEqual([entry]);
+      expect(prompts).toEqual([{ tool: "file_write", key: expected.key, options: [expected, subtree] }]);
+      expect(permission.whitelist.list()).toContainEqual(expected);
+      expect(permission.whitelist.list().some((e) => covers(e, { name: "file_write", key: expected.key }))).toBe(true);
       expect(brain.messagesOf(1).find((m) => m.role === "tool")).toBeDefined();
     } finally {
-      rmSync(ws, { recursive: true, force: true });
-      // Task 4 前执行器仍按 CWD 解析相对路径：兜底清理真实写入的 src/a.ts（Task 4 接入 workspace 后成为空操作）
-      rmSync("src/a.ts", { force: true });
+      rmSync(outsideDir, { recursive: true, force: true });
     }
   });
 
-  it("edit_file 属写类：审批提示 kind=path（WRITE_TOOLS 漏项回归）", async () => {
-    const ws = mkdtempSync(join(tmpdir(), "loop-ws-"));
-    try {
-      const wsReal = realpathSync(ws);
-      const call = { name: "edit_file", arguments: { path: "x.ts", hunks: [{ search: "a", replace: "b" }] } };
-      const brain = pendingBrain(call);
-      const prompts: ApprovalPrompt[] = [];
-      const loop = new AgentLoop({
-        brain,
-        ears: new FakeEars(["任务", "/exit"]),
-        eyes: buildEyes(),
-        hands: buildHands(),
-        output: new TextOutput({ stdout: new FakeWritable(), intervalMs: 0 }),
-        signal: new AbortController().signal,
-        workspace: wsReal,
-        mouth: {
-          confirm: async () => true,
-          askApproval: async (prompt: ApprovalPrompt) => {
-            prompts.push(prompt);
-            return { action: "deny" };
-          },
+  it("file_edit 属写类：审批提示两粒度（此路径 / 此目录）", async () => {
+    const permission = makePermission();
+    const call = { name: "file_edit", arguments: { path: "x.ts", hunks: [{ search: "a", replace: "b" }] } };
+    const brain = pendingBrain(call);
+    const selfEntry: TrustEntry = { tool: "file_edit", key: `${wsKey}/x.ts`, scope: "self" };
+    const subtreeEntry: TrustEntry = { tool: "file_edit", key: `${wsKey}/`, scope: "subtree" };
+    const prompts: ApprovalPrompt[] = [];
+    const loop = new AgentLoop({
+      brain,
+      ears: new FakeEars(["任务", "/exit"]),
+      eyes: buildEyes(),
+      hands: buildHands(),
+      output: new TextOutput({ stdout: new FakeWritable(), intervalMs: 0 }),
+      signal: new AbortController().signal,
+      permission,
+      mouth: {
+        confirm: async () => true,
+        askApproval: async (prompt: ApprovalPrompt) => {
+          prompts.push(prompt);
+          return { action: "deny" };
         },
-      });
-      await loop.run();
-      expect(prompts[0]).toEqual({
-        tool: "edit_file",
-        key: normalizeMatchKey(join(wsReal, "x.ts")),
-        kind: "path",
-      });
-    } finally {
-      rmSync(ws, { recursive: true, force: true });
-    }
+      },
+    });
+    await loop.run();
+    expect(prompts[0]).toEqual({ tool: "file_edit", key: selfEntry.key, options: [selfEntry, subtreeEntry] });
   });
 
-  it("读类调用审批：提示 kind=path，此目录条目 = read_dir 自身 + /", async () => {
-    const ws = mkdtempSync(join(tmpdir(), "loop-ws-"));
-    try {
-      const wsReal = realpathSync(ws);
-      const call = { name: "read_dir", arguments: { path: "sub" } };
-      const brain = pendingBrain(call);
-      const expected: WhitelistEntry = {
-        tool: "read_dir",
-        key: `${normalizeMatchKey(join(wsReal, "sub"))}/`,
-        kind: "path",
-      };
-      const prompts: ApprovalPrompt[] = [];
-      const loop = new AgentLoop({
-        brain,
-        ears: new FakeEars(["任务", "/exit"]),
-        eyes: buildEyes(),
-        hands: buildHands(),
-        output: new TextOutput({ stdout: new FakeWritable(), intervalMs: 0 }),
-        signal: new AbortController().signal,
-        workspace: wsReal,
-        mouth: {
-          confirm: async () => true,
-          askApproval: async (prompt: ApprovalPrompt) => {
-            prompts.push(prompt);
-            return { action: "whitelist", entry: expected };
-          },
+  it("读类调用审批：dir_list 第二项 subtree = 自身 + /", async () => {
+    const permission = makePermission();
+    const call = { name: "dir_list", arguments: { path: "sub" } };
+    const brain = pendingBrain(call);
+    const selfEntry: TrustEntry = { tool: "dir_list", key: `${wsKey}/sub`, scope: "self" };
+    const subtreeEntry: TrustEntry = { tool: "dir_list", key: `${wsKey}/sub/`, scope: "subtree" };
+    const prompts: ApprovalPrompt[] = [];
+    const loop = new AgentLoop({
+      brain,
+      ears: new FakeEars(["任务", "/exit"]),
+      eyes: buildEyes(),
+      hands: buildHands(),
+      output: new TextOutput({ stdout: new FakeWritable(), intervalMs: 0 }),
+      signal: new AbortController().signal,
+      permission,
+      mouth: {
+        confirm: async () => true,
+        askApproval: async (prompt: ApprovalPrompt) => {
+          prompts.push(prompt);
+          return { action: "whitelist", entry: prompt.options[1]! };
         },
-      });
-      await loop.run();
-      expect(prompts[0]).toEqual({ tool: "read_dir", key: normalizeMatchKey(join(wsReal, "sub")), kind: "path" });
-      expect(brain.addedWhitelist).toEqual([expected]);
-    } finally {
-      rmSync(ws, { recursive: true, force: true });
-    }
+      },
+    });
+    await loop.run();
+    expect(prompts[0]).toEqual({ tool: "dir_list", key: selfEntry.key, options: [selfEntry, subtreeEntry] });
+    expect(brain.messagesOf(1).find((m) => m.role === "tool")).toBeDefined();
   });
 });

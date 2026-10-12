@@ -1,7 +1,7 @@
 import { PassThrough, Readable } from "node:stream";
 import { describe, expect, it } from "vitest";
 import { AskUser } from "../src/mouth/ask-user.js";
-import type { ApprovalPrompt, ApprovalChoice } from "../src/types/index.js";
+import type { TrustEntry } from "../src/tool/index.js";
 
 function inputFrom(text: string): Readable {
   return new Readable({
@@ -64,63 +64,59 @@ describe("AskUser", () => {
   });
 });
 
-describe("askApproval 三选", () => {
-  it("y → allow", async () => {
-    const ask = new AskUser({ input: inputFrom("y\n") });
-    const choice = await ask.askApproval({ tool: "terminal", key: "ls -la", kind: "exact" });
-    expect(choice).toEqual({ action: "allow" });
+describe("askApproval（options 驱动三形态：0/1/2 项）", () => {
+  const cmdOption: TrustEntry = { tool: "command_run", key: "ls -la", scope: "self" };
+  const pathOptions: TrustEntry[] = [
+    { tool: "file_write", key: "c:/ws/src/a.ts", scope: "self" },
+    { tool: "file_write", key: "c:/ws/src/", scope: "subtree" },
+  ];
+
+  it("0 项（键缺失）：仅允许/拒绝，y → allow、n → deny", async () => {
+    const ask1 = new AskUser({ input: inputFrom("y\n") });
+    expect(await ask1.askApproval({ tool: "file_read", key: "", options: [] })).toEqual({ action: "allow" });
+    const ask2 = new AskUser({ input: inputFrom("n\n") });
+    expect(await ask2.askApproval({ tool: "file_read", key: "", options: [] })).toEqual({ action: "deny" });
   });
-  it("n → deny", async () => {
-    const ask = new AskUser({ input: inputFrom("n\n") });
-    const choice = await ask.askApproval({ tool: "terminal", key: "ls -la", kind: "exact" });
+
+  it("0 项：w 不可用 → 循环追问（w 后 n 生效）", async () => {
+    const ask = new AskUser({ input: inputFrom("w\nn\n") });
+    const choice = await ask.askApproval({ tool: "file_read", key: "", options: [] });
     expect(choice).toEqual({ action: "deny" });
   });
-  it("w → whitelist（exact 条目）", async () => {
+
+  it("1 项（命令类）：w → 唯一选项（原样回显 entry）", async () => {
     const ask = new AskUser({ input: inputFrom("w\n") });
-    const choice = await ask.askApproval({ tool: "terminal", key: "ls -la", kind: "exact" });
-    expect(choice).toEqual({ action: "whitelist", entry: { tool: "terminal", key: "ls -la", kind: "exact" } });
+    const choice = await ask.askApproval({ tool: "command_run", key: "ls -la", options: [cmdOption] });
+    expect(choice).toEqual({ action: "whitelist", entry: cmdOption });
   });
-  it("写类：w → 此路径；d → 此目录", async () => {
+
+  it("1 项：y/n 仍可用", async () => {
+    const ask1 = new AskUser({ input: inputFrom("y\n") });
+    expect(await ask1.askApproval({ tool: "command_run", key: "ls -la", options: [cmdOption] })).toEqual({
+      action: "allow",
+    });
+    const ask2 = new AskUser({ input: inputFrom("n\n") });
+    expect(await ask2.askApproval({ tool: "command_run", key: "ls -la", options: [cmdOption] })).toEqual({
+      action: "deny",
+    });
+  });
+
+  it("2 项（路径类）：w → 此路径（options[0]）；d → 此目录（options[1]）", async () => {
     const ask1 = new AskUser({ input: inputFrom("w\n") });
-    const pathChoice = await ask1.askApproval({ tool: "write_file", key: "src/utils.ts", kind: "path" });
-    expect(pathChoice).toEqual({
+    expect(await ask1.askApproval({ tool: "file_write", key: "c:/ws/src/a.ts", options: pathOptions })).toEqual({
       action: "whitelist",
-      entry: { tool: "write_file", key: "src/utils.ts", kind: "path" },
+      entry: pathOptions[0],
     });
     const ask2 = new AskUser({ input: inputFrom("d\n") });
-    const dirChoice = await ask2.askApproval({ tool: "write_file", key: "src/utils.ts", kind: "path" });
-    expect(dirChoice).toEqual({
+    expect(await ask2.askApproval({ tool: "file_write", key: "c:/ws/src/a.ts", options: pathOptions })).toEqual({
       action: "whitelist",
-      entry: { tool: "write_file", key: "src/", kind: "path" },
+      entry: pathOptions[1],
     });
   });
-  it("d 分支根级/盘符根降级为文件条目（防整盘/全路径超授权）", async () => {
-    const ask1 = new AskUser({ input: inputFrom("d\n") });
-    expect(await ask1.askApproval({ tool: "write_file", key: "c:/x.txt", kind: "path" })).toEqual({
-      action: "whitelist",
-      entry: { tool: "write_file", key: "c:/x.txt", kind: "path" },
-    });
-    const ask2 = new AskUser({ input: inputFrom("d\n") });
-    expect(await ask2.askApproval({ tool: "write_file", key: "/x", kind: "path" })).toEqual({
-      action: "whitelist",
-      entry: { tool: "write_file", key: "/x", kind: "path" },
-    });
-  });
-  it("读类 d 分支：read_dir 此目录 = 自身 + /；read_file = 父目录 + /", async () => {
-    const ask1 = new AskUser({ input: inputFrom("d\n") });
-    expect(await ask1.askApproval({ tool: "read_dir", key: "c:/ws/src", kind: "path" })).toEqual({
-      action: "whitelist",
-      entry: { tool: "read_dir", key: "c:/ws/src/", kind: "path" },
-    });
-    const ask2 = new AskUser({ input: inputFrom("d\n") });
-    expect(await ask2.askApproval({ tool: "read_file", key: "c:/ws/src/a.ts", kind: "path" })).toEqual({
-      action: "whitelist",
-      entry: { tool: "read_file", key: "c:/ws/src/", kind: "path" },
-    });
-  });
+
   it("非法输入循环追问（x 后 y 生效）", async () => {
     const ask = new AskUser({ input: inputFrom("x\ny\n") });
-    const choice = await ask.askApproval({ tool: "terminal", key: "ls", kind: "exact" });
+    const choice = await ask.askApproval({ tool: "command_run", key: "ls", options: [cmdOption] });
     expect(choice).toEqual({ action: "allow" });
   });
 });
