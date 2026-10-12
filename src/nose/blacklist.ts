@@ -42,7 +42,10 @@ export const BLACKLIST_PATTERNS: readonly RegExp[] = [
   /\btaskkill\b[^\n|;]*\/f[^\n|;]*(?:lsass|csrss|wininit|winlogon)/i,
   // 权限全毁（chmod -R 000 跟 / 或系统目录）
   /\bchmod\s+-R\s+000\s+\/(?:\s|$|\*|(?:etc|usr|bin|sbin|lib(?:64)?)(?:\s|$|\/))/i,
-  // 写类工具写系统目录（path 形态锚定开头——terminal 命令串不以盘符开头，天然只命中写类）
+];
+
+/** 写类工具写系统目录：仅当调用为写类工具时由 policy 应用于路径匹配键（读类不硬拒，走信任门禁）。 */
+export const BLACKLIST_WRITE_PATH_PATTERNS: readonly RegExp[] = [
   /^[a-z]:\/windows\/(?:system32|boot)(?:\/|$)/i,
   /^[a-z]:\/system\s+volume\s+information(?:\/|$)/i,
 ];

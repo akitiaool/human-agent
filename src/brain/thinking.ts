@@ -39,6 +39,21 @@ export abstract class BaseThinking {
     return this.#permission.classify(call);
   }
 
+  /** 工作区绝对路径（启动已 realpath 规范化）。 */
+  get workspace(): string {
+    return this.#workspace;
+  }
+
+  /** 调用匹配键（规范匹配键管道）；管道失败/参数缺失 undefined。 */
+  keyFor(call: ToolCall): string | undefined {
+    return this.#permission.keyFor(call);
+  }
+
+  /** 当前工作区白名单条目快照。 */
+  whitelistEntries(): readonly WhitelistEntry[] {
+    return this.#permission.entries();
+  }
+
   /** 白名单落盘（用户经弹窗/嘴巴批准后由宿主调用）；同步内部实现，返回 Promise 兼容接口。 */
   addWhitelistEntry(entry: WhitelistEntry): Promise<void> {
     this.#permission.addEntry(entry);

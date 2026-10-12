@@ -2,7 +2,7 @@
 // 裁决顺序：权限黑名单 → 存在性 → 结构 → 白名单放行 → 其余需授权。
 // 权限层注入 PermissionPolicy；"需授权"仅作标记，审批通道由宿主（桥/loop）负责。
 import { schemas } from "./knowledge.js";
-import { matchKeyFor, type PermissionPolicy } from "../nose/policy.js";
+import type { PermissionPolicy } from "../nose/policy.js";
 import type { ReflectionVerdict, ToolCall } from "./llm.js";
 import { fail } from "../types/index.js";
 
@@ -18,10 +18,11 @@ export class Reflection {
     const pending: ToolCall[] = [];
     const blocked: ReflectionVerdict["blocked"] = [];
     for (const call of calls) {
-      if (this.#policy.classify(call) === "blacklist") {
+      const verdict = this.#policy.classify(call);
+      if (verdict.status === "blacklist") {
         blocked.push({
           call,
-          result: fail("BLACKLIST", `系统破坏操作，禁止执行：${matchKeyFor(call) ?? call.name}`),
+          result: fail("BLACKLIST", `系统破坏操作，禁止执行：${verdict.key ?? call.name}`),
         });
         continue;
       }
@@ -41,7 +42,7 @@ export class Reflection {
         });
         continue;
       }
-      if (this.#policy.classify(call) === "whitelist") allowed.push(call);
+      if (verdict.status === "allowed") allowed.push(call);
       else pending.push(call);
     }
     return { allowed, pending, blocked };

@@ -1,7 +1,7 @@
 import { ConversationContext } from "../brain/context.js";
 import { TOOLS } from "../brain/knowledge.js";
 import type { BrainInference, BrainInferenceResult, ToolCall } from "../brain/llm.js";
-import { matchKeyFor } from "../nose/policy.js";
+import { isPathTool, matchKeyFor } from "../nose/policy.js";
 import type {
   ActionResult,
   AgentOutput,
@@ -256,11 +256,11 @@ export class AgentLoop {
       }
 
       if (pendingSet.has(call)) {
-        const isWrite = call.name === "write_file" || call.name === "apply_patch";
+        const kind = isPathTool(call.name) ? "path" : "exact";
         const prompt: ApprovalPrompt = {
           tool: call.name,
-          key: matchKeyFor(call) ?? "",
-          kind: isWrite ? "path" : "exact",
+          key: matchKeyFor(call, process.cwd()) ?? "",
+          kind,
         };
         const choice = await this.#mouth.askApproval(prompt);
         if (choice.action === "deny") {

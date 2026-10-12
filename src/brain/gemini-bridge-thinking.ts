@@ -7,7 +7,7 @@
 import http from "node:http";
 import type { AddressInfo } from "node:net";
 import { executeTool, type ToolOrgans } from "../heart/executor.js";
-import { matchKeyFor, normalizePath, toolMatches } from "../nose/policy.js";
+import { normalizePath, toolMatches } from "../nose/policy.js";
 import { ASTParser, flattenToolCalls } from "./ast-parser.js";
 import type { ActionResult, EyesContract, HandsContract, WhitelistEntry } from "../types/index.js";
 import { fail } from "../types/index.js";
@@ -405,7 +405,7 @@ export class GeminiBridgeThinking extends BaseThinking {
       const entry: WhitelistEntry = { tool: w.tool, key: w.key, kind: w.kind };
       return allowedCalls.some((call) => {
         if (entry.kind === "exact") {
-          return toolMatches(entry.tool, call.name) && entry.key === matchKeyFor(call);
+          return toolMatches(entry.tool, call.name) && entry.key === this.keyFor(call);
         }
         if (call.name !== "write_file" && call.name !== "apply_patch" && call.name !== "edit_file") return false;
         const path = typeof call.arguments.path === "string" ? normalizePath(call.arguments.path) : "";
