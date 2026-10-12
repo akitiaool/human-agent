@@ -235,12 +235,17 @@ export class PermissionPolicy {
     ) {
       return false;
     }
-    if (normalized.kind === "path" && current.some((e) => e.kind === "path" && covers(e.key, normalized.key))) {
-      return false; // 子被父盖：跳过（跨工具同判——path 是信任面概念，不按工具拆分）
+    if (
+      normalized.kind === "path" &&
+      current.some((e) => e.kind === "path" && covers(e.key, normalized.key) && toolMatches(e.tool, normalized.tool))
+    ) {
+      return false; // 子被父盖：跳过（仅当既有条目按方向语义确能覆盖新调用——读条目盖不住写）
     }
     const kept =
       normalized.kind === "path"
-        ? current.filter((e) => !(e.kind === "path" && covers(normalized.key, e.key))) // 加父去子
+        ? current.filter(
+            (e) => !(e.kind === "path" && covers(normalized.key, e.key) && toolMatches(normalized.tool, e.tool)),
+          ) // 加父去子：仅删除按方向语义确被新条目覆盖的子条目（写信任蕴含读）
         : current;
     this.#sections[this.#workspaceKey] = [...kept, normalized];
     this.#save();

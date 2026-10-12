@@ -393,6 +393,36 @@ describe("PermissionPolicy 持久化与清理", () => {
     expect(p.entries()).toEqual([{ tool: "write_file", key: `${base}/`, kind: "path" }]);
   });
 
+  it("方向盲区修复：读目录条目不得吞掉写子条目（写审批照常入库）", () => {
+    const base = `${wsKey}/src`;
+    const p = new PermissionPolicy({ file: wlFile, workspace: wsReal });
+    p.addEntry({ tool: "read_dir", key: `${base}/`, kind: "path" });
+    expect(p.addEntry({ tool: "write_file", key: `${base}/a.ts`, kind: "path" })).toBe(true);
+    expect(p.entries()).toEqual([
+      { tool: "read_dir", key: `${base}/`, kind: "path" },
+      { tool: "write_file", key: `${base}/a.ts`, kind: "path" },
+    ]);
+  });
+
+  it("方向盲区修复：读目录条目不得删除既有写子条目（用户配置不静默丢失）", () => {
+    const base = `${wsKey}/src`;
+    const p = new PermissionPolicy({ file: wlFile, workspace: wsReal });
+    p.addEntry({ tool: "write_file", key: `${base}/a.ts`, kind: "path" });
+    expect(p.addEntry({ tool: "read_dir", key: `${base}/`, kind: "path" })).toBe(true);
+    expect(p.entries()).toEqual([
+      { tool: "write_file", key: `${base}/a.ts`, kind: "path" },
+      { tool: "read_dir", key: `${base}/`, kind: "path" },
+    ]);
+  });
+
+  it("方向逻辑回归钉：写目录条目照旧删除被覆盖的读子条目（写信任蕴含读）", () => {
+    const base = `${wsKey}/src`;
+    const p = new PermissionPolicy({ file: wlFile, workspace: wsReal });
+    p.addEntry({ tool: "read_file", key: `${base}/a.ts`, kind: "path" });
+    expect(p.addEntry({ tool: "write_file", key: `${base}/`, kind: "path" })).toBe(true);
+    expect(p.entries()).toEqual([{ tool: "write_file", key: `${base}/`, kind: "path" }]);
+  });
+
   it("精确重复条目跳过；终端条目按归一后去重", () => {
     const p = new PermissionPolicy({ file: wlFile, workspace: wsReal });
     p.addEntry({ tool: "terminal", key: "git status", kind: "exact" });
