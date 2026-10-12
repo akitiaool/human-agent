@@ -271,6 +271,16 @@ panel.innerHTML = `
 .ha-tier-warning { color: #fbbf24; font-size: 12px; }
 .ha-value { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; direction: rtl; text-align: left; }
 #ha-workspace { direction: rtl; }
+.ha-cand { border: 1px solid #374151; border-radius: 6px; margin-top: 6px; }
+.ha-cand-head { display: flex; width: 100%; align-items: center; gap: 6px; background: none; border: none; color: #e8e8e8; font: inherit; padding: 5px 8px; cursor: pointer; }
+.ha-cand-count { color: #9ca3af; }
+.ha-cand-arrow { margin-left: auto; }
+.ha-cand-ops { display: flex; align-items: center; gap: 6px; padding: 4px 8px; flex-wrap: wrap; }
+.ha-cand-list { max-height: 140px; overflow-y: auto; padding: 0 8px 6px; }
+.ha-cand-row { display: flex; align-items: center; gap: 6px; white-space: nowrap; overflow: hidden; font-size: 12px; }
+.ha-cand-tool { color: #93c5fd; flex: none; }
+.ha-cand-key { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; }
+.ha-cand-counts { color: #9ca3af; flex: none; }
 </style>
 <div class="ha-title">
   <span>gemini-bridge<span class="ha-badge">v3 网页对话驱动</span></span>
@@ -341,6 +351,24 @@ panel.innerHTML = `
   <span id="ha-workspace" class="ha-value" title="">（未获取）</span>
 </div>
 <button id="ha-inject-protocol" title="手动把工具协议（规则）文本填入输入框（自动提交开=填好后自动提交）">填入规则文本</button>
+<div class="ha-cand">
+  <button id="ha-cand-toggle" class="ha-cand-head" title="白名单外裁决的持久记录：默认拒绝档=补种清单，默认允许档=放行审计">
+    信任候选 <span id="ha-cand-count" class="ha-cand-count">(0)</span><span class="ha-cand-arrow">▸</span>
+  </button>
+  <div class="ha-cand-body" id="ha-cand-body" hidden>
+    <div class="ha-cand-ops">
+      <button id="ha-cand-all">全选</button>
+      <span>粒度</span>
+      <select id="ha-cand-gran" title="仅作用于路径类行；terminal/抓网页行恒 exact">
+        <option value="file">文件</option>
+        <option value="dir">目录</option>
+      </select>
+      <button id="ha-cand-add">入库所选 (0)</button>
+      <button id="ha-cand-dismiss">清除所选</button>
+    </div>
+    <div class="ha-cand-list" id="ha-cand-list"></div>
+  </div>
+</div>
 <div class="ha-status" id="ha-status"><span id="ha-status-text">待命</span><span class="ha-status-dot" title="状态指示灯"></span></div>
 <button id="ha-retry" hidden>手动重试</button>
 <div class="ha-log-bar">
@@ -724,6 +752,58 @@ function setupPanelEvents() {
     scheduleSaveSettings();
     log(`桥服务地址：${settings.baseUrl}`);
   });
+  panel.querySelector("#ha-cand-toggle").addEventListener("click", () => {
+    const body = panel.querySelector("#ha-cand-body");
+    body.hidden = !body.hidden;
+    panel.querySelector(".ha-cand-arrow").textContent = body.hidden ? "▸" : "▾";
+    if (!body.hidden) void refreshCandidates(); // 展开时刷新
+  });
+  panel.querySelector("#ha-cand-all").addEventListener("click", () => {
+    const boxes = [...panel.querySelectorAll("#ha-cand-list input[type=checkbox]")];
+    const target = boxes.some((b) => !b.checked);
+    for (const b of boxes) b.checked = target;
+    updateAddButton();
+  });
+  panel.querySelector("#ha-cand-add").addEventListener("click", async () => {
+    const rows = checkedCandidateRows();
+    if (rows.length === 0) {
+      log("信任候选：未选择任何行");
+      return;
+    }
+    const gran = panel.querySelector("#ha-cand-gran").value;
+    const entries = rows.map((r) => buildCandidateEntry(r.tool, r.key, gran));
+    let resp;
+    try {
+      resp = await chrome.runtime.sendMessage({ type: "whitelist-add", entries, baseUrl: settings.baseUrl });
+    } catch (err) {
+      resp = { error: err instanceof Error ? err.message : String(err) };
+    }
+    if (resp?.ok === true) {
+      log(`信任候选：入库 ${entries.length} 条（${gran === "dir" ? "目录" : "文件"}粒度）`);
+      void refreshCandidates();
+    } else {
+      log(`信任候选入库失败：${resp?.error ?? "未知错误"}（条目须对应现存候选，桥侧已拒绝）`);
+    }
+  });
+  panel.querySelector("#ha-cand-dismiss").addEventListener("click", async () => {
+    const items = checkedCandidateRows();
+    if (items.length === 0) {
+      log("信任候选：未选择任何行");
+      return;
+    }
+    let resp;
+    try {
+      resp = await chrome.runtime.sendMessage({ type: "candidates-dismiss", items, baseUrl: settings.baseUrl });
+    } catch (err) {
+      resp = { error: err instanceof Error ? err.message : String(err) };
+    }
+    if (resp?.ok === true) {
+      log(`信任候选：清除 ${items.length} 条`);
+      void refreshCandidates();
+    } else {
+      log(`信任候选清除失败：${resp?.error ?? "未知错误"}`);
+    }
+  });
 }
 
 // ---------- AI Studio DOM 操作（每次现查，禁止缓存跨轮复用） ----------
@@ -959,6 +1039,7 @@ async function handleApproval(item) {
     log(`默认允许档：放行 ${item.calls.length} 条未信任调用`);
     if (!(await postApproval({ id: item.id, allowed: item.calls.map(() => true) }))) setStatus("错误");
     log(`[信任候选] +${item.calls.length}（默认允许）`);
+    void refreshCandidates();
     return;
   }
   if (settings.untrustedTier === "deny") {
@@ -966,6 +1047,7 @@ async function handleApproval(item) {
     log(`默认拒绝档：拒绝 ${item.calls.length} 条未信任调用`);
     if (!(await postApproval({ id: item.id, allowed: item.calls.map(() => false) }))) setStatus("错误");
     log(`[信任候选] +${item.calls.length}（默认拒绝）`);
+    void refreshCandidates();
     return;
   }
   setStatus("等待授权");
@@ -981,6 +1063,81 @@ async function handleApproval(item) {
   }
   setStatus("待命");
   log(`[信任候选] +${item.calls.length - wl.length}（默认弹窗）`);
+  void refreshCandidates();
+}
+
+let candRows = []; // 最近一次拉取的候选列表
+
+function buildCandidateEntry(tool, key, gran) {
+  if (!PATH_TOOL_NAMES.has(tool)) return { tool, key, kind: "exact" };
+  if (gran !== "dir") return { tool, key, kind: "path" };
+  const dirKey = approximateDirKey(tool, key);
+  return { tool, key: dirKey ?? key, kind: "path" };
+}
+
+// 「此目录」近似键（与服务端 dirEntryKey 同规则；桥侧复核，失败即 400）
+function approximateDirKey(tool, key) {
+  if (key === "" || key === "/" || /^[a-z]:\/$/i.test(key)) return null;
+  if (DIR_TARGET_TOOLS.has(tool)) return `${key}/`;
+  const i = key.lastIndexOf("/");
+  if (i <= 0 || (i === 2 && key[1] === ":")) return null;
+  return `${key.slice(0, i)}/`;
+}
+
+function checkedCandidateRows() {
+  return [...panel.querySelectorAll("#ha-cand-list input[type=checkbox]:checked")].map((el) => ({
+    tool: el.dataset.tool,
+    key: el.dataset.key,
+  }));
+}
+
+function updateAddButton() {
+  const n = checkedCandidateRows().length;
+  panel.querySelector("#ha-cand-add").textContent = `入库所选 (${n})`;
+}
+
+function renderCandidates(list) {
+  candRows = list;
+  panel.querySelector("#ha-cand-count").textContent = `(${list.length})`;
+  const host = panel.querySelector("#ha-cand-list");
+  host.textContent = "";
+  for (const c of list) {
+    const row = document.createElement("label");
+    row.className = "ha-cand-row";
+    row.title = `${c.tool} ${c.key}`;
+    const input = document.createElement("input");
+    input.type = "checkbox";
+    input.dataset.tool = c.tool;
+    input.dataset.key = c.key;
+    input.addEventListener("change", updateAddButton);
+    const tool = document.createElement("span");
+    tool.className = "ha-cand-tool";
+    tool.textContent = c.tool;
+    const key = document.createElement("span");
+    key.className = "ha-cand-key";
+    key.textContent = c.key;
+    const counts = document.createElement("span");
+    counts.className = "ha-cand-counts";
+    counts.textContent = `拒 ${c.denied} / 放 ${c.allowed}`;
+    row.append(input, tool, key, counts);
+    host.appendChild(row);
+  }
+  updateAddButton();
+}
+
+// 拉取方语义：展开时 + 操作后拉取；桥不推送（未展开时也顺带更新计数徽标）
+async function refreshCandidates() {
+  let resp;
+  try {
+    resp = await chrome.runtime.sendMessage({ type: "get-candidates", baseUrl: settings.baseUrl });
+  } catch (err) {
+    resp = { error: err instanceof Error ? err.message : String(err) };
+  }
+  if (Array.isArray(resp?.candidates)) {
+    renderCandidates(resp.candidates);
+  } else if (resp?.error) {
+    log(`信任候选拉取失败：${resp.error}`);
+  }
 }
 
 // 审批提示语按调用类别泛化（读类不再套用写类文案）

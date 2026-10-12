@@ -126,6 +126,43 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
         return;
       }
 
+      if (message.type === "get-candidates") {
+        let res;
+        try {
+          res = await fetch(`${base}/candidates`, {
+            signal: AbortSignal.timeout(GET_PROTOCOL_TIMEOUT_MS),
+            cache: "no-store",
+          });
+        } catch (err) {
+          sendResponse({
+            error:
+              err?.name === "TimeoutError" || err?.name === "AbortError"
+                ? "GET /candidates 超时"
+                : err instanceof Error
+                  ? err.message
+                  : String(err),
+          });
+          return;
+        }
+        if (res.status === 204) {
+          sendResponse({ error: "桥服务正在关闭" });
+          return;
+        }
+        if (!res.ok) {
+          sendResponse({ status: res.status, error: `GET /candidates → HTTP ${res.status}` });
+          return;
+        }
+        let candidates = [];
+        try {
+          const data = await res.json();
+          candidates = Array.isArray(data?.candidates) ? data.candidates : [];
+        } catch {
+          // 响应体非 JSON 按空处理
+        }
+        sendResponse({ candidates });
+        return;
+      }
+
       if (message.type === "submit-result") {
         const reply = message?.reply;
         if (typeof reply !== "string" || reply.trim() === "") {
@@ -207,6 +244,74 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
           return;
         }
         sendResponse({ ok: false, status: res.status, error: `POST /approval → HTTP ${res.status}` });
+        return;
+      }
+
+      if (message.type === "whitelist-add") {
+        const entries = Array.isArray(message?.entries) ? message.entries : [];
+        if (entries.length === 0) {
+          sendResponse({ ok: false, error: "empty entries" });
+          return;
+        }
+        let res;
+        try {
+          res = await fetch(`${base}/whitelist`, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ entries }),
+            signal: AbortSignal.timeout(POST_RESULT_TIMEOUT_MS),
+          });
+        } catch (err) {
+          sendResponse({
+            ok: false,
+            error:
+              err?.name === "TimeoutError" || err?.name === "AbortError"
+                ? "POST /whitelist 超时"
+                : err instanceof Error
+                  ? err.message
+                  : String(err),
+          });
+          return;
+        }
+        if (res.ok) {
+          sendResponse({ ok: true });
+          return;
+        }
+        sendResponse({ ok: false, status: res.status, error: `POST /whitelist → HTTP ${res.status}` });
+        return;
+      }
+
+      if (message.type === "candidates-dismiss") {
+        const items = Array.isArray(message?.items) ? message.items : [];
+        if (items.length === 0) {
+          sendResponse({ ok: false, error: "empty items" });
+          return;
+        }
+        let res;
+        try {
+          res = await fetch(`${base}/candidates/dismiss`, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ items }),
+            signal: AbortSignal.timeout(POST_RESULT_TIMEOUT_MS),
+          });
+        } catch (err) {
+          sendResponse({
+            ok: false,
+            error:
+              err?.name === "TimeoutError" || err?.name === "AbortError"
+                ? "POST /candidates/dismiss 超时"
+                : err instanceof Error
+                  ? err.message
+                  : String(err),
+          });
+          return;
+        }
+        if (res.ok) {
+          sendResponse({ ok: true });
+          return;
+        }
+        sendResponse({ ok: false, status: res.status, error: `POST /candidates/dismiss → HTTP ${res.status}` });
         return;
       }
 
