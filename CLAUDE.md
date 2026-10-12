@@ -80,7 +80,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## 不可违反的设计原则
 
-1. **动静绝对分离**：眼睛只读、无副作用；双手是破坏性操作必须受控；**一切工具调用**（含读取）经统一权限模型裁决——黑名单（确定性系统破坏）直接拒绝、白名单（用户信任）静默执行、未列入的按宿主档位处置（CLI 恒弹窗三选；桥扩展三档：默认弹窗/默认拒绝/默认允许）。读类进路径级信任维度（read_file/read_dir/search_code），方向为**写信任蕴含读**；审批通过可加入白名单（路径两粒度：此路径/此目录）。
+1. **动静绝对分离**：眼睛只读、无副作用；双手是破坏性操作必须受控；**一切工具调用**（含读取）经统一权限模型裁决——黑名单（确定性系统破坏）直接拒绝、白名单（用户信任）静默执行、未列入的按宿主档位处置（CLI 恒弹窗三选；桥扩展三档：默认弹窗/默认拒绝/默认允许）。读类进路径级信任维度（file_read/dir_list/code_search），方向为**写信任蕴含读**；审批通过可加入白名单（路径两粒度：此路径/此目录）。
 2. **异常即反馈，永不崩溃**：双手/眼睛执行失败（退出码非 0、文件不存在、超时等）**严禁抛出未捕获异常**，必须包装成 `ActionResult` 返回给大脑在下一循环中自我修复。
 3. **中断第一公民**：`Ctrl+C` 由心脏毫秒级捕获，级联向所有器官下发 `AbortSignal`，停止子进程、取消网络流、保护现场；器官检测到 `signal.aborted` 后迅速退出并将生命体状态置为 `INTERRUPTED`，会话历史不丢失。
 4. **轻量起步**：只装基础设施依赖（chalk、commander、execa、zod），大模型 SDK、TTS/ASR 等重度依赖在具体阶段按需引入。
@@ -165,7 +165,7 @@ CLI 入口为 `bin/cli.ts`（处理 argv）。
 
 工作区经三级决议（实现 `permission.workspace.resolve`，两种模式启动前先决议再装配）：`--workspace <path>` > `HUMAN_AGENT_WORKSPACE` > 启动 CWD；启动时 realpath 规范化且必须为已存在目录（否则友好报错 exit 1）；一进程一工作区不可变（切换=重启）。注意：`pnpm dev -- --workspace X` 不可用——`--` 连同后续参数被透传给脚本，commander 报 too many arguments；临时指定请用 `pnpm exec tsx bin/cli.ts --workspace X`。
 
-## 开发路线（5 阶段递进）
+## 开发路线（7 阶段递进）
 
 1. 骨架与类型（`package.json`/`tsconfig.json`、`src/types/` 与 `ActionResult` 契约）✅
 2. 双手与眼睛（file-reader、terminal、file-writer、risk-checker）✅
