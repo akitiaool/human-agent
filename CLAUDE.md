@@ -131,7 +131,7 @@ export type ActionResult<T = unknown> =
 | `terminal` | `command_run` |
 | `fetch_page` | `page_fetch` |
 
-**自有错误码**（kebab，域结果用）：`blacklist`、`unknown-tool`、`invalid-args`、`user-denied`、`dependency-blocked`、`exec-timeout`、`exec-error`、`read-error`、`write-error`、`patch-not-found`、`empty-search`、`invalid-pattern`、`fetch-error`、`workspace-invalid`。
+**自有错误码**（kebab，域结果用）：`blacklist`、`unknown-tool`、`invalid-args`、`user-denied`、`dependency-blocked`、`exec-timeout`、`exec-error`、`read-error`、`write-error`、`patch-not-found`、`empty-search`、`invalid-pattern`、`fetch-error`、`workspace-invalid`；另按同一规则外推：`hunk-not-found`、`ambiguous-match`、`version-mismatch`、`file-not-found`。
 
 **传输错误码**（closed，信封专用）：`invalid-body`、`unknown-endpoint`、`method-not-allowed`、`unknown-approval`、`internal`（对应 HTTP 400/404/405/404/500；message 为中文人话）。
 
