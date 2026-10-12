@@ -1,4 +1,4 @@
-import { mkdtempSync, readFileSync, realpathSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, realpathSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, it } from "vitest";
@@ -48,6 +48,27 @@ describe("permission 门面", () => {
     const nonexist = permission.workspace.resolve(join(a, "nope"), undefined, process.cwd());
     expect(nonexist.status).toBe("error");
     if (nonexist.status === "error") expect(nonexist.error.code).toBe("workspace-invalid");
+  });
+
+  it("空串按缺省处理（空 cli/空环境变量不生效）", () => {
+    const cwdDir = mkdtempSync(join(tmpdir(), "cwd-"));
+    expect(permission.workspace.resolve("", undefined, cwdDir)).toEqual({
+      status: "ok",
+      workspace: realpathSync.native(cwdDir),
+    });
+    expect(permission.workspace.resolve(undefined, "", cwdDir)).toEqual({
+      status: "ok",
+      workspace: realpathSync.native(cwdDir),
+    });
+  });
+
+  it("相对值按传入 cwd 解析 + realpath 规范化", () => {
+    const base = mkdtempSync(join(tmpdir(), "base-"));
+    mkdirSync(join(base, "sub"));
+    expect(permission.workspace.resolve("sub", undefined, base)).toEqual({
+      status: "ok",
+      workspace: realpathSync.native(join(base, "sub")),
+    });
   });
 
   it("硬规 5：Permission 各子命名空间成员快照", () => {

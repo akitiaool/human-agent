@@ -1,6 +1,6 @@
 // permission 域门面：构造时绑定工作区与文件；成员不再收 workspace 参数。
 import { homedir } from "node:os";
-import { join } from "node:path";
+import { join, resolve } from "node:path";
 import { statSync } from "node:fs";
 import { createKey, normalizeMatchKey, defaultRealpath, type RealpathFn, type KeyService } from "./key.js";
 import { createCandidates, type CandidatesService, type CandidateRecord } from "./candidates.js";
@@ -69,10 +69,15 @@ function resolveWorkspace(
   cwd: string,
   realpathFn: RealpathFn = defaultRealpath,
 ): { status: "ok"; workspace: string } | { status: "error"; error: { code: "workspace-invalid"; message: string } } {
-  const raw = cliValue ?? envValue ?? cwd;
+  const raw =
+    cliValue !== undefined && cliValue.trim() !== ""
+      ? cliValue
+      : envValue !== undefined && envValue.trim() !== ""
+        ? envValue
+        : cwd;
   let real: string;
   try {
-    real = realpathFn(raw);
+    real = realpathFn(resolve(cwd, raw));
   } catch {
     return { status: "error", error: { code: "workspace-invalid", message: `工作区不存在或不可访问：${raw}` } };
   }
