@@ -54,6 +54,12 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 - `src/mouth/ask-user.ts`：新增 `askApproval(prompt)` 三选审批——`[y] 允许 [n] 拒绝 [w] 加入白名单`，写类另有 `[d] 白名单(此目录)`（父目录段级前缀条目），无效输入循环追问；`MouthContract`/`ApprovalPrompt`/`ApprovalChoice` 契约（types/organ.ts）
 - 接入：loop `#execute` pending 走嘴巴三选；桥 pending 批量审批 + `POST /approval` 可选 `whitelist` 字段（校验：条目必须对应本批 allowed=true 的调用——exact 与匹配键一致、path 为「此路径」文件条目或「此目录」目录条目（读目录类 = 自身 + `/`、其余 = 父目录 + `/`），不合法 400）；扩展弹窗白名单按钮（内容见阶段五 extensions 条目）；`src/agent.ts` `HumanAgent`/`buildBridgeService` 透传 `whitelistFile`；CLI 启动 system 消息注入 `workspaceConstraint()`（agent.run 装配）
 
+阶段七（API 重设计）已完成（TDD，331 tests）：三域三根（TS：`tool`/`permission`/`bridge`；wire：`task`/`permission`/`agent`）与统一词形规则见「API 词根表」。
+- `src/tool/`（工具域）：工具知识唯一来源——`schemas.ts`（schema + 描述 + meta，`ToolName = keyof typeof schemas` 编译期穷尽）、`protocol.ts`（协议文本模板）、`index.ts`（组装面 `tool`：names/meta/schemas/infos/covers/protocol；`covers` 唯一覆盖判定取代旧 toolMatches/keyMatches）；工具 8 个（旧 → 新名对照见词根表）
+- `src/permission/`（权限域）：`createPermission` 门面（构造绑定工作区与文件、自动注册工作区写白名单；成员 `workspace`/`key`/`verdict`/`whitelist`/`blacklist`/`candidates`）+ 模块级 `permission.workspace.resolve`（三级决议）；布局：`store.ts`（白名单与候选同容器 `{version:1, workspaces}`，单一读写/校验）、`key.ts`（规范匹配键管道 + 唯一归一器 + entryFor/optionsFor/execPath）、`verdict.ts`（黑名单 → 白名单 → 未列）、`whitelist.ts`（grant/list；AddResult added/duplicate/covered/rejected）、`candidates.ts`、`blacklist.ts`；**文件格式 v1、无迁移**（旧格式/旧工具名条目整档作废属预期）
+- `src/bridge/`（桥域）：`createBridge`（组合 permission + `createReflection({permission})` + 共享执行器，内嵌 HTTP 服务 127.0.0.1）、`envelope.ts`（统一信封 `{status:"ok",data?} | {status:"error",error:{code,message}}`；传输错误码 closed；裸 204 仅空长轮询）、`pipeline.ts`（旧桥状态机移植：严格解析、无调用 processed:false 自终止、pending 批量审批（options 预构造）、候选两钩子）
+- 集成与退役：`ActionResult` 判别联合（`success` 布尔退役、错误码全面 kebab）；loop options 收 `permission`（与 brain 共持同一实例）、executor context `{permission}`（执行落点 = 判定落点）；CLI 桥模式直接 `createBridge`；扩展 v0.4.0 零手抄（审批按钮按载荷 options 渲染、候选入库 `{items, scope}`）；旧模块 7 个全数删除、无别名 shim
+
 **尚未开始**：voice/image/browser 等预留器官（`eyes/image-viewer.ts`、`ears/voice-input.ts`、`mouth/voice-output.ts`、`hands/browser-action.ts`）。
 
 `human-agent` 是一个拟人化智能体（Humanoid Agent）CLI 工具，技术栈为 TypeScript / Node.js (>= 20.0.0, ESM)。
@@ -62,15 +68,15 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 顶层模块以人类生物学器官抽象，每层只依赖相邻的神经信号，职责专一：
 
-- 🧠 `src/brain/`（大脑）：知识与思考。`knowledge.ts` 知识库（工具如何使用的知识，未来 RAG 在此聚合）、`thinking.ts` 通用基类（BaseThinking：权限 + 反思 + 工作区，桥与 CLI 共用的确定性层）、思考层（`ollama-thinking.ts` 模型推理 / `gemini-bridge-thinking.ts` 执行型桥服务，均继承 BaseThinking）、`reflection.ts` 反思层（可行性裁决，确定性代码）、`context.ts` 会话消息队列（仅 Ollama 模式用）；`llm.ts` 统一推理接口
-- 🫀 `src/heart/`（心脏）：生命循环。`loop.ts` 推进 `听取指令 → 大脑思考 → 反思裁决 → 手眼执行 → 反馈结果 → 循环/结束`，并承担承受力（任务/单命令超时、maxIterations、中断）；`executor.ts` 共享工具执行路由（loop 与桥服务共用；**执行落点 = 判定落点**——路径类经 execPath 传递）；`interrupt.ts` 持有全局 `AbortController`
+- 🧠 `src/brain/`（大脑）：思考与推理。工具知识唯一来源在 **`src/tool/` 工具域**（`schemas.ts`/`protocol.ts`/`index.ts`，原 `knowledge.ts` 迁入并扩展）；`reflection.ts` 反思层（`createReflection({permission})` 工厂，确定性裁决：黑名单 → 未知工具 → 非法参数 → 白名单放行 → pending）；`ollama-thinking.ts` 思考层（OllamaThinking implements BrainInference，`infer` + 委托反思层 `reflect`）；`ast-parser.ts` 工具调用解析（ASTParser 状态机，桥管道严格解析用）；`context.ts` 会话消息队列（仅 Ollama 模式用）；`llm.ts` 统一推理接口（原 BaseThinking 壳层与 `gemini-bridge-thinking.ts` 已删除——权限归 permission 域、桥归 bridge 域）
+- 🫀 `src/heart/`（心脏）：生命循环。`loop.ts` 推进 `听取指令 → 大脑思考 → 反思裁决 → 手眼执行 → 反馈结果 → 循环/结束`，并承担承受力（任务/单命令超时、maxIterations、中断），options 收 `permission` 实例（与 brain 共持同一实例）；`executor.ts` 共享工具执行路由（`executeTool(organs, name, args, signal, context: {permission})`，loop 与桥管道共用；**执行落点 = 判定落点**——路径类经 `permission.key.execPath` 传递）；`interrupt.ts` 持有全局 `AbortController`
 - 👁️ `src/eyes/`（眼睛）：**只读**。文件读/目录遍历/代码检索、网页抓取转 Clean Markdown。
 - 👂 `src/ears/`（耳朵）：输入。终端 REPL、语音（预留）。
 - 🗣️ `src/mouth/`（嘴巴）：输出。流式 Markdown/彩色终端输出、`confirm(message): Promise<boolean>` 交互确认、`askApproval(prompt)` 三选审批（允许/拒绝/加入白名单，写类另有「此目录」）。
 - ✋ `src/hands/`（双手）：**写/执行**。文件写入与 Patch、基于 `execa` 的 Shell 执行（绑定中断信号、超时强杀；`Terminal` cwd 钉工作区——相对命令落点 = 判定落点）。
-- 👃 `src/nose/`（鼻子）：权限与嗅探。`policy.ts`（PermissionPolicy：黑名单 + 白名单统一裁决）、`workspace-path.ts`（规范匹配键管道 + 启动工作区决议）、`candidates.ts`（信任候选档案）、`blacklist.ts`（内置黑名单规则库，随版本）、`risk-checker.ts`（独立危险特征嗅探，输出 `SAFE`/`DANGEROUS`，保留为观察模块、不再参与裁决）；环境快照（OS、CWD、Git 分支、端口占用）。
+- 👃 `src/nose/`（鼻子）：观察模块（不参与裁决）。`risk-checker.ts`（独立危险特征嗅探，输出 `SAFE`/`DANGEROUS`）、`env-checker.ts`（环境快照：OS、CWD、Git 分支、端口占用）；权限族模块（policy/workspace-path/candidates/blacklist）已全数迁入 `src/permission/` 权限域。
 
-组装入口：`src/agent.ts`——`HumanAgent` 类通过构造函数依赖注入全部器官（`brain, heart, eyes, hands, mouth, nose, ears`），恒为 Ollama 模式；`buildBridgeService()` 组装执行型桥服务。
+组装入口：`src/agent.ts`——`HumanAgent` 类构造注入器官（brain/eyes/hands/mouth/ears/output，可选覆盖），内部建 `createPermission`（同一实例注入思考层与 loop），恒为 Ollama 模式；器官工厂 `buildDefaultEyes()`/`buildDefaultHands(workspace)` 导出供桥复用；桥服务入口为 `src/bridge/` 的 `bridge.createBridge(options)`（原 `buildBridgeService()` 已删除）。
 
 ## 不可违反的设计原则
 
@@ -81,19 +87,57 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## 关键契约
 
-所有工具（双手/眼睛）操作统一返回 `ActionResult`，错误结构固定：
+所有工具（双手/眼睛）操作统一返回 `ActionResult` 判别联合（`success` 布尔已退役，非法态不可构造；`ok()`/`fail()` 保留名返回新形状）：
 
 ```typescript
-export interface ActionResult<T = unknown> {
-  success: boolean;
-  data?: T;
-  error?: {
-    code: string;
-    message: string;
-    stack?: string;
-  };
-}
+export type ActionResult<T = unknown> =
+  | { status: "ok"; data?: T }
+  | { status: "error"; error: { code: string; message: string; stack?: string } };
 ```
+
+## API 词根表（硬规 4）
+
+每个标识符必须带域归属（前缀），全路径命名 `域.子域.动词`（如 `permission.whitelist.grant`）；消费者不占根、主题才占根。词根与词形规则与 spec（`docs/superpowers/specs/2026-10-12-api-redesign-design.md`）§1/§7 同源。
+
+**域根表**：
+
+| 面 | 根 | 内容 |
+|---|---|---|
+| TS | `tool` | 工具知识域：工具是什么、怎么匹配 |
+| TS | `permission` | 权限域：键、工作区、裁决、白名单、黑名单、候选 |
+| TS | `bridge` | 桥管道域：HTTP 服务与流水线 |
+| wire | `task` | 管道面（长轮询取件 / 回填 / 审批回执） |
+| wire | `permission` | 权限面（候选 / 入库 / 清除；查看与撤销预留） |
+| wire | `agent` | 宿主信息面（协议 / 信息；状态流预留） |
+
+**词形规则**（全局单一）：
+
+- 判别词唯一 `status`；`ok` / `success` 两个布尔判别词全系统退役。
+- 值词（错误码、裁决值、入库状态、`type` 等）一律 **kebab**（原 SCREAMING_SNAKE 退役）。
+- 工具名 **snake**（已获批的协议词，独立子表）；JSON 结构键多词一律 kebab（`deny-count`、`write-path`、`first-seen` 等）。
+- 唯一例外：Node errno 透传码（`ENOENT` 等）保持原样——外部词表，不属于自有词表。
+- 器官生命周期枚举（`AgentStatus`/`AgentPhase`）与 `RiskLevel` 为内部状态机、不跨面，维持原样（spec §7 范围说明）。
+
+**工具名旧 → 新对照**（8 组；不留任何旧名别名 / 兼容 shim）：
+
+| 旧 | 新 |
+|---|---|
+| `read_file` | `file_read` |
+| `write_file` | `file_write` |
+| `edit_file` | `file_edit` |
+| `apply_patch` | `file_patch` |
+| `read_dir` | `dir_list` |
+| `search_code` | `code_search` |
+| `terminal` | `command_run` |
+| `fetch_page` | `page_fetch` |
+
+**自有错误码**（kebab，域结果用）：`blacklist`、`unknown-tool`、`invalid-args`、`user-denied`、`dependency-blocked`、`exec-timeout`、`exec-error`、`read-error`、`write-error`、`patch-not-found`、`empty-search`、`invalid-pattern`、`fetch-error`、`workspace-invalid`。
+
+**传输错误码**（closed，信封专用）：`invalid-body`、`unknown-endpoint`、`method-not-allowed`、`unknown-approval`、`internal`（对应 HTTP 400/404/405/404/500；message 为中文人话）。
+
+**防漂移硬规 5 条**（全文见 spec §8）：① 编译期耦合（`ToolName = keyof typeof schemas`、`meta` 穷尽——新增工具不补 meta/schema 不通过编译）；② 扩展零手抄（扩展不含工具名语义/键归一/条目构造，一切语义经载荷 options / items+scope 由桥下发）；③ 文件 version + zod strict + 单一序列化器（`src/permission/store.ts`）；④ 词根表进 CLAUDE.md（本节）；⑤ 命名空间成员快照测试（tool 面 / permission 各子命名空间 / bridge 服务面，新增成员必须显式更新快照）。
+
+**词根表 → 命名修改流程**：新增标识符必须归入既有词根或显式修改词根表（本节）；改动词根须显式更新本章节与 spec。
 
 ## 编码规范
 
@@ -119,7 +163,7 @@ pnpm test     # vitest 全量运行（tests/ 目录，TDD 流程：先写测试�
 
 CLI 入口为 `bin/cli.ts`（处理 argv）。
 
-工作区经三级决议：`--workspace <path>` > `HUMAN_AGENT_WORKSPACE` > 启动 CWD；启动时 realpath 规范化且必须为已存在目录（否则友好报错 exit 1）；一进程一工作区不可变（切换=重启）。注意：`pnpm dev -- --workspace X` 不可用——`--` 连同后续参数被透传给脚本，commander 报 too many arguments；临时指定请用 `pnpm exec tsx bin/cli.ts --workspace X`。
+工作区经三级决议（实现 `permission.workspace.resolve`，两种模式启动前先决议再装配）：`--workspace <path>` > `HUMAN_AGENT_WORKSPACE` > 启动 CWD；启动时 realpath 规范化且必须为已存在目录（否则友好报错 exit 1）；一进程一工作区不可变（切换=重启）。注意：`pnpm dev -- --workspace X` 不可用——`--` 连同后续参数被透传给脚本，commander 报 too many arguments；临时指定请用 `pnpm exec tsx bin/cli.ts --workspace X`。
 
 ## 开发路线（5 阶段递进）
 
@@ -129,3 +173,4 @@ CLI 入口为 `bin/cli.ts`（处理 argv）。
 4. 大脑与心脏（loop 状态机、interrupt、接入具体大模型）✅（OllamaBrain + qwen3，`OLLAMA_MODEL` 可换模型）
 5. Gemini 桥与职责模型重构（knowledge/ollama-thinking/gemini-bridge-thinking/reflection + 共享执行器、浏览器扩展桥）✅（扩展 v2 重写待真实 AI Studio DOM）
 6. 统一权限模型（thinking/policy/blacklist + Reflection 集成 + CLI/桥 pending 审批 + 扩展白名单按钮）✅
+7. API 重设计（tool/permission/bridge 三域 + 统一信封 + ActionResult 判别联合 + 扩展零手抄）✅
