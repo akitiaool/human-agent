@@ -43,9 +43,20 @@ const defaultSettings = {
   segmentLenMax: 1024, // 分块长度上限（正常文本回填尽量少分块）
   typoChance: 40, // 每段触发「粘贴错字→退格→重打」纠错的概率（%）
   speed: 1, // 回填速度倍率（0.5/1/2/4/10，回填过程中可即时修改）
-  autoApprove: false, // 自动授权危险命令：开=静默放行不弹窗
+  untrustedTier: "popup", // 未信任调用处置：popup 默认弹窗 / deny 默认拒绝 / allow 默认允许（黑名单三档一致直接拒绝）
   approvalTimeoutSec: 120, // 审批超时（秒），到点自动全部拒绝
 };
+
+const TIER_LABELS = { popup: "默认弹窗", deny: "默认拒绝", allow: "默认允许" };
+// 工具分类镜像集（与服务端 policy.ts 的 WRITE_TOOLS/READ_TOOLS/DIR_TARGET_TOOLS 对齐；载荷键为近似值，落盘归一以桥为准）
+const WRITE_TOOL_NAMES = new Set(["write_file", "apply_patch", "edit_file"]);
+const READ_TOOL_NAMES = new Set(["read_file", "read_dir", "search_code"]);
+const PATH_TOOL_NAMES = new Set([...WRITE_TOOL_NAMES, ...READ_TOOL_NAMES]);
+const DIR_TARGET_TOOLS = new Set(["read_dir", "search_code"]);
+function isPathToolName(name) {
+  return PATH_TOOL_NAMES.has(name);
+}
+let bridgeWorkspace = ""; // 当前桥工作区（GET /info；仅显示与载荷近似归一用，不持久化）
 
 let settings = { ...defaultSettings };
 let pendingInjectText = ""; // 已取得、待投递循环回填的协议文本（空串=无）
@@ -257,6 +268,9 @@ panel.innerHTML = `
 .ha-approval-row.ha-approval-wl { border-color: #166534; }
 .ha-approval-row.ha-approval-wl .ha-approval-hint { color: #86efac; }
 .ha-approval-foot { display: flex; gap: 8px; margin-top: 8px; justify-content: flex-end; }
+.ha-tier-warning { color: #fbbf24; font-size: 12px; }
+.ha-value { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; direction: rtl; text-align: left; }
+#ha-workspace { direction: rtl; }
 </style>
 <div class="ha-title">
   <span>gemini-bridge<span class="ha-badge">v3 网页对话驱动</span></span>
@@ -271,9 +285,15 @@ panel.innerHTML = `
   <label class="ha-row">
     <input type="checkbox" id="ha-auto-inject"> 新对话自动注入协议
   </label>
-  <label class="ha-row">
-    <input type="checkbox" id="ha-auto-approve"> 自动授权危险命令
-  </label>
+  <div class="ha-row">
+    <span>未信任处置</span>
+    <select id="ha-untrusted-tier" title="未信任（黑名单/白名单外）调用的去向；黑名单三档一致直接拒绝">
+      <option value="popup">默认弹窗（逐条授权）</option>
+      <option value="deny">默认拒绝（无人值守推荐）</option>
+      <option value="allow">默认允许（仅黑名单拦截）</option>
+    </select>
+    <span id="ha-tier-warning" class="ha-tier-warning" hidden>⚠ 仅黑名单兜底</span>
+  </div>
 </div>
 <label class="ha-row">
   <input type="checkbox" id="ha-simulate"> 模拟人类逐字输入
@@ -315,6 +335,10 @@ panel.innerHTML = `
 <div class="ha-row">
   <span>桥服务</span>
   <input type="text" id="ha-base-url" spellcheck="false" placeholder="http://127.0.0.1:8765">
+</div>
+<div class="ha-row">
+  <span>工作区</span>
+  <span id="ha-workspace" class="ha-value" title="">（未获取）</span>
 </div>
 <button id="ha-inject-protocol" title="手动把工具协议（规则）文本填入输入框（自动提交开=填好后自动提交）">填入规则文本</button>
 <div class="ha-status" id="ha-status"><span id="ha-status-text">待命</span><span class="ha-status-dot" title="状态指示灯"></span></div>
@@ -499,6 +523,7 @@ function noteBridgeSuccess() {
       autoInjectState = "idle"; // 拉取失败期间桥已恢复：重试自动补投
       log("协议自动补投：桥服务可用，将重试拉取");
     }
+    void refreshWorkspace(); // 连接恢复补拉工作区（幂等：已有值则直接返回）
   }
 }
 
@@ -520,6 +545,23 @@ async function fetchProtocolText() {
   if (typeof resp?.protocol === "string" && resp.protocol !== "") return { text: resp.protocol };
   if (resp?.status === 404) return { error: "桥服务无 /protocol 端点（旧版本），请重启桥服务加载新代码" };
   return { error: resp?.error ?? "协议文本为空" };
+}
+
+// 桥工作区（GET /info）：面板显示 + 载荷近似归一基准；已取得则不重复拉取
+async function refreshWorkspace() {
+  if (bridgeWorkspace !== "") return;
+  let resp;
+  try {
+    resp = await chrome.runtime.sendMessage({ type: "get-info", baseUrl: settings.baseUrl });
+  } catch (err) {
+    resp = { error: err instanceof Error ? err.message : String(err) };
+  }
+  if (typeof resp?.workspace === "string" && resp.workspace !== "") {
+    bridgeWorkspace = resp.workspace;
+    const el = panel.querySelector("#ha-workspace");
+    el.textContent = bridgeWorkspace;
+    el.title = bridgeWorkspace;
+  }
 }
 
 function log(text) {
@@ -562,7 +604,8 @@ function applySettingsToPanel() {
   panel.querySelector("#ha-typo-chance").value = settings.typoChance;
   panel.querySelector("#ha-speed").value = settings.speed;
   panel.querySelector("#ha-base-url").value = settings.baseUrl;
-  panel.querySelector("#ha-auto-approve").checked = settings.autoApprove;
+  panel.querySelector("#ha-untrusted-tier").value = settings.untrustedTier;
+  panel.querySelector("#ha-tier-warning").hidden = settings.untrustedTier !== "allow";
   panel.querySelector("#ha-approval-timeout").value = settings.approvalTimeoutSec;
 }
 
@@ -650,11 +693,11 @@ function setupPanelEvents() {
     scheduleSaveSettings();
     log(`回填速度：${settings.speed}x（下次节奏立即生效）`);
   });
-  panel.querySelector("#ha-auto-approve").addEventListener("change", (e) => {
-    settings.autoApprove = e.target.checked;
+  panel.querySelector("#ha-untrusted-tier").addEventListener("change", (e) => {
+    settings.untrustedTier = ["popup", "deny", "allow"].includes(e.target.value) ? e.target.value : "popup";
     applySettingsToPanel();
     scheduleSaveSettings();
-    log(`自动授权危险命令：${settings.autoApprove ? "开" : "关"}`);
+    log(`未信任处置：${TIER_LABELS[settings.untrustedTier]}`);
   });
   panel.querySelector("#ha-approval-timeout").addEventListener("change", (e) => {
     settings.approvalTimeoutSec = clampApprovalTimeout(Number(e.target.value));
@@ -836,31 +879,45 @@ function deepNorm(value) {
   return value;
 }
 
+function resolveSegments(p) {
+  const isAbs = p.startsWith("/");
+  const isDrive = /^[a-z]:\//i.test(p);
+  const out = [];
+  for (const s of p.split("/")) {
+    if (s === "" || s === ".") continue;
+    if (s === "..") {
+      if (out.length > (isDrive ? 1 : 0)) out.pop();
+      continue;
+    }
+    out.push(s);
+  }
+  return (isAbs ? "/" : "") + out.join("/");
+}
+
+// 载荷键近似归一：写类补 edit_file、读类进路径维度；相对形态以桥工作区（GET /info）为基准。
+// 仅作展示/近似用——落盘归一与对应性校验以桥侧管道为准（§3 归一职责上收）。
 function normalizeKey(call, granularity) {
   const args = call.arguments ?? {};
-  if (call.name === "write_file" || call.name === "apply_patch") {
-    const p = String(args.path ?? "")
-      .trim()
-      .replace(/\s+/g, " ")
-      .replace(/\\/g, "/")
-      .replace(/\/+/g, "/");
-    // 段级解析：折叠 . 与 ..（与服务端 normalizePath 一致——防 c:/ws/../../windows 穿越绕过黑名单锚定/工作区边界）
+  let target = null;
+  if (PATH_TOOL_NAMES.has(call.name)) {
+    if (call.name === "search_code") {
+      target = typeof args.dir === "string" && args.dir.trim() !== "" ? args.dir : ".";
+    } else {
+      target = typeof args.path === "string" && args.path.trim() !== "" ? args.path : null;
+    }
+  }
+  if (target !== null) {
+    const p = String(target).trim().replace(/\s+/g, " ").replace(/\\/g, "/").replace(/\/+/g, "/");
+    const base = bridgeWorkspace.replace(/\\/g, "/").replace(/\/+$/, "");
     const isAbs = p.startsWith("/");
     const isDrive = /^[a-z]:\//i.test(p);
-    const out = [];
-    for (const s of p.split("/")) {
-      if (s === "" || s === ".") continue;
-      if (s === "..") {
-        if (out.length > (isDrive ? 1 : 0)) out.pop();
-        continue;
-      }
-      out.push(s);
-    }
-    const resolved = (isAbs ? "/" : "") + out.join("/");
-    const lower = /^win/i.test(navigator.platform) ? resolved.toLowerCase() : resolved;
+    const joined = !isAbs && !isDrive && base !== "" ? resolveSegments(`${base}/${p}`) : resolveSegments(p);
+    const lower = /^win/i.test(navigator.platform) ? joined.toLowerCase() : joined;
     if (granularity === "dir") {
+      const root = lower === "/" || /^[a-z]:\/$/.test(lower);
+      if (root) return { key: lower, kind: "path" }; // 根级/盘符根：降级文件条目
+      if (DIR_TARGET_TOOLS.has(call.name)) return { key: `${lower}/`, kind: "path" };
       const i = lower.lastIndexOf("/");
-      // 根级/盘符根：dir 条目=全部绝对路径/整盘超授权，降级为文件条目（与 buildWhitelistEntry 一致）
       if (i <= 0 || (i === 2 && lower[1] === ":")) return { key: lower, kind: "path" };
       return { key: `${lower.slice(0, i)}/`, kind: "path" };
     }
@@ -897,13 +954,22 @@ async function postApproval(payload) {
 }
 
 async function handleApproval(item) {
-  if (settings.autoApprove) {
-    log(`自动授权已开启：静默放行 ${item.calls.length} 条危险命令`);
+  if (settings.untrustedTier === "allow") {
+    // 默认允许档：策略代答放行（桥不感知档位——同一回执通道）
+    log(`默认允许档：放行 ${item.calls.length} 条未信任调用`);
     if (!(await postApproval({ id: item.id, allowed: item.calls.map(() => true) }))) setStatus("错误");
+    log(`[信任候选] +${item.calls.length}（默认允许）`);
+    return;
+  }
+  if (settings.untrustedTier === "deny") {
+    // 默认拒绝档：策略代答拒绝（即时回决，无弹窗倒计时空耗）
+    log(`默认拒绝档：拒绝 ${item.calls.length} 条未信任调用`);
+    if (!(await postApproval({ id: item.id, allowed: item.calls.map(() => false) }))) setStatus("错误");
+    log(`[信任候选] +${item.calls.length}（默认拒绝）`);
     return;
   }
   setStatus("等待授权");
-  log(`收到审批请求（${item.calls.length} 条危险命令），等待授权…`);
+  log(`收到审批请求（${item.calls.length} 条未信任调用），等待授权…`);
   const decision = await showApprovalDialog(item);
   const payload = { id: item.id, allowed: decision.allowed };
   const wl = decision.whitelist ?? [];
@@ -914,6 +980,15 @@ async function handleApproval(item) {
     return;
   }
   setStatus("待命");
+  log(`[信任候选] +${item.calls.length - wl.length}（默认弹窗）`);
+}
+
+// 审批提示语按调用类别泛化（读类不再套用写类文案）
+function approvalHint(call) {
+  if (WRITE_TOOL_NAMES.has(call.name)) return "该操作可能写入或覆盖文件，请确认后授权";
+  if (READ_TOOL_NAMES.has(call.name)) return "该操作将读取工作区外的文件，请确认后授权";
+  if (call.name === "terminal") return "该命令可能修改系统或数据，请确认后授权";
+  return "该操作将访问外部网页，请确认后授权";
 }
 
 // 审批弹窗：遮罩 + 居中卡片；逐条 [允许][拒绝][白名单] + 全部允许/全部拒绝；
@@ -931,7 +1006,7 @@ function showApprovalDialog(item) {
         (call, i) => `
       <div class="ha-approval-row" data-i="${i}">
         <div class="ha-approval-cmd">${escapeHtml(call.arguments?.command ?? JSON.stringify(call.arguments))}</div>
-        <div class="ha-approval-hint">该命令可能删除或覆盖数据，请确认后授权</div>
+        <div class="ha-approval-hint">${escapeHtml(approvalHint(call))}</div>
         <div class="ha-approval-btns">
           <button class="ha-allow" data-i="${i}">允许</button>
           <button class="ha-deny" data-i="${i}">拒绝</button>
@@ -940,7 +1015,7 @@ function showApprovalDialog(item) {
       )
       .join("");
     box.innerHTML = `
-      <div class="ha-approval-title">危险命令授权 <span class="ha-approval-count" id="ha-approval-count"></span></div>
+      <div class="ha-approval-title">工具调用授权 <span class="ha-approval-count" id="ha-approval-count"></span></div>
       ${rows}
       <div class="ha-approval-foot">
         <button class="ha-allow-all" id="ha-approval-allow-all">全部允许</button>
@@ -973,20 +1048,20 @@ function showApprovalDialog(item) {
     }, 1000);
     countEl.textContent = `${secondsLeft.value}s 后自动拒绝`;
 
-    // 每行追加白名单按钮：非写类 [白名单]；写类（write_file/apply_patch）额外 [白名单(此目录)]
+    // 每行追加白名单按钮：路径类两粒度 [白名单(此路径)] [白名单(此目录)]；其余 [白名单]（exact）
     [...box.querySelectorAll(".ha-approval-row")].forEach((row, index) => {
       const call = item.calls[index];
       const rowActions = row.querySelector(".ha-approval-btns");
-      const isWrite = call.name === "write_file" || call.name === "apply_patch";
+      const pathTool = isPathToolName(call.name);
       const wlBtn = document.createElement("button");
-      wlBtn.textContent = isWrite ? "白名单(此路径)" : "白名单";
+      wlBtn.textContent = pathTool ? "白名单(此路径)" : "白名单";
       wlBtn.className = "ha-btn ha-btn-wl";
       wlBtn.onclick = () => {
         decisions[index] = true; // 白名单即允许
-        whitelist[index] = buildEntry(call, isWrite ? "path" : "exact");
+        whitelist[index] = buildEntry(call, pathTool ? "path" : "exact");
         refreshRow(row, index);
       };
-      if (isWrite) {
+      if (pathTool) {
         const dirBtn = document.createElement("button");
         dirBtn.textContent = "白名单(此目录)";
         dirBtn.className = "ha-btn ha-btn-wl";
@@ -1350,7 +1425,14 @@ async function init() {
       autoInject: typeof saved.autoInject === "boolean" ? saved.autoInject : defaultSettings.autoInject,
       simulateTyping:
         typeof saved.simulateTyping === "boolean" ? saved.simulateTyping : defaultSettings.simulateTyping,
-      autoApprove: typeof saved.autoApprove === "boolean" ? saved.autoApprove : defaultSettings.autoApprove,
+      untrustedTier:
+        saved.untrustedTier === "popup" || saved.untrustedTier === "deny" || saved.untrustedTier === "allow"
+          ? saved.untrustedTier
+          : typeof saved.autoApprove === "boolean"
+            ? saved.autoApprove
+              ? "allow"
+              : "popup" // 一次性迁移：旧 autoApprove true→默认允许 / false→默认弹窗（行为不变）
+            : defaultSettings.untrustedTier,
       approvalTimeoutSec: clampApprovalTimeout(Number(saved.approvalTimeoutSec)),
     };
   }
@@ -1363,6 +1445,7 @@ async function init() {
   log(
     `gemini-bridge v3 已就绪：桥服务 ${settings.baseUrl}，自动提交 ${settings.autoMode ? "开" : "关"}，新对话自动注入 ${settings.autoInject ? "开" : "关"}`,
   );
+  void refreshWorkspace(); // 启动即拉一次工作区（桥未就绪时静默失败，连接成功后补拉）
   setupCaptureListener(); // 网络捕获接入：等 MAIN world 捕获消息（document_start 已发 hello，此处补 ping）
   deliveryLoop(); // 投递循环：长轮询取回填消息
 }

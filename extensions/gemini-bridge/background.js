@@ -89,6 +89,43 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
         return;
       }
 
+      if (message.type === "get-info") {
+        let res;
+        try {
+          res = await fetch(`${base}/info`, {
+            signal: AbortSignal.timeout(GET_PROTOCOL_TIMEOUT_MS),
+            cache: "no-store",
+          });
+        } catch (err) {
+          sendResponse({
+            error:
+              err?.name === "TimeoutError" || err?.name === "AbortError"
+                ? "GET /info 超时"
+                : err instanceof Error
+                  ? err.message
+                  : String(err),
+          });
+          return;
+        }
+        if (res.status === 204) {
+          sendResponse({ error: "桥服务正在关闭" });
+          return;
+        }
+        if (!res.ok) {
+          sendResponse({ status: res.status, error: `GET /info → HTTP ${res.status}` });
+          return;
+        }
+        let workspace = "";
+        try {
+          const data = await res.json();
+          workspace = typeof data?.workspace === "string" ? data.workspace : "";
+        } catch {
+          // 响应体非 JSON 按空处理
+        }
+        sendResponse({ workspace });
+        return;
+      }
+
       if (message.type === "submit-result") {
         const reply = message?.reply;
         if (typeof reply !== "string" || reply.trim() === "") {
