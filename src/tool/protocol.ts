@@ -1,0 +1,91 @@
+// 协议文本模板：规则正文只做工具名逐字替换（spec §11——"DEPENDENCY_BLOCKED" 为语义标签，保留原样）。
+import { z } from "zod";
+import { descriptions, names, schemas } from "./schemas.js";
+
+const PROTOCOL_HEADER =
+  "【human-agent 工具协议】你是 human-agent 智能体的大脑，通过调用工具与本地环境交互。";
+
+const PROTOCOL_RULES = [
+  "调用规则：",
+  "- 需要读取/修改/执行才能完成用户任务时，必须调用工具，不得假装完成",
+  "- 【纯粹性铁律】：若要调用工具，整个回复必须且只能包含 { <::: TOOL_CALL[ID] ... :::> TOOL_CALL[ID] } 容器块与空白，严禁附带任何自然语言解释、前缀、问候或说明（包含任何额外文字的回复均会被系统视为普通对话，工具将不会被执行）",
+  "- 如需向用户解释思路或讨论方案，请输出纯文本对话（不含工具调用）；需要执行时再单独输出工具调用",
+  "- 标准工具调用格式（外层 { ... } 容器，内层 <::: TOOL_CALL[ID] 配对）：",
+  "{",
+  "<::: TOOL_CALL[1]",
+  "tool: file_read",
+  "path: package.json",
+  "start_line: 1",
+  "line_count: 15",
+  ":::> TOOL_CALL[1]",
+  "}",
+  "- 全量写入文件（file_write 原生无转义 CONTENT 语法）：",
+  "{",
+  "<::: TOOL_CALL[2]",
+  "tool: file_write",
+  "path: src/agent.ts",
+  "<::: CONTENT",
+  "// 这里直接书写完整代码，零转义",
+  ":::> CONTENT",
+  ":::> TOOL_CALL[2]",
+  "}",
+  "- 局部代码精确替换（file_edit 原生无转义 N+1 流式 Diff 语法）：",
+  "{",
+  "<::: TOOL_CALL[3]",
+  "tool: file_edit",
+  "path: src/heart/loop.ts",
+  "base_version: v-xxxx",
+  "<::: BEFORE[1]",
+  "待替换的原始旧代码 1（原生多行，直接换行，无需转义）",
+  "<::> AFTER[1]",
+  "替换后的目标新代码 1（原生多行，直接换行，无需转义）",
+  "<::> BEFORE[2]",
+  "待替换的原始旧代码 2",
+  "<::> AFTER[2]",
+  "替换后的目标新代码 2",
+  ":::> AFTER[2]",
+  ":::> TOOL_CALL[3]",
+  "}",
+  "- 终端命令执行（command_run 原生无转义 COMMAND 语法）：",
+  "{",
+  "<::: TOOL_CALL[4]",
+  "tool: command_run",
+  "timeout_ms: 10000",
+  "<::: COMMAND",
+  "pnpm build && pnpm test",
+  ":::> COMMAND",
+  ":::> TOOL_CALL[4]",
+  "}",
+  "- 复合工具调用格式（支持 pipeline 链式依赖与 batch 独立执行）：",
+  "{",
+  "<::: PIPELINE[p1]",
+  "  <::: TOOL_CALL[step1]",
+  "  tool: command_run",
+  "  <::: COMMAND",
+  "  pnpm build",
+  "  :::> COMMAND",
+  "  :::> TOOL_CALL[step1]",
+  "  <::: TOOL_CALL[step2]",
+  "  tool: command_run",
+  "  <::: COMMAND",
+  "  pnpm test",
+  "  :::> COMMAND",
+  "  :::> TOOL_CALL[step2]",
+  ":::> PIPELINE[p1]",
+  "}",
+  "- 执行语义：",
+  "  * BATCH（批处理）：子工具相互独立执行，单项失败或被拒绝不影响其他子工具执行",
+  "  * PIPELINE（流水线）：子工具按序依赖执行，前序步骤失败或被拒绝将立即阻断后续步骤（标记为 DEPENDENCY_BLOCKED）",
+  "  * 支持在 PIPELINE 内部嵌套 BATCH，或在 BATCH 内部嵌套 PIPELINE",
+  "- 工具结果将以「工具执行结果（human-agent）：1. ... 2. ...」的格式统一反馈",
+  "- 任务完成或无需工具时，直接输出最终回答文本",
+].join("\n");
+
+/** 序列化工具协议文本（每轮思考完整注入；可靠性与旧行为一致）。 */
+export function protocol(): string {
+  const toolLines = names.map(
+    (name, index) =>
+      `${index + 1}. ${name}: ${descriptions[name]} | ${JSON.stringify(z.toJSONSchema(schemas[name]))}`,
+  );
+  return `${PROTOCOL_HEADER}\n可用工具（名称：用途 | 参数）：\n${toolLines.join("\n")}\n${PROTOCOL_RULES}`;
+}
