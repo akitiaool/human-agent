@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "gemini-bridge",
-  "version": "0.3.0",
+  "version": "0.4.0",
   "description": "human-agent 与 AI Studio 网页版 Gemini 的桥：网络原文捕获模型回复回传桥服务，长轮询取回填消息模拟人类输入。",
   "permissions": ["storage"],
   "host_permissions": ["http://127.0.0.1/*"],

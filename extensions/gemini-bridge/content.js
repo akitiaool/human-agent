@@ -1,8 +1,10 @@
-// gemini-bridge v3 content script —— 网页对话驱动。
+// gemini-bridge v0.4 content script —— 网页对话驱动。
+// 零手抄：扩展不含任何工具名/键归一/条目构造——审批白名单按钮按载荷 task.options[i] 渲染、所选条目原样回显，
+// 候选入库只发 {items, scope} 由桥服务物化条目并校验（wire v1：统一信封 + task/permission/agent 三面）。
 // 回复回传走网络原文捕获（路线 A）：MAIN world inject.js 钩 GenerateContent 响应 → postMessage
-// → 本脚本用 haDecodeGenerateContent（decode.js，同 content_scripts 数组先加载）解码 → POST /result。
+// → 本脚本用 haDecodeGenerateContent（decode.js，同 content_scripts 数组先加载）解码 → POST /task/reply。
 // 投递循环：长轮询 GET /task → 模拟人类逐字回填 → 自动/手动提交。
-// 协议注入：GET /protocol 按需拉取（无本地存储）；「新对话自动注入协议」开关（默认开）控制自动注入——
+// 协议注入：GET /agent/protocol 按需拉取（无本地存储）；「新对话自动注入协议」开关（默认开）控制自动注入——
 // 会话切换检测 = URL 轮询（/prompts/<id> ⇄ /prompts/new_chat 逐对话唯一），仅空对话页自动注入，
 // 页面加载不自动检查（防刷新旧对话渲染期误判为空导致重放），面板按钮随时可手动注入（无条件）。
 // 选择器为 AI Studio 真实 DOM（2026-08-19 落定，task-13-brief 附录 A）。
@@ -48,15 +50,7 @@ const defaultSettings = {
 };
 
 const TIER_LABELS = { popup: "默认弹窗", deny: "默认拒绝", allow: "默认允许" };
-// 工具分类镜像集（与服务端 policy.ts 的 WRITE_TOOLS/READ_TOOLS/DIR_TARGET_TOOLS 对齐；载荷键为近似值，落盘归一以桥为准）
-const WRITE_TOOL_NAMES = new Set(["write_file", "apply_patch", "edit_file"]);
-const READ_TOOL_NAMES = new Set(["read_file", "read_dir", "search_code"]);
-const PATH_TOOL_NAMES = new Set([...WRITE_TOOL_NAMES, ...READ_TOOL_NAMES]);
-const DIR_TARGET_TOOLS = new Set(["read_dir", "search_code"]);
-function isPathToolName(name) {
-  return PATH_TOOL_NAMES.has(name);
-}
-let bridgeWorkspace = ""; // 当前桥工作区（GET /info；仅显示与载荷近似归一用，不持久化）
+let bridgeWorkspace = ""; // 当前桥工作区（GET /agent/info；仅面板显示，不持久化）
 
 let settings = { ...defaultSettings };
 let pendingInjectText = ""; // 已取得、待投递循环回填的协议文本（空串=无）
@@ -283,7 +277,7 @@ panel.innerHTML = `
 .ha-cand-counts { color: #9ca3af; flex: none; }
 </style>
 <div class="ha-title">
-  <span>gemini-bridge<span class="ha-badge">v3 网页对话驱动</span></span>
+  <span>gemini-bridge<span class="ha-badge">v0.4 网页对话驱动</span></span>
   <button id="ha-collapse" title="收起为悬浮球">–</button>
 </div>
 <div class="ha-group-card">
@@ -359,9 +353,9 @@ panel.innerHTML = `
     <div class="ha-cand-ops">
       <button id="ha-cand-all">全选</button>
       <span>粒度</span>
-      <select id="ha-cand-gran" title="仅作用于路径类行；terminal/抓网页行恒 exact">
-        <option value="file">文件</option>
-        <option value="dir">目录</option>
+      <select id="ha-cand-gran" title="入库粒度：此路径=仅目标自身（self）/ 此目录=目标所在子树（subtree）；桥服务按工具类型校验并物化条目">
+        <option value="self">此路径</option>
+        <option value="subtree">此目录</option>
       </select>
       <button id="ha-cand-add">入库所选 (0)</button>
       <button id="ha-cand-dismiss">清除所选</button>
@@ -410,7 +404,7 @@ retryBtn.addEventListener("click", () => {
   }
 });
 
-// 手动填入规则文本：从桥服务按需拉取（GET /protocol）→ 排队注入（跟随自动提交）
+// 手动填入规则文本：从桥服务按需拉取（GET /agent/protocol）→ 排队注入（跟随自动提交）
 const injectProtocolBtn = panel.querySelector("#ha-inject-protocol");
 injectProtocolBtn.addEventListener("click", async () => {
   if (pendingInjectText) {
@@ -562,30 +556,38 @@ function waitForManualRetry() {
   });
 }
 
-// 从桥服务按需拉取协议文本（GET /protocol，经 background 中继）；返回 {text} 或 {error}
+// 从桥服务按需拉取协议文本（GET /agent/protocol，经 background 中继）；返回 {text} 或 {error}
 async function fetchProtocolText() {
   let resp;
   try {
     resp = await chrome.runtime.sendMessage({ type: "get-protocol", baseUrl: settings.baseUrl });
   } catch (err) {
-    resp = { error: err instanceof Error ? err.message : String(err) };
+    resp = { status: "error", error: { code: "bridge-unreachable", message: err instanceof Error ? err.message : String(err) } };
   }
-  if (typeof resp?.protocol === "string" && resp.protocol !== "") return { text: resp.protocol };
-  if (resp?.status === 404) return { error: "桥服务无 /protocol 端点（旧版本），请重启桥服务加载新代码" };
-  return { error: resp?.error ?? "协议文本为空" };
+  if (resp?.status === "ok") {
+    const protocol = resp.data?.protocol;
+    if (typeof protocol === "string" && protocol !== "") return { text: protocol };
+    return { error: "协议文本为空" };
+  }
+  const error = resp?.error;
+  if (error?.code === "unknown-endpoint") {
+    return { error: "桥服务无 /agent/protocol 端点（旧版本），请重启桥服务加载新代码" };
+  }
+  return { error: error?.message ?? "协议文本为空" };
 }
 
-// 桥工作区（GET /info）：面板显示 + 载荷近似归一基准；已取得则不重复拉取
+// 桥工作区（GET /agent/info）：仅面板显示；已取得则不重复拉取，失败静默（桥未就绪时启动即拉，连接成功后补拉）
 async function refreshWorkspace() {
   if (bridgeWorkspace !== "") return;
   let resp;
   try {
     resp = await chrome.runtime.sendMessage({ type: "get-info", baseUrl: settings.baseUrl });
   } catch (err) {
-    resp = { error: err instanceof Error ? err.message : String(err) };
+    resp = { status: "error", error: { code: "bridge-unreachable", message: err instanceof Error ? err.message : String(err) } };
   }
-  if (typeof resp?.workspace === "string" && resp.workspace !== "") {
-    bridgeWorkspace = resp.workspace;
+  const workspace = resp?.status === "ok" ? resp.data?.workspace : null;
+  if (typeof workspace === "string" && workspace !== "") {
+    bridgeWorkspace = workspace;
     const el = panel.querySelector("#ha-workspace");
     el.textContent = bridgeWorkspace;
     el.title = bridgeWorkspace;
@@ -770,19 +772,30 @@ function setupPanelEvents() {
       log("信任候选：未选择任何行");
       return;
     }
-    const gran = panel.querySelector("#ha-cand-gran").value;
-    const entries = rows.map((r) => buildCandidateEntry(r.tool, r.key, gran));
+    const scope = panel.querySelector("#ha-cand-gran").value; // self / subtree：桥服务按工具类型校验并物化条目
+    const items = rows.map((r) => ({ tool: r.tool, key: r.key }));
     let resp;
     try {
-      resp = await chrome.runtime.sendMessage({ type: "whitelist-add", entries, baseUrl: settings.baseUrl });
+      resp = await chrome.runtime.sendMessage({ type: "whitelist-add", items, scope, baseUrl: settings.baseUrl });
     } catch (err) {
-      resp = { error: err instanceof Error ? err.message : String(err) };
+      resp = { status: "error", error: { code: "bridge-unreachable", message: err instanceof Error ? err.message : String(err) } };
     }
-    if (resp?.ok === true) {
-      log(`信任候选：入库 ${entries.length} 条（${gran === "dir" ? "目录" : "文件"}粒度）`);
+    if (resp?.status === "ok") {
+      const grants = Array.isArray(resp.data?.grants) ? resp.data.grants : [];
+      const counts = { added: 0, duplicate: 0, covered: 0, rejected: 0 };
+      for (const grant of grants) {
+        const status = grant?.add?.status;
+        if (Object.hasOwn(counts, status)) counts[status] += 1;
+      }
+      log(
+        `信任候选：提交 ${items.length} 条 → 新增 ${counts.added} / 重复 ${counts.duplicate} / ` +
+          `已被覆盖 ${counts.covered} / 被拒 ${counts.rejected}`,
+      );
       void refreshCandidates();
+    } else if (resp?.error?.code === "bridge-unreachable") {
+      noteBridgeFailure(resp.error.message);
     } else {
-      log(`信任候选入库失败：${resp?.error ?? "未知错误"}（条目须对应现存候选，桥侧已拒绝）`);
+      log(`信任候选入库失败：${resp?.error?.message ?? "未知错误"}`); // 桥侧 400 的 message 直接呈现
     }
   });
   panel.querySelector("#ha-cand-dismiss").addEventListener("click", async () => {
@@ -795,13 +808,15 @@ function setupPanelEvents() {
     try {
       resp = await chrome.runtime.sendMessage({ type: "candidates-dismiss", items, baseUrl: settings.baseUrl });
     } catch (err) {
-      resp = { error: err instanceof Error ? err.message : String(err) };
+      resp = { status: "error", error: { code: "bridge-unreachable", message: err instanceof Error ? err.message : String(err) } };
     }
-    if (resp?.ok === true) {
-      log(`信任候选：清除 ${items.length} 条`);
+    if (resp?.status === "ok") {
+      log(`信任候选：清除 ${resp.data?.dropped ?? 0} 条`);
       void refreshCandidates();
+    } else if (resp?.error?.code === "bridge-unreachable") {
+      noteBridgeFailure(resp.error.message);
     } else {
-      log(`信任候选清除失败：${resp?.error ?? "未知错误"}`);
+      log(`信任候选清除失败：${resp?.error?.message ?? "未知错误"}`);
     }
   });
 }
@@ -942,95 +957,24 @@ async function clickSendWhenReady() {
   return true;
 }
 
-// ---------- 审批：危险命令授权（弹窗/自动授权）→ POST /approval ----------
-
-// 白名单键归一化：与服务端 src/nose/policy.ts 对齐——写类路径反斜杠转正斜杠 + 斜杠折叠 + win32 小写；
-// terminal 命令空白折叠（无斜杠折叠）；其余工具完整参数深归一 + 键排序（exact 键必须与桥侧 serializeArgs 一致）
-function deepNorm(value) {
-  if (typeof value === "string") {
-    return value.trim().replace(/\s+/g, " ").replace(/\\/g, "/");
-  }
-  if (Array.isArray(value)) return value.map(deepNorm);
-  if (value !== null && typeof value === "object") {
-    const out = {};
-    for (const k of Object.keys(value).sort()) out[k] = deepNorm(value[k]);
-    return out;
-  }
-  return value;
-}
-
-function resolveSegments(p) {
-  const isAbs = p.startsWith("/");
-  const isDrive = /^[a-z]:\//i.test(p);
-  const out = [];
-  for (const s of p.split("/")) {
-    if (s === "" || s === ".") continue;
-    if (s === "..") {
-      if (out.length > (isDrive ? 1 : 0)) out.pop();
-      continue;
-    }
-    out.push(s);
-  }
-  return (isAbs ? "/" : "") + out.join("/");
-}
-
-// 载荷键近似归一：写类补 edit_file、读类进路径维度；相对形态以桥工作区（GET /info）为基准。
-// 仅作展示/近似用——落盘归一与对应性校验以桥侧管道为准（§3 归一职责上收）。
-function normalizeKey(call, granularity) {
-  const args = call.arguments ?? {};
-  let target = null;
-  if (PATH_TOOL_NAMES.has(call.name)) {
-    if (call.name === "search_code") {
-      target = typeof args.dir === "string" && args.dir.trim() !== "" ? args.dir : ".";
-    } else {
-      target = typeof args.path === "string" && args.path.trim() !== "" ? args.path : null;
-    }
-  }
-  if (target !== null) {
-    const p = String(target).trim().replace(/\s+/g, " ").replace(/\\/g, "/").replace(/\/+/g, "/");
-    const base = bridgeWorkspace.replace(/\\/g, "/").replace(/\/+$/, "");
-    const isAbs = p.startsWith("/");
-    const isDrive = /^[a-z]:\//i.test(p);
-    const joined = !isAbs && !isDrive && base !== "" ? resolveSegments(`${base}/${p}`) : resolveSegments(p);
-    const lower = /^win/i.test(navigator.platform) ? joined.toLowerCase() : joined;
-    if (granularity === "dir") {
-      const root = lower === "/" || /^[a-z]:\/$/.test(lower);
-      if (root) return { key: lower, kind: "path" }; // 根级/盘符根：降级文件条目
-      if (DIR_TARGET_TOOLS.has(call.name)) return { key: `${lower}/`, kind: "path" };
-      const i = lower.lastIndexOf("/");
-      if (i <= 0 || (i === 2 && lower[1] === ":")) return { key: lower, kind: "path" };
-      return { key: `${lower.slice(0, i)}/`, kind: "path" };
-    }
-    return { key: lower, kind: "path" };
-  }
-  if (call.name === "terminal") {
-    return {
-      key: String(args.command ?? "").trim().replace(/\s+/g, " ").replace(/\\/g, "/"),
-      kind: "exact",
-    };
-  }
-  return { key: JSON.stringify(deepNorm(args)), kind: "exact" };
-}
-
-function buildEntry(call, granularity) {
-  const { key, kind } = normalizeKey(call, granularity);
-  return { tool: call.name, key, kind };
-}
+// ---------- 审批：未信任调用授权（弹窗/三档代答）→ POST /task/approval ----------
 
 async function postApproval(payload) {
+  let resp;
   try {
-    const resp = await chrome.runtime.sendMessage({ type: "approve", ...payload, baseUrl: settings.baseUrl });
-    if (resp?.ok === true) return true;
-    if (resp?.status === 404) {
-      log("审批请求已过期（桥服务已按超时拒绝），跳过");
-      return true; // 桥已兜底处理并回填拒绝行，流程继续
-    }
-    noteBridgeFailure(resp?.error ?? "POST /approval 失败");
-    return false;
+    resp = await chrome.runtime.sendMessage({ type: "approve", ...payload, baseUrl: settings.baseUrl });
   } catch (err) {
-    noteBridgeFailure(err instanceof Error ? err.message : String(err));
-    return false;
+    resp = { status: "error", error: { code: "bridge-unreachable", message: err instanceof Error ? err.message : String(err) } };
   }
+  if (resp?.status === "ok") return true;
+  const error = resp?.error ?? { code: "internal", message: "未知错误" };
+  if (error.code === "unknown-approval") {
+    log(`审批结果提交：${error.message}`); // 桥侧未受理（如已按超时兜底拒绝）：显示服务端 message，流程继续
+    return true;
+  }
+  if (error.code === "bridge-unreachable") noteBridgeFailure(error.message);
+  else log(`审批结果提交失败：${error.message}`);
+  return false;
 }
 
 async function handleApproval(item) {
@@ -1068,22 +1012,6 @@ async function handleApproval(item) {
 
 let candRows = []; // 最近一次拉取的候选列表
 
-function buildCandidateEntry(tool, key, gran) {
-  if (!PATH_TOOL_NAMES.has(tool)) return { tool, key, kind: "exact" };
-  if (gran !== "dir") return { tool, key, kind: "path" };
-  const dirKey = approximateDirKey(tool, key);
-  return { tool, key: dirKey ?? key, kind: "path" };
-}
-
-// 「此目录」近似键（与服务端 dirEntryKey 同规则；桥侧复核，失败即 400）
-function approximateDirKey(tool, key) {
-  if (key === "" || key === "/" || /^[a-z]:\/$/i.test(key)) return null;
-  if (DIR_TARGET_TOOLS.has(tool)) return `${key}/`;
-  const i = key.lastIndexOf("/");
-  if (i <= 0 || (i === 2 && key[1] === ":")) return null;
-  return `${key.slice(0, i)}/`;
-}
-
 function checkedCandidateRows() {
   return [...panel.querySelectorAll("#ha-cand-list input[type=checkbox]:checked")].map((el) => ({
     tool: el.dataset.tool,
@@ -1118,7 +1046,7 @@ function renderCandidates(list) {
     key.textContent = c.key;
     const counts = document.createElement("span");
     counts.className = "ha-cand-counts";
-    counts.textContent = `拒 ${c.denied} / 放 ${c.allowed}`;
+    counts.textContent = `拒 ${c["deny-count"] ?? 0} / 放 ${c["allow-count"] ?? 0}`;
     row.append(input, tool, key, counts);
     host.appendChild(row);
   }
@@ -1131,26 +1059,33 @@ async function refreshCandidates() {
   try {
     resp = await chrome.runtime.sendMessage({ type: "get-candidates", baseUrl: settings.baseUrl });
   } catch (err) {
-    resp = { error: err instanceof Error ? err.message : String(err) };
+    resp = { status: "error", error: { code: "bridge-unreachable", message: err instanceof Error ? err.message : String(err) } };
   }
-  if (Array.isArray(resp?.candidates)) {
-    renderCandidates(resp.candidates);
-  } else if (resp?.error) {
-    log(`信任候选拉取失败：${resp.error}`);
+  if (resp?.status === "ok") {
+    renderCandidates(Array.isArray(resp.data?.candidates) ? resp.data.candidates : []);
+    return;
+  }
+  const error = resp?.error;
+  if (!error) return;
+  if (error.code === "bridge-unreachable") {
+    noteBridgeFailure(error.message);
+  } else if (error.code === "unknown-endpoint") {
+    log(`信任候选拉取失败：${error.message}（桥服务可能为旧版本，请重启加载新代码）`);
+  } else {
+    log(`信任候选拉取失败：${error.message}`);
   }
 }
 
-// 审批提示语按调用类别泛化（读类不再套用写类文案）
-function approvalHint(call) {
-  if (WRITE_TOOL_NAMES.has(call.name)) return "该操作可能写入或覆盖文件，请确认后授权";
-  if (READ_TOOL_NAMES.has(call.name)) return "该操作将读取工作区外的文件，请确认后授权";
-  if (call.name === "terminal") return "该命令可能修改系统或数据，请确认后授权";
-  return "该操作将访问外部网页，请确认后授权";
+// 审批提示语由载荷选项数量驱动（零手抄：扩展不感知工具语义，不出现任何工具名）
+function approvalHint(optionCount) {
+  if (optionCount >= 2) return "未信任调用：可授权本次，或将此路径/此目录加入白名单后自动放行";
+  if (optionCount === 1) return "未信任调用：可授权本次，或加入白名单后自动放行";
+  return "未信任调用（无法生成白名单条目）：请确认后授权";
 }
 
-// 审批弹窗：遮罩 + 居中卡片；逐条 [允许][拒绝][白名单] + 全部允许/全部拒绝；
-// 白名单按钮是显式动作：条目并入本次提交的 whitelist 数组并自动勾选该条允许（弹窗保持打开，可继续处理其余行）；
-// 顶部倒计时按面板审批超时配置，到点自动全部拒绝（白名单条目一并撤销，保证载荷与 allowed 一致）。
+// 审批弹窗：遮罩 + 居中卡片；逐条 [允许][拒绝] + 白名单按钮（按载荷选项渲染）+ 全部允许/全部拒绝；
+// 白名单按钮是显式动作：选项条目原样回显并入本次提交的 whitelist 数组并自动勾选该条允许（弹窗保持打开，可继续处理其余行）；
+// 顶部倒计时按面板审批超时配置，到点自动全部拒绝（白名单条目一并撤销，保证载荷与 allowed 一致；全部允许不自动填白名单）。
 function showApprovalDialog(item) {
   return new Promise((resolve) => {
     const overlay = document.createElement("div");
@@ -1158,12 +1093,15 @@ function showApprovalDialog(item) {
     const box = document.createElement("div");
     box.className = "ha-approval-box";
     const secondsLeft = { value: settings.approvalTimeoutSec };
+    const optionsByCall = Array.isArray(item.options) ? item.options : [];
     const rows = item.calls
       .map(
         (call, i) => `
       <div class="ha-approval-row" data-i="${i}">
         <div class="ha-approval-cmd">${escapeHtml(call.arguments?.command ?? JSON.stringify(call.arguments))}</div>
-        <div class="ha-approval-hint">${escapeHtml(approvalHint(call))}</div>
+        <div class="ha-approval-hint">${escapeHtml(
+          approvalHint(Array.isArray(optionsByCall[i]) ? optionsByCall[i].length : 0),
+        )}</div>
         <div class="ha-approval-btns">
           <button class="ha-allow" data-i="${i}">允许</button>
           <button class="ha-deny" data-i="${i}">拒绝</button>
@@ -1205,31 +1143,23 @@ function showApprovalDialog(item) {
     }, 1000);
     countEl.textContent = `${secondsLeft.value}s 后自动拒绝`;
 
-    // 每行追加白名单按钮：路径类两粒度 [白名单(此路径)] [白名单(此目录)]；其余 [白名单]（exact）
+    // 白名单按钮按载荷选项渲染（零手抄）：两项 → [白名单(此路径)] [白名单(此目录)]；一项 → [白名单]；零项 → 无按钮。
+    // 点击 = 该条允许且所选选项条目原样回显（条目由桥侧预构造，回执按批校验成员资格）
     [...box.querySelectorAll(".ha-approval-row")].forEach((row, index) => {
-      const call = item.calls[index];
+      const options = Array.isArray(optionsByCall[index]) ? optionsByCall[index] : [];
+      const labels = options.length === 2 ? ["白名单(此路径)", "白名单(此目录)"] : options.map(() => "白名单");
       const rowActions = row.querySelector(".ha-approval-btns");
-      const pathTool = isPathToolName(call.name);
-      const wlBtn = document.createElement("button");
-      wlBtn.textContent = pathTool ? "白名单(此路径)" : "白名单";
-      wlBtn.className = "ha-btn ha-btn-wl";
-      wlBtn.onclick = () => {
-        decisions[index] = true; // 白名单即允许
-        whitelist[index] = buildEntry(call, pathTool ? "path" : "exact");
-        refreshRow(row, index);
-      };
-      if (pathTool) {
-        const dirBtn = document.createElement("button");
-        dirBtn.textContent = "白名单(此目录)";
-        dirBtn.className = "ha-btn ha-btn-wl";
-        dirBtn.onclick = () => {
-          decisions[index] = true;
-          whitelist[index] = buildEntry(call, "dir");
+      options.forEach((option, k) => {
+        const wlBtn = document.createElement("button");
+        wlBtn.textContent = labels[k];
+        wlBtn.className = "ha-btn ha-btn-wl";
+        wlBtn.onclick = () => {
+          decisions[index] = true; // 白名单即允许
+          whitelist[index] = option; // 原样回显
           refreshRow(row, index);
         };
-        rowActions.appendChild(dirBtn);
-      }
-      rowActions.appendChild(wlBtn);
+        rowActions.appendChild(wlBtn);
+      });
     });
 
     box.addEventListener("click", (e) => {
@@ -1336,7 +1266,7 @@ async function deliveryLoop() {
           try {
             return await chrome.runtime.sendMessage({ type: "get-task", baseUrl: settings.baseUrl });
           } catch (err) {
-            return { error: err instanceof Error ? err.message : String(err) };
+            return { status: "error", error: { code: "bridge-unreachable", message: err instanceof Error ? err.message : String(err) } };
           }
         })();
       }
@@ -1347,26 +1277,35 @@ async function deliveryLoop() {
       if (raced.kind === "tick") continue; // 轮询仍在途：回顶重查队列/状态
       inflightPoll = null; // 本轮询已消费，下轮重新发起
       const resp = raced.resp;
-      if (resp?.error) {
-        bridgeFailCount += 1;
-        if (bridgeFailCount <= BRIDGE_RETRY_ATTEMPTS) {
-          noteBridgeFailure(resp.error, `第 ${bridgeFailCount}/${BRIDGE_RETRY_ATTEMPTS} 次失败，${bridgeFailCount}s 后重试`);
-          await sleep(bridgeFailCount * 1000);
+      // 信封消费：仅 status:"ok" 携带任务（空轮询 data:null）；
+      // bridge-unreachable（扩展本地伪码）走退避重试，其余错误记日志下轮再拉
+      if (resp?.status !== "ok") {
+        const error = resp?.error ?? { code: "bridge-unreachable", message: "桥未连接或请求超时" };
+        if (error.code === "bridge-unreachable") {
+          bridgeFailCount += 1;
+          if (bridgeFailCount <= BRIDGE_RETRY_ATTEMPTS) {
+            noteBridgeFailure(error.message, `第 ${bridgeFailCount}/${BRIDGE_RETRY_ATTEMPTS} 次失败，${bridgeFailCount}s 后重试`);
+            await sleep(bridgeFailCount * 1000);
+            continue;
+          }
+          noteBridgeFailure(error.message, "5 次重试均失败，请点击面板「手动重试」");
+          setStatus("桥未连接");
+          retryBtn.hidden = false;
+          await waitForManualRetry();
           continue;
         }
-        noteBridgeFailure(resp.error, "5 次重试均失败，请点击面板「手动重试」");
-        setStatus("桥未连接");
-        retryBtn.hidden = false;
-        await waitForManualRetry();
+        log(`取任务失败：${error.message}`);
+        await sleep(TASK_RETRY_MS);
         continue;
       }
       noteBridgeSuccess();
-      if (resp?.task?.type === "approval") {
-        await handleApproval(resp.task);
+      const task = resp.data;
+      if (task?.type === "approval") {
+        await handleApproval(task);
         continue; // 审批处理完立即拉取下一条（执行结果回填消息）
       }
-      if (resp?.task?.message) {
-        await deliverMessage(resp.task.message, "task");
+      if (typeof task?.message === "string") {
+        await deliverMessage(task.message, "task");
         continue; // 有消息时立即拉取下一条
       }
       // 无消息：仅把错误状态恢复为待命，不覆盖「已抓取回复」等有效状态
@@ -1442,7 +1381,7 @@ async function autoInjectProtocolIfEligible() {
   return true;
 }
 
-// ---------- 网络捕获接入（路线 A）：MAIN world → postMessage → 解码 → POST /result ----------
+// ---------- 网络捕获接入（路线 A）：MAIN world → postMessage → 解码 → POST /task/reply ----------
 
 const CAPTURE_MARKER = "gemini-bridge-capture";
 let captureMounted = false; // 「网络捕获已挂载」只记一次（hello 或首条捕获消息先到者）
@@ -1459,24 +1398,26 @@ async function postResult(reply, stats) {
   try {
     resp = await chrome.runtime.sendMessage({ type: "submit-result", reply, baseUrl: settings.baseUrl });
   } catch (err) {
-    resp = { error: err instanceof Error ? err.message : String(err) };
+    resp = { status: "error", error: { code: "bridge-unreachable", message: err instanceof Error ? err.message : String(err) } };
   }
-  if (resp?.error) {
-    noteBridgeFailure(resp.error); // 响亮停滞：本条丢弃不重发（无重采样通道），日志可诊
-    return;
-  }
-  if (resp.ok) {
+  if (resp?.status === "ok") {
+    const processed = resp.data?.processed === true;
     noteBridgeSuccess();
     log(
       `网络捕获：已回传（${reply.length} 字符，${stats.deltaCount} deltas，滤 ${stats.thoughtCount} thought，` +
-        `${resp.processed ? "已入队执行" : "服务侧忽略（无工具调用）"}）`,
+        `${processed ? "已入队执行" : "服务侧忽略（无工具调用）"}）`,
     );
-    if (!resp.processed) setStatus("待命");
+    if (!processed) setStatus("待命");
     // processed 时保持「已抓取回复（等待执行）」，直到回填消息到达
-  } else {
-    setStatus("错误");
-    log(`回传被拒：HTTP ${resp.status ?? "?"}`);
+    return;
   }
+  const error = resp?.error;
+  if (error?.code === "bridge-unreachable") {
+    noteBridgeFailure(error.message); // 响亮停滞：本条丢弃不重发（无重采样通道），日志可诊
+    return;
+  }
+  setStatus("错误");
+  log(`回传被拒：${error?.message ?? "未知错误"}`);
 }
 
 function setupCaptureListener() {
@@ -1600,7 +1541,7 @@ async function init() {
   setupNewConversationWatcher();
   setStatus("待命");
   log(
-    `gemini-bridge v3 已就绪：桥服务 ${settings.baseUrl}，自动提交 ${settings.autoMode ? "开" : "关"}，新对话自动注入 ${settings.autoInject ? "开" : "关"}`,
+    `gemini-bridge v0.4 已就绪：桥服务 ${settings.baseUrl}，自动提交 ${settings.autoMode ? "开" : "关"}，新对话自动注入 ${settings.autoInject ? "开" : "关"}`,
   );
   void refreshWorkspace(); // 启动即拉一次工作区（桥未就绪时静默失败，连接成功后补拉）
   setupCaptureListener(); // 网络捕获接入：等 MAIN world 捕获消息（document_start 已发 hello，此处补 ping）
