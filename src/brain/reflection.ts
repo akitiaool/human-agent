@@ -1,50 +1,43 @@
-// 反思层（潜意识）：决策后再想"可行吗"。确定性代码，不经过模型。
-// 裁决顺序：权限黑名单 → 存在性 → 结构 → 白名单放行 → 其余需授权。
-// 权限层注入 PermissionPolicy；"需授权"仅作标记，审批通道由宿主（桥/loop）负责。
-import { schemas } from "./knowledge.js";
-import type { PermissionPolicy } from "../nose/policy.js";
-import type { ReflectionVerdict, ToolCall } from "./llm.js";
+// 反思层（确定性代码）：裁决顺序 = 黑名单 → 未知工具 → 非法参数 → 白名单放行 → pending（spec §3.2）。
+import type { BlockedCall, ReflectionVerdict, ToolCall } from "./llm.js";
 import { fail } from "../types/index.js";
+import { isToolName, tool } from "../tool/index.js";
+import type { Permission } from "../permission/index.js";
 
-export class Reflection {
-  readonly #policy: PermissionPolicy;
-
-  constructor(policy: PermissionPolicy) {
-    this.#policy = policy;
-  }
-
-  async reflect(calls: readonly ToolCall[]): Promise<ReflectionVerdict> {
-    const allowed: ToolCall[] = [];
-    const pending: ToolCall[] = [];
-    const blocked: ReflectionVerdict["blocked"] = [];
-    for (const call of calls) {
-      const verdict = this.#policy.classify(call);
-      if (verdict.status === "blacklist") {
-        blocked.push({
-          call,
-          result: fail("blacklist", `系统破坏操作，禁止执行：${verdict.key ?? call.name}`),
-        });
-        continue;
+export function createReflection(options: { permission: Permission }): {
+  reflect(calls: readonly ToolCall[]): ReflectionVerdict;
+} {
+  const { permission } = options;
+  return {
+    reflect(calls) {
+      const allowed: ToolCall[] = [];
+      const pending: ToolCall[] = [];
+      const blocked: BlockedCall[] = [];
+      for (const call of calls) {
+        const verdict = permission.verdict.decide(call);
+        if (verdict.status === "blacklist") {
+          blocked.push({ call, result: fail("blacklist", `黑名单命中：${verdict.key ?? call.name}`) });
+          continue;
+        }
+        if (!isToolName(call.name)) {
+          blocked.push({ call, result: fail("unknown-tool", `未知工具：${call.name}`) });
+          continue;
+        }
+        const parsed = tool.schemas[call.name].safeParse(call.arguments ?? {});
+        if (!parsed.success) {
+          blocked.push({
+            call,
+            result: fail("invalid-args", `参数校验失败：${parsed.error.issues.map((i) => i.message).join("；")}`),
+          });
+          continue;
+        }
+        if (verdict.status === "allowed") {
+          allowed.push(call);
+          continue;
+        }
+        pending.push(call);
       }
-      const schema = schemas[call.name as keyof typeof schemas];
-      if (schema === undefined) {
-        blocked.push({ call, result: fail("unknown-tool", `未知工具: ${call.name}`) });
-        continue;
-      }
-      const parsed = schema.safeParse(call.arguments);
-      if (!parsed.success) {
-        const issues = parsed.error.issues
-          .map((issue) => `${issue.path.join(".")}: ${issue.message}`)
-          .join("; ");
-        blocked.push({
-          call,
-          result: fail("invalid-args", `工具 ${call.name} 参数不合法: ${issues}`),
-        });
-        continue;
-      }
-      if (verdict.status === "allowed") allowed.push(call);
-      else pending.push(call);
-    }
-    return { allowed, pending, blocked };
-  }
+      return { allowed, pending, blocked };
+    },
+  };
 }

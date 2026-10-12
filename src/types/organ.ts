@@ -1,5 +1,6 @@
 // 各器官的标准入参/出参契约（设计文档 §3、§6.1）
 import type { DiffHunk } from "../brain/llm.js";
+import type { TrustEntry } from "../tool/index.js";
 
 // ---------- 通用工具结果契约：双手/眼睛无论成败必须返回，严禁抛错 (§6.1) ----------
 
@@ -67,24 +68,17 @@ export interface EarsContract {
   prompt(question: string): Promise<string>;
 }
 
-/** 白名单条目：exact 精确整串 / path 写类路径（目录条目 key 以 / 结尾）。 */
-export interface WhitelistEntry {
-  tool: string;
-  key: string;
-  kind: "exact" | "path";
-}
-
-/** 审批提示：工具名 + 匹配键 + 条目类型（写类为 path，其余 exact）。 */
+/** 审批提示：工具名 + 匹配键 + 预构造的合法信任条目选项（顺序即展示顺序）。 */
 export interface ApprovalPrompt {
   tool: string;
   key: string;
-  kind: "exact" | "path";
+  options: TrustEntry[];
 }
 
 export type ApprovalChoice =
   | { action: "allow" }
   | { action: "deny" }
-  | { action: "whitelist"; entry: WhitelistEntry };
+  | { action: "whitelist"; entry: TrustEntry };
 
 export interface MouthContract {
   confirm(message: string): Promise<boolean>;

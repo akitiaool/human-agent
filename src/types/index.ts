@@ -16,7 +16,8 @@ export type {
   PortStatus,
   ReadFileResult,
   RiskLevel,
-  WhitelistEntry,
 } from "./organ.js";
+
+export type { TrustEntry, Scope } from "../tool/index.js";
 
 export { fail, ok } from "./organ.js";

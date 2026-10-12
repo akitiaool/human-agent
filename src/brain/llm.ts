@@ -1,5 +1,5 @@
 import type { ConversationContext } from "./context.js";
-import type { ActionResult, WhitelistEntry } from "../types/index.js";
+import type { ActionResult } from "../types/index.js";
 
 export interface DiffHunk {
   search: string;
@@ -54,8 +54,4 @@ export interface BrainInference {
   ): Promise<BrainInferenceResult>;
   /** 反思：对候选工具调用做可行性裁决（存在性/结构/权限），放行、待授权或拦截+错误反馈。 */
   reflect(calls: readonly ToolCall[]): Promise<ReflectionVerdict>;
-  /** 加入白名单（用户经嘴巴/弹窗批准后落盘）。 */
-  addWhitelistEntry(entry: WhitelistEntry): Promise<void>;
-  /** 工作区声明（软约束）：宿主注入 system 消息/协议文本。 */
-  workspaceConstraint(): string;
 }

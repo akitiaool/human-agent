@@ -1,9 +1,10 @@
 #!/usr/bin/env node
 import { Command } from "commander";
-import { buildBridgeService, HumanAgent } from "../src/agent.js";
+import { HumanAgent } from "../src/agent.js";
+import { createBridge } from "../src/bridge/index.js";
 import { InterruptController } from "../src/heart/interrupt.js";
 import { TextInput } from "../src/ears/text-input.js";
-import { resolveStartupWorkspace } from "../src/nose/workspace-path.js";
+import { permission } from "../src/permission/index.js";
 
 const program = new Command();
 
@@ -15,31 +16,35 @@ program
 
 program.parse(process.argv);
 
-const startup = resolveStartupWorkspace(
+// 工作区三级决议：--workspace > HUMAN_AGENT_WORKSPACE > 启动 CWD（realpath 规范化且必须为已存在目录）
+const resolved = permission.workspace.resolve(
   program.opts().workspace as string | undefined,
   process.env.HUMAN_AGENT_WORKSPACE,
   process.cwd(),
 );
-if (!startup.ok) {
-  console.error(`启动失败：${startup.error}`);
+if (resolved.status === "error") {
+  console.error(`启动失败：${resolved.error.message}`);
   process.exit(1);
 }
-const workspace = startup.workspace;
+const workspace = resolved.workspace;
 
 if (process.env.GEMINI_BRIDGE_PORT !== undefined) {
   // 桥模式：对话在网页（AI Studio），CLI 仅宿主 HTTP 服务
+  const parsed = Number.parseInt(process.env.GEMINI_BRIDGE_PORT, 10);
+  const port = Number.isInteger(parsed) && parsed >= 0 && parsed <= 65535 ? parsed : 8765;
   const interrupt = new InterruptController();
-  const service = buildBridgeService({
+  const service = createBridge({
     workspace,
+    port,
     signal: interrupt.getSignal(),
     logger: (text) => console.log(`[gemini-bridge] ${text}`),
   });
   process.on("SIGINT", () => interrupt.abort());
   process.on("SIGTERM", () => interrupt.abort());
   try {
-    const port = await service.getPort();
+    const actual = await service.getPort();
     console.log(`工作区：${workspace}`);
-    console.log(`Gemini 桥已监听 http://127.0.0.1:${port}`);
+    console.log(`Gemini 桥已监听 http://127.0.0.1:${actual}`);
     console.log("请在 AI Studio 页面与 Gemini 对话；插件会把 Gemini 的回复传给智能体执行工具，并把结果回填提交。");
   } catch (err) {
     console.error(`Gemini 桥无法监听端口：${err instanceof Error ? err.message : String(err)}`);

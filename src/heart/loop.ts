@@ -1,7 +1,7 @@
 import { ConversationContext } from "../brain/context.js";
-import { TOOLS } from "../brain/knowledge.js";
 import type { BrainInference, BrainInferenceResult, ToolCall } from "../brain/llm.js";
-import { isPathTool, matchKeyFor } from "../nose/policy.js";
+import type { Permission } from "../permission/index.js";
+import { tool } from "../tool/index.js";
 import type {
   ActionResult,
   AgentOutput,
@@ -29,8 +29,8 @@ export interface AgentLoopOptions {
   /** 单轮任务超时（毫秒），0 表示禁用；超时后终止本轮并继续监听。 */
   timeoutMs?: number;
   onPhase?: (phase: AgentPhase, detail?: string) => void;
-  /** 工作区（判定基准；缺省 process.cwd()）。 */
-  workspace?: string;
+  /** 权限域实例（与 brain 共持同一实例；判定基准与执行落点）。 */
+  permission: Permission;
 }
 
 /** 解析超时时长：纯数字按毫秒；s/m/h 后缀按秒/分/时；0 或 off 表示禁用；非法返回 null。 */
@@ -60,7 +60,7 @@ export class AgentLoop {
   readonly #maxIterations: number;
   #timeoutMs: number;
   readonly #onPhase: ((phase: AgentPhase, detail?: string) => void) | undefined;
-  readonly #workspace: string;
+  readonly #permission: Permission;
 
   #status: AgentStatus = "IDLE";
   #turnTimedOut = false;
@@ -77,7 +77,7 @@ export class AgentLoop {
     this.#maxIterations = options.maxIterations ?? 10;
     this.#timeoutMs = options.timeoutMs ?? 300_000;
     this.#onPhase = options.onPhase;
-    this.#workspace = options.workspace ?? process.cwd();
+    this.#permission = options.permission;
   }
 
   getStatus(): AgentStatus {
@@ -177,7 +177,7 @@ export class AgentLoop {
         this.#emit("THINKING");
         let result: BrainInferenceResult;
         try {
-          result = await this.#brain.infer(this.#context, TOOLS, turnSignal);
+          result = await this.#brain.infer(this.#context, tool.infos, turnSignal);
         } catch (err) {
           if (this.#signal.aborted) {
             this.#status = "INTERRUPTED";
@@ -251,9 +251,9 @@ export class AgentLoop {
         const result = await executeTool(
           { eyes: this.#eyes, hands: this.#hands },
           call.name,
-          call.arguments,
+          call.arguments ?? {},
           turnSignal,
-          { workspace: this.#workspace },
+          { permission: this.#permission },
         );
         this.#finish(call.name, result);
         this.#context.add({ role: "tool", name: call.name, content: JSON.stringify(result) });
@@ -261,11 +261,10 @@ export class AgentLoop {
       }
 
       if (pendingSet.has(call)) {
-        const kind = isPathTool(call.name) ? "path" : "exact";
         const prompt: ApprovalPrompt = {
           tool: call.name,
-          key: matchKeyFor(call, this.#workspace) ?? "",
-          kind,
+          key: this.#permission.key.of(call) ?? "",
+          options: this.#permission.key.optionsFor(call),
         };
         const choice = await this.#mouth.askApproval(prompt);
         if (choice.action === "deny") {
@@ -275,16 +274,16 @@ export class AgentLoop {
           continue;
         }
         if (choice.action === "whitelist") {
-          await this.#brain.addWhitelistEntry(choice.entry);
+          this.#permission.whitelist.grant(choice.entry);
           this.#output.info(`已加入白名单：${choice.entry.tool} ${choice.entry.key}`);
         }
         this.#emit("ACTING", call.name);
         const result = await executeTool(
           { eyes: this.#eyes, hands: this.#hands },
           call.name,
-          call.arguments,
+          call.arguments ?? {},
           turnSignal,
-          { workspace: this.#workspace },
+          { permission: this.#permission },
         );
         this.#finish(call.name, result);
         this.#context.add({ role: "tool", name: call.name, content: JSON.stringify(result) });

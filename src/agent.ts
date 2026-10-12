@@ -1,5 +1,4 @@
 import { ConversationContext } from "./brain/context.js";
-import { GeminiBridgeThinking } from "./brain/gemini-bridge-thinking.js";
 import { OllamaThinking } from "./brain/ollama-thinking.js";
 import type { BrainInference } from "./brain/llm.js";
 import { TextInput } from "./ears/text-input.js";
@@ -11,8 +10,8 @@ import { AgentLoop } from "./heart/loop.js";
 import { InterruptController } from "./heart/interrupt.js";
 import { TextOutput } from "./mouth/text-output.js";
 import { AskUser } from "./mouth/ask-user.js";
-import { EnvChecker } from "./nose/env-checker.js";
-import { RiskChecker } from "./nose/risk-checker.js";
+import { createPermission } from "./permission/index.js";
+import type { Permission } from "./permission/index.js";
 import type {
   AgentOutput,
   AgentStatus,
@@ -20,14 +19,12 @@ import type {
   EyesContract,
   HandsContract,
   MouthContract,
-  NoseContract,
 } from "./types/index.js";
 
 export interface HumanAgentOptions {
   brain?: BrainInference;
   ears?: EarsContract;
   mouth?: MouthContract;
-  nose?: NoseContract;
   eyes?: EyesContract;
   hands?: HandsContract;
   output?: AgentOutput;
@@ -47,33 +44,40 @@ export class HumanAgent {
   readonly brain: BrainInference;
   readonly eyes: EyesContract;
   readonly hands: HandsContract;
-  readonly nose: NoseContract;
   readonly mouth: MouthContract;
   readonly ears: EarsContract;
   readonly output: AgentOutput;
   readonly context: ConversationContext;
   readonly maxIterations: number;
   readonly timeoutMs: number | undefined;
-  readonly #loopWorkspace: string | undefined;
+  readonly #permission: Permission;
 
   constructor(options: HumanAgentOptions = {}) {
     this.interrupt = new InterruptController();
     this.eyes = options.eyes ?? buildDefaultEyes();
     this.hands = options.hands ?? buildDefaultHands(options.workspace);
-    this.#loopWorkspace = options.workspace;
-    this.nose = options.nose ?? buildDefaultNose();
     this.mouth = options.mouth ?? new AskUser();
     this.ears = options.ears ?? new TextInput();
     this.output = options.output ?? new TextOutput();
     this.context = options.context ?? new ConversationContext({ maxTokens: 8000 });
     this.maxIterations = options.maxIterations ?? 10;
     this.timeoutMs = options.timeoutMs;
-    this.brain = options.brain ?? buildDefaultBrain(options.whitelistFile, options.workspace);
+    this.#permission = createPermission({
+      workspace: options.workspace ?? process.cwd(),
+      ...(options.whitelistFile !== undefined ? { whitelistFile: options.whitelistFile } : {}),
+    });
+    this.brain =
+      options.brain ??
+      new OllamaThinking({
+        permission: this.#permission,
+        ...(process.env.OLLAMA_BASE_URL !== undefined ? { baseUrl: process.env.OLLAMA_BASE_URL } : {}),
+        ...(process.env.OLLAMA_MODEL !== undefined ? { model: process.env.OLLAMA_MODEL } : {}),
+      });
   }
 
   async run(): Promise<AgentStatus> {
     if (!this.context.getAll().some((message) => message.role === "system")) {
-      this.context.add({ role: "system", content: this.brain.workspaceConstraint() });
+      this.context.add({ role: "system", content: this.#permission.workspace.constraint() });
     }
     const loop = new AgentLoop({
       brain: this.brain,
@@ -86,69 +90,14 @@ export class HumanAgent {
       context: this.context,
       maxIterations: this.maxIterations,
       ...(this.timeoutMs !== undefined ? { timeoutMs: this.timeoutMs } : {}),
-      ...(this.#loopWorkspace !== undefined ? { workspace: this.#loopWorkspace } : {}),
+      permission: this.#permission,
     });
     await loop.run();
     return loop.getStatus();
   }
 }
 
-function buildDefaultBrain(whitelistFile?: string, workspace?: string): BrainInference {
-  return new OllamaThinking({
-    ...(process.env.OLLAMA_BASE_URL !== undefined ? { baseUrl: process.env.OLLAMA_BASE_URL } : {}),
-    ...(process.env.OLLAMA_MODEL !== undefined ? { model: process.env.OLLAMA_MODEL } : {}),
-    ...(whitelistFile !== undefined ? { whitelistFile } : {}),
-    ...(workspace !== undefined ? { workspace } : {}),
-  });
-}
-
-export interface BridgeServiceOptions {
-  port?: number;
-  signal?: AbortSignal;
-  timeoutMs?: number;
-  logger?: (text: string) => void;
-  /** 白名单文件；缺省 ~/.human-agent/whitelist.json（注入隔离测试/多实例用） */
-  whitelistFile?: string;
-  /** 信任候选档案文件；缺省 ~/.human-agent/candidates.json（注入隔离测试/多实例用） */
-  candidatesFile?: string;
-  /** 工作区（启动 realpath 规范化）；缺省 process.cwd()。 */
-  workspace?: string;
-}
-
-/** 桥模式组装：网页对话 + 智能体仅执行工具。port 缺省读 GEMINI_BRIDGE_PORT（非法回退 8765）。 */
-export function buildBridgeService(options: BridgeServiceOptions = {}): GeminiBridgeThinking {
-  const hands = buildDefaultHands(options.workspace);
-  const eyes = buildDefaultEyes();
-  const port = options.port ?? (() => {
-    const raw = process.env.GEMINI_BRIDGE_PORT;
-    if (raw === undefined) return 8765;
-    const parsed = Number(raw);
-    return Number.isInteger(parsed) && parsed > 0 ? parsed : 8765;
-  })();
-  return new GeminiBridgeThinking({
-    port,
-    hands,
-    eyes,
-    ...(options.signal !== undefined ? { signal: options.signal } : {}),
-    ...(options.timeoutMs !== undefined ? { timeoutMs: options.timeoutMs } : {}),
-    ...(options.logger !== undefined ? { logger: options.logger } : {}),
-    ...(options.whitelistFile !== undefined ? { whitelistFile: options.whitelistFile } : {}),
-    ...(options.candidatesFile !== undefined ? { candidatesFile: options.candidatesFile } : {}),
-    ...(options.workspace !== undefined ? { workspace: options.workspace } : {}),
-  });
-}
-
-function buildDefaultNose(): NoseContract {
-  const riskChecker = new RiskChecker();
-  const envChecker = new EnvChecker();
-  return {
-    checkRisk: (command) => riskChecker.checkRisk(command),
-    getEnvSnapshot: () => envChecker.getEnvSnapshot(),
-    checkPorts: (ports) => envChecker.checkPorts(ports),
-  };
-}
-
-function buildDefaultEyes(): EyesContract {
+export function buildDefaultEyes(): EyesContract {
   const reader = new FileReader();
   const crawler = new WebCrawler();
   return {
@@ -159,7 +108,7 @@ function buildDefaultEyes(): EyesContract {
   };
 }
 
-function buildDefaultHands(workspace?: string): HandsContract {
+export function buildDefaultHands(workspace?: string): HandsContract {
   const writer = new FileWriter();
   const terminal = new Terminal({ ...(workspace !== undefined ? { cwd: workspace } : {}) });
   return {
