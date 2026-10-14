@@ -1,5 +1,5 @@
 // 权限文件共享存储：白名单与候选同一容器（version 1），单一读写/校验模块（硬规 3）。
-import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
 import { dirname } from "node:path";
 
 export interface Container<T> {
@@ -32,11 +32,13 @@ export function loadContainer<T>(file: string, parseItem: (item: unknown) => T |
   }
 }
 
-/** 落盘：失败返回 false，永不抛出（调用方经注入 logger 报告）。 */
+/** 落盘：先写临时文件再原子改名（写一半崩溃不留损坏档）；失败返回 false，永不抛出（调用方经注入 logger 报告）。 */
 export function saveContainer<T>(file: string, container: Container<T>): boolean {
   try {
     mkdirSync(dirname(file), { recursive: true });
-    writeFileSync(file, JSON.stringify(container, null, 2), "utf8");
+    const tmp = `${file}.tmp`;
+    writeFileSync(tmp, JSON.stringify(container, null, 2), "utf8");
+    renameSync(tmp, file);
     return true;
   } catch {
     return false;

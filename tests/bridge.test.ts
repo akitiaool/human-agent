@@ -474,6 +474,78 @@ describe("createBridge 端点与统一信封", () => {
     if (candidates !== null) expect(candidates.status).toBe(204);
   });
 
+  it("close 中止在途批执行：级联 AbortSignal 到双手，且不再产生超时回填", async () => {
+    const { whitelistFile, candidatesFile } = files();
+    seedWhitelist(whitelistFile, [{ tool: "command_run", key: "hang", scope: "self" }]);
+    let aborted = false;
+    const hands: HandsContract = {
+      writeFile: async () => ok(undefined),
+      applyPatch: async () => ok(undefined),
+      editFile: async () => ok(undefined),
+      executeCommand: (_command, signal) =>
+        new Promise<ActionResult<unknown>>((resolve) => {
+          const done = (): void => {
+            aborted = true;
+            resolve(fail("exec-error", "已中止"));
+          };
+          if (signal?.aborted === true) { done(); return; }
+          signal?.addEventListener("abort", done, { once: true });
+        }),
+    };
+    const logs: string[] = [];
+    const bridge = createBridge({
+      workspace: wsReal,
+      port: 0,
+      whitelistFile,
+      candidatesFile,
+      hands,
+      timeoutMs: 60_000,
+      logger: (text) => logs.push(text),
+    });
+    openBridges.push(bridge);
+    const port = await bridge.getPort();
+    await postReply(port, toolCall("command_run", { command: "hang" }));
+    await new Promise((resolve) => setTimeout(resolve, 100)); // 确保批执行已进入双手
+    bridge.close();
+    const seen = await new Promise<boolean>((resolve) => {
+      const poll = setInterval(() => {
+        if (aborted) { clearInterval(poll); clearTimeout(cap); resolve(true); }
+      }, 10);
+      const cap = setTimeout(() => { clearInterval(poll); resolve(false); }, 500);
+    });
+    expect(seen).toBe(true);
+    await new Promise((resolve) => setTimeout(resolve, 50)); // 待管线收尾
+    expect(logs.some((text) => text.includes("回填消息已入队"))).toBe(false);
+  });
+
+  it("请求体超 1MB 上限 → 400 invalid-body（message 说明上限）", async () => {
+    const { port } = await makeBridge();
+    const huge = JSON.stringify({
+      items: [{ tool: "command_run", key: "a".repeat(1_200_000), scope: "self" }],
+    });
+    const res = await postJson(port, "/permission/whitelist/revoke", huge);
+    expect(res.status).toBe(400);
+    expect(errorCode(res.envelope)).toBe("invalid-body");
+    if (res.envelope.status === "error") expect(res.envelope.error.message).toContain("1MB");
+  });
+
+  it("监听冲突在创建时被捕获：getPort 迟到仍拒绝（不产生未处理 error）", async () => {
+    const a = await makeBridge();
+    const { whitelistFile, candidatesFile } = files();
+    const logs: string[] = [];
+    const b = createBridge({
+      workspace: wsReal,
+      port: a.port,
+      whitelistFile,
+      candidatesFile,
+      logger: (text) => logs.push(text),
+    });
+    openBridges.push(b);
+    await new Promise((resolve) => setTimeout(resolve, 150)); // 让 EADDRINUSE 先行触发
+    await expect(b.getPort()).rejects.toThrow();
+    expect(logs.some((text) => text.includes("监听失败"))).toBe(true);
+  });
+
   it("域失败不抬升信封：批执行超时回填为域消息，GET /task 仍 200 ok", async () => {
     const { port, organs } = await makeBridge({
       timeoutMs: 100,

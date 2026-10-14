@@ -1,7 +1,7 @@
 // 管线（旧桥状态机移植）：网页内容 → 严格解析 → 统一裁决 → 批量审批 → 执行 → 回填入队。
 // 不变量：parseToolCalls 严格解析（无容错兜底）、无调用 processed:false 自终止（不做服务端去重）、
 // pending 批量审批（兜底超时全拒）、批级执行超时、候选两钩子（审批回执落地即记、兜底超时 settle 记拒绝）、
-// close 释放不记候选；审批载荷 options 预构造（扩展零手抄载体，spec §4）。
+// close 中止在途批（级联双手）且释放挂起审批不记候选；审批载荷 options 预构造（扩展零手抄载体，spec §4）。
 import { z } from "zod";
 import { ASTParser, flattenToolCalls } from "../brain/ast-parser.js";
 import type { BrainInferenceResult, ReflectionVerdict, ToolCall, ToolCallNode } from "../brain/llm.js";
@@ -101,6 +101,8 @@ export function createPipeline(options: PipelineOptions): Pipeline {
   let busy: Promise<void> = Promise.resolve();
   /** close() 后置位：此后到达的长轮询立即释放（close 时请求可能尚未到达服务端）。 */
   let closed = false;
+  /** close() 中止在途批的级联信号（与全局中断同路并入批 signal）。 */
+  const closeController = new AbortController();
 
   /** 长轮询：有出队消息立即返回；无则挂起 ~25s 后 null（204）。 */
   function takeTask(): Promise<TaskItem | null> {
@@ -154,9 +156,12 @@ export function createPipeline(options: PipelineOptions): Pipeline {
 
   /** 单批流水线：统一裁决 → 需授权的批量审批 → 执行流控（pipeline 短路与 batch 独立执行）→ 回填。 */
   async function processBatch(nodes: readonly ToolCallNode[]): Promise<void> {
-    if (signal.aborted) return; // 全局中断：丢弃批次
-    const batchSignal =
-      timeoutMs > 0 ? AbortSignal.any([signal, AbortSignal.timeout(timeoutMs)]) : signal;
+    if (signal.aborted || closed) return; // 全局中断/已关闭：丢弃批次
+    const batchSignal = AbortSignal.any([
+      signal,
+      closeController.signal,
+      ...(timeoutMs > 0 ? [AbortSignal.timeout(timeoutMs)] : []),
+    ]);
 
     const flatCalls = flattenToolCalls(nodes);
     const verdict = await reflection.reflect(flatCalls);
@@ -170,7 +175,7 @@ export function createPipeline(options: PipelineOptions): Pipeline {
         decision = await Promise.race([promise, abortSignalPromise(batchSignal)]);
       } catch {
         cancel();
-        if (signal.aborted) return; // 全局中断：丢弃批次
+        if (signal.aborted || closed) return; // 全局中断/关闭：丢弃批次
         pushMessage(`⚠️ 工具执行超时（超过 ${timeoutMs}ms），已终止`);
         return;
       }
@@ -255,7 +260,7 @@ export function createPipeline(options: PipelineOptions): Pipeline {
       await executeNode(node, false);
     }
 
-    if (signal.aborted) return; // 全局中断：丢弃批次不排队
+    if (signal.aborted || closed) return; // 全局中断/关闭：丢弃批次不排队
     if (batchSignal.aborted) {
       pushMessage(`⚠️ 工具执行超时（超过 ${timeoutMs}ms），已终止`);
       return;
@@ -454,9 +459,10 @@ export function createPipeline(options: PipelineOptions): Pipeline {
     return `${permission.workspace.constraint()}\n\n${tool.protocol()}`;
   }
 
-  /** 关闭：挂起审批全部按拒绝释放（不记候选，兜底定时器清除）、长轮询释放、清空回填队列。 */
+  /** 关闭：中止在途批（级联双手）、挂起审批全按拒绝释放（不记候选，兜底定时器清除）、长轮询释放、清空回填队列。 */
   function close(): void {
     closed = true;
+    closeController.abort();
     for (const entry of approvals.values()) {
       clearTimeout(entry.timer);
       entry.resolve({ allowed: new Array<boolean>(entry.calls.length).fill(false), timedOut: true });

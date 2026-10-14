@@ -1277,6 +1277,14 @@ function approvalHint(optionCount) {
   return "未信任调用（无法生成白名单条目）：请确认后授权";
 }
 
+// 审批参数展示（零手抄：不读特定参数键）：唯一字符串值直显（命令/路径等主参数），否则回退 JSON。
+function approvalArgsText(args) {
+  const values = args !== null && typeof args === "object" ? Object.values(args) : [];
+  if (values.length === 1 && typeof values[0] === "string") return values[0];
+  if (args === undefined) return "";
+  return JSON.stringify(args);
+}
+
 // 审批弹窗：遮罩 + 居中卡片；逐条 [允许][拒绝] + 白名单按钮（按载荷选项渲染）+ 全部允许/全部拒绝；
 // 白名单按钮是显式动作：选项条目原样回显并入本次提交的 whitelist 数组并自动勾选该条允许（弹窗保持打开，可继续处理其余行）；
 // 顶部倒计时按面板审批超时配置，到点自动全部拒绝（白名单条目一并撤销，保证载荷与 allowed 一致；全部允许不自动填白名单）。
@@ -1292,7 +1300,7 @@ function showApprovalDialog(item) {
       .map(
         (call, i) => `
       <div class="ha-approval-row" data-i="${i}">
-        <div class="ha-approval-cmd">${escapeHtml(call.arguments?.command ?? JSON.stringify(call.arguments))}</div>
+        <div class="ha-approval-cmd">${escapeHtml(approvalArgsText(call.arguments))}</div>
         <div class="ha-approval-hint">${escapeHtml(
           approvalHint(Array.isArray(optionsByCall[i]) ? optionsByCall[i].length : 0),
         )}</div>

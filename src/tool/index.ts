@@ -17,7 +17,9 @@ import { protocol } from "./protocol.js";
 export { descriptions, isToolName, meta, names, schemas };
 export type { Scope, ToolMeta, ToolName, TrustEntry };
 
-/** 唯一覆盖判定（spec §2）：工具方向（同名；或同 target 且「条目 access=write 或 调用 access=read」）+ 键方向（self 相等；subtree 前缀 + 自覆盖）。 */
+/** 唯一覆盖判定（spec §2）：工具方向（同名；或同 target 且「条目 access=write 或 调用 access=read」）+ 键方向（self 相等；subtree 前缀 + 自覆盖）。
+ *  不变量：subtree 条目 key 恒以 "/" 结尾（dirEntryKey 保证）——startsWith 前缀匹配不跨名吞并（`src/` 不吞 `src2/`）；
+ *  `slice(0, -1)` 分支为目录自覆盖（条目 `w/` 命中调用 `w`，如 dir_list 读目录自身）。 */
 export function covers(entry: TrustEntry, call: { name: string; key: string }): boolean {
   const entryMeta: ToolMeta | undefined = (meta as Record<string, ToolMeta | undefined>)[entry.tool];
   const callMeta: ToolMeta | undefined = (meta as Record<string, ToolMeta | undefined>)[call.name];

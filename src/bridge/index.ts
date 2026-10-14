@@ -37,6 +37,9 @@ const ROUTES: Record<string, readonly string[]> = {
   "/agent/info": ["GET"],
 };
 
+/** 请求体 1MB 上限：超出即 400，防止畸形巨型载荷占用内存。 */
+const BODY_LIMIT_BYTES = 1_048_576;
+
 export function createBridge(options: BridgeOptions): BridgeService {
   const logger = options.logger ?? ((text: string) => console.error(text));
   const permission = createPermission({
@@ -57,18 +60,24 @@ export function createBridge(options: BridgeOptions): BridgeService {
     logger,
   });
   const server = createServer((req, res) => { void handle(req, res, pipeline, options.workspace); });
+  // 监听结果在创建时收口：监听失败（如 EADDRINUSE）若无人监听 error 事件会炸进程，此处一律捕获，
+  // 经日志与 getPort 拒绝双路呈现；listenState 随创建即可被后续 getPort 取用（监听先于请求属常态）。
+  const listenState = new Promise<number>((resolve, reject) => {
+    server.once("listening", () => resolve(portOf(server)));
+    server.once("error", (error: Error) => {
+      logger(`桥服务监听失败：${error.message}`);
+      reject(error);
+    });
+  });
+  listenState.catch(() => {}); // 未调用 getPort 时也消化拒绝，避免未处理 rejection
   server.listen(options.port ?? 8765, "127.0.0.1");
   return {
-    getPort: () => new Promise<number>((resolve, reject) => {
-      if (server.listening) { resolve(portOf(server)); return; }
-      server.once("listening", () => resolve(portOf(server)));
-      server.once("error", reject);
-    }),
+    getPort: () => (server.listening ? Promise.resolve(portOf(server)) : listenState),
     close: () => {
       pipeline.close();
       // 延迟关服（旧桥行为）：挂起的长轮询须先把管道 close 释放的 204 写回，立即 closeAllConnections 会把在途响应 RST。
       setTimeout(() => {
-        server.close();
+        try { server.close(); } catch { /* 从未成功监听：无可关闭 */ }
         server.closeAllConnections();
       }, 50);
     },
@@ -98,7 +107,12 @@ async function handle(
   let body: unknown = undefined;
   if (method === "POST") {
     try { body = await readJsonBody(req); }
-    catch { send(400, errorEnvelope("invalid-body", "请求体不是合法 JSON")); return; }
+    catch (error) {
+      const message = error instanceof Error && error.message === "body-too-large"
+        ? `请求体超过 1MB 上限（${BODY_LIMIT_BYTES} 字节）`
+        : "请求体不是合法 JSON";
+      send(400, errorEnvelope("invalid-body", message)); return;
+    }
   }
   try {
     if (pathname === "/task") {
@@ -147,14 +161,27 @@ async function handle(
 function readJsonBody(req: IncomingMessage): Promise<unknown> {
   return new Promise((resolve, reject) => {
     const chunks: Buffer[] = [];
-    req.on("data", (chunk: Buffer) => chunks.push(chunk));
+    let size = 0;
+    let failed = false;
+    req.on("data", (chunk: Buffer) => {
+      if (failed) return;
+      size += chunk.length;
+      if (size > BODY_LIMIT_BYTES) {
+        failed = true;
+        reject(new Error("body-too-large"));
+        req.resume(); // 泄掉剩余请求体，保证 400 响应可及时写回
+        return;
+      }
+      chunks.push(chunk);
+    });
     req.on("end", () => {
+      if (failed) return;
       try {
         resolve(JSON.parse(Buffer.concat(chunks).toString("utf8")) as unknown);
       } catch {
         reject(new Error("invalid JSON"));
       }
     });
-    req.on("error", reject);
+    req.on("error", (error) => { if (!failed) reject(error); });
   });
 }

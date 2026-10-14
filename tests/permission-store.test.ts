@@ -1,4 +1,4 @@
-import { mkdtempSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, it } from "vitest";
@@ -59,5 +59,13 @@ describe("permission/store", () => {
     const raw = JSON.parse(readFileSync(file, "utf8")) as Record<string, unknown>;
     expect(raw["version"]).toBe(1);
     expect(raw["workspaces"]).toBeDefined();
+  });
+
+  it("原子落盘 pin：覆盖旧文件成功、无 .tmp 残留", () => {
+    const file = join(dir(), "w.json");
+    saveContainer(file, { version: 1, workspaces: { "/ws": [{ id: "a" }] } });
+    expect(saveContainer(file, { version: 1, workspaces: { "/ws": [{ id: "b" }] } })).toBe(true);
+    expect(loadContainer(file, parseItem)).toEqual({ version: 1, workspaces: { "/ws": [{ id: "b" }] } });
+    expect(existsSync(`${file}.tmp`)).toBe(false);
   });
 });
