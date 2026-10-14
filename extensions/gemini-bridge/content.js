@@ -122,12 +122,17 @@ panel.innerHTML = `
 <style>
 #ha-panel {
   position: fixed; right: 16px; bottom: 16px; z-index: 2147483647;
-  width: 280px; padding: 10px 12px; border-radius: 10px;
+  width: 364px; max-width: calc(100vw - 32px); /* 固定宽度：容纳候选操作行（全选/粒度/入库/清除）的最小值 */
+  height: 784px; max-height: min(784px, calc(100vh - 32px)); /* 固定高度：候选区展开 + 重试按钮出现的完整态也不挤（含数像素余量） */
+  padding: 10px 12px; border-radius: 10px;
   background: #1f1f1f; color: #e8e8e8; font: 12px/1.6 system-ui, sans-serif;
   border: 1px solid #4b5563; user-select: none;
-  max-height: 70vh; display: flex; flex-direction: column;
+  display: flex; flex-direction: column;
+  overflow-y: auto; /* 固定尺寸 + 小窗口兜底滚动；常态下尺寸不随内容变化 */
+  box-sizing: border-box; /* 尺寸含内边距/边框（页面若有全局 border-box 规则也不受其影响） */
   color-scheme: dark; /* 原生控件（数字 spinner、select 下拉、滚动条）走暗色绘制 */
 }
+#ha-panel > * { flex: none; } /* 高度流式：子项按内容定高、不随面板压缩（日志区单独控高） */
 #ha-panel .ha-title {
   font-weight: 700; display: flex; align-items: center; justify-content: space-between;
   cursor: grab; background: #191919; border-bottom: 1px solid #333;
@@ -160,9 +165,9 @@ panel.innerHTML = `
   font-size: 10px; font-weight: 400; color: #9ca3af;
   border: 1px solid #4b5563; border-radius: 4px; padding: 0 4px; margin-left: 4px;
 }
-#ha-panel .ha-row { display: flex; align-items: center; gap: 6px; margin: 4px 0; }
+#ha-panel .ha-row { display: flex; align-items: center; gap: 6px; margin: 3px 0; }
 #ha-panel .ha-group-card {
-  margin: 6px 0 8px; padding: 4px 8px 6px;
+  margin: 4px 0 6px; padding: 4px 8px 4px;
   background: #181818; border: 1px solid #333; border-radius: 6px;
 }
 #ha-panel .ha-group-card .ha-group-title {
@@ -174,8 +179,15 @@ panel.innerHTML = `
   border-radius: 4px; padding: 2px 6px; width: 56px; font: inherit;
 }
 #ha-panel input[type="text"] { width: 150px; flex: 1; }
-#ha-panel select { width: 64px; }
+#ha-panel select { width: auto; } /* 宽度随最长选项（中文档位文本不再截断） */
+#ha-panel #ha-untrusted-tier { flex: 1; }
 #ha-panel input[type="checkbox"] { accent-color: #3b82f6; }
+/* 按钮基底（与既有 .ha-log-bar/#ha-collapse 同款中性样式；各 id 规则按特异性覆盖） */
+#ha-panel button {
+  background: #111; color: #9ca3af; border: 1px solid #4b5563;
+  border-radius: 4px; font: inherit; padding: 2px 8px; cursor: pointer;
+}
+#ha-panel button:hover { color: #e8e8e8; border-color: #6b7280; }
 #ha-panel .ha-status {
   margin-top: 6px; padding: 4px 8px; border-radius: 6px;
   background: #111827; border: 1px solid #374151;
@@ -225,10 +237,12 @@ panel.innerHTML = `
   border-radius: 4px; font: inherit; padding: 0 8px; cursor: pointer;
 }
 #ha-panel .ha-log-bar button:hover { color: #e8e8e8; border-color: #6b7280; }
-#ha-panel .ha-log {
-  margin-top: 4px; max-height: 160px; overflow-y: auto;
+#ha-panel > .ha-log {
+  flex: 1 1 auto; min-height: 72px; /* 弹性填充剩余空间；候选区展开/重试出现时让位（面板整体不动） */
+  margin-top: 4px; overflow-y: auto;
   border-top: 1px solid #333; padding-top: 6px; color: #b0b0b0;
   white-space: pre-wrap; word-break: break-all;
+  contain: inline-size; /* 长行不撑宽面板 */
 }
 #ha-log::-webkit-scrollbar { width: 8px; }
 #ha-log::-webkit-scrollbar-track { background: #111827; }
@@ -262,46 +276,61 @@ panel.innerHTML = `
 .ha-approval-row.ha-approval-wl { border-color: #166534; }
 .ha-approval-row.ha-approval-wl .ha-approval-hint { color: #86efac; }
 .ha-approval-foot { display: flex; gap: 8px; margin-top: 8px; justify-content: flex-end; }
-.ha-tier-warning { color: #fbbf24; font-size: 12px; }
-.ha-value { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; direction: rtl; text-align: left; }
+.ha-tier-label, .ha-tier-warning { flex: none; white-space: nowrap; } /* 中文可逐字折断：禁止收缩换行，让弹性给 select */
+.ha-tier-warning { color: #fbbf24; font-size: 12px; width: 14px; text-align: center; cursor: default; }
+.ha-tier-warning.ha-tier-off { visibility: hidden; } /* 非默认允许档：占位不显示——三档下拉宽度恒定 */
+.ha-value { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; direction: rtl; text-align: left; contain: inline-size; }
 #ha-workspace { direction: rtl; }
 .ha-cand { border: 1px solid #374151; border-radius: 6px; margin-top: 6px; }
 .ha-cand-head { display: flex; width: 100%; align-items: center; gap: 6px; background: none; border: none; color: #e8e8e8; font: inherit; padding: 5px 8px; cursor: pointer; }
 .ha-cand-count { color: #9ca3af; }
 .ha-cand-arrow { margin-left: auto; }
 .ha-cand-ops { display: flex; align-items: center; gap: 6px; padding: 4px 8px; flex-wrap: wrap; }
-.ha-cand-list { max-height: 140px; overflow-y: auto; padding: 0 8px 6px; }
+.ha-cand-list { max-height: 80px; overflow-y: auto; padding: 0 8px 6px; contain: inline-size; }
 .ha-cand-row { display: flex; align-items: center; gap: 6px; white-space: nowrap; overflow: hidden; font-size: 12px; }
 .ha-cand-tool { color: #93c5fd; flex: none; }
 .ha-cand-key { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; }
 .ha-cand-counts { color: #9ca3af; flex: none; }
+/* 候选操作按钮：入库=蓝（主操作）、清除=红（破坏性），与既有按钮色调词汇一致 */
+#ha-panel #ha-cand-add { color: #93c5fd; border-color: #1d4ed8; }
+#ha-panel #ha-cand-add:hover { border-color: #2563eb; color: #bfdbfe; }
+#ha-panel #ha-cand-dismiss { color: #fca5a5; border-color: #7f1d1d; }
+#ha-panel #ha-cand-dismiss:hover { border-color: #b91c1c; color: #fecaca; }
+/* 统一悬浮气泡：data-ha-tip 承载文本，深色主题与面板一致（替代原生白底 title） */
+.ha-tip {
+  position: fixed; z-index: 2147483647; max-width: 280px;
+  background: #111; color: #e8e8e8; border: 1px solid #4b5563;
+  border-radius: 6px; padding: 4px 8px; font: 12px/1.6 system-ui, sans-serif;
+  box-shadow: 0 4px 12px rgba(0,0,0,.55); pointer-events: none;
+  white-space: normal; word-break: break-word; color-scheme: dark;
+}
 </style>
 <div class="ha-title">
   <span>gemini-bridge<span class="ha-badge">v0.4 网页对话驱动</span></span>
-  <button id="ha-collapse" title="收起为悬浮球">–</button>
+  <button id="ha-collapse" data-ha-tip="收起为悬浮球">–</button>
 </div>
 <div class="ha-group-card">
   <div class="ha-group-title">自动模式</div>
   <div class="ha-row">
     <label><input type="checkbox" id="ha-auto-mode"> 自动提交回填消息</label>
-    <button id="ha-submit-now" title="立即提交输入框当前内容（非空即提交，无论内容来源；回填进行中暂不可用）">立即提交</button>
+    <button id="ha-submit-now" data-ha-tip="立即提交输入框当前内容（非空即提交，无论内容来源；回填进行中暂不可用）">立即提交</button>
   </div>
-  <label class="ha-row">
-    <input type="checkbox" id="ha-auto-inject"> 新对话自动注入协议
-  </label>
   <div class="ha-row">
-    <span>未信任处置</span>
-    <select id="ha-untrusted-tier" title="未信任（黑名单/白名单外）调用的去向；黑名单三档一致直接拒绝">
+    <label><input type="checkbox" id="ha-auto-inject"> 新对话自动注入协议</label>
+  </div>
+  <div class="ha-row">
+    <span class="ha-tier-label">未信任处置</span>
+    <select id="ha-untrusted-tier" data-ha-tip="未信任（黑名单/白名单外）调用的去向；黑名单三档一致直接拒绝">
       <option value="popup">默认弹窗（逐条授权）</option>
       <option value="deny">默认拒绝（无人值守推荐）</option>
       <option value="allow">默认允许（仅黑名单拦截）</option>
     </select>
-    <span id="ha-tier-warning" class="ha-tier-warning" hidden>⚠ 仅黑名单兜底</span>
+    <span id="ha-tier-warning" class="ha-tier-warning ha-tier-off" data-ha-tip="默认允许档仅靠黑名单兜底：未信任调用除黑名单命中外一律放行">⚠</span>
   </div>
 </div>
-<label class="ha-row">
-  <input type="checkbox" id="ha-simulate"> 模拟人类逐字输入
-</label>
+<div class="ha-row">
+  <label><input type="checkbox" id="ha-simulate"> 模拟人类逐字输入</label>
+</div>
 <div class="ha-row">
   <span>审批超时</span>
   <input type="number" id="ha-approval-timeout" min="10" max="600" step="10">
@@ -328,7 +357,7 @@ panel.innerHTML = `
 </div>
 <div class="ha-row">
   <span>回填速度</span>
-  <select id="ha-speed" title="回填过程中修改立即生效（分块长度已切分，本次不变）">
+  <select id="ha-speed" data-ha-tip="回填过程中修改立即生效（分块长度已切分，本次不变）">
     <option value="0.5">0.5x</option>
     <option value="1">1x</option>
     <option value="2">2x</option>
@@ -342,18 +371,18 @@ panel.innerHTML = `
 </div>
 <div class="ha-row">
   <span>工作区</span>
-  <span id="ha-workspace" class="ha-value" title="">（未获取）</span>
+  <span id="ha-workspace" class="ha-value" data-ha-tip="">（未获取）</span>
 </div>
-<button id="ha-inject-protocol" title="手动把工具协议（规则）文本填入输入框（自动提交开=填好后自动提交）">填入规则文本</button>
+<button id="ha-inject-protocol" data-ha-tip="手动把工具协议（规则）文本填入输入框（自动提交开=填好后自动提交）">填入规则文本</button>
 <div class="ha-cand">
-  <button id="ha-cand-toggle" class="ha-cand-head" title="白名单外裁决的持久记录：默认拒绝档=补种清单，默认允许档=放行审计">
+  <button id="ha-cand-toggle" class="ha-cand-head" data-ha-tip="白名单外裁决的持久记录：默认拒绝档=补种清单，默认允许档=放行审计">
     信任候选 <span id="ha-cand-count" class="ha-cand-count">(0)</span><span class="ha-cand-arrow">▸</span>
   </button>
   <div class="ha-cand-body" id="ha-cand-body" hidden>
     <div class="ha-cand-ops">
       <button id="ha-cand-all">全选</button>
       <span>粒度</span>
-      <select id="ha-cand-gran" title="入库粒度：此路径=仅目标自身（self）/ 此目录=目标所在子树（subtree）；桥服务按工具类型校验并物化条目">
+      <select id="ha-cand-gran" data-ha-tip="入库粒度：此路径=仅目标自身（self）/ 此目录=目标所在子树（subtree）；桥服务按工具类型校验并物化条目">
         <option value="self">此路径</option>
         <option value="subtree">此目录</option>
       </select>
@@ -363,11 +392,11 @@ panel.innerHTML = `
     <div class="ha-cand-list" id="ha-cand-list"></div>
   </div>
 </div>
-<div class="ha-status" id="ha-status"><span id="ha-status-text">待命</span><span class="ha-status-dot" title="状态指示灯"></span></div>
+<div class="ha-status" id="ha-status"><span id="ha-status-text">待命</span><span class="ha-status-dot" data-ha-tip="状态指示灯"></span></div>
 <button id="ha-retry" hidden>手动重试</button>
 <div class="ha-log-bar">
-  <button id="ha-log-export" title="导出日志为文本文件">导出</button>
-  <button id="ha-log-clear" title="清除日志">清除</button>
+  <button id="ha-log-export" data-ha-tip="导出日志为文本文件">导出</button>
+  <button id="ha-log-clear" data-ha-tip="清除日志">清除</button>
 </div>
 <div class="ha-log" id="ha-log"></div>
 `;
@@ -376,9 +405,39 @@ document.documentElement.appendChild(panel);
 // 悬浮球：面板收起后的最小形态（状态圆点），双击展开完整面板
 const ball = document.createElement("div");
 ball.id = "ha-ball";
-ball.title = "双击展开面板";
+ball.setAttribute("data-ha-tip", "双击展开面板");
 ball.innerHTML = `<span class="ha-dot" id="ha-ball-dot"></span>`;
 document.documentElement.appendChild(ball);
+
+// 统一悬浮气泡：委托监听 [data-ha-tip]，面板上方展示、越界翻转、视口夹取（替代原生白底 title）
+const tip = document.createElement("div");
+tip.className = "ha-tip";
+tip.hidden = true;
+document.documentElement.appendChild(tip);
+document.addEventListener("mouseover", (e) => {
+  const t = e.target;
+  const el = t && typeof t.closest === "function" ? t.closest("[data-ha-tip]") : null;
+  const text = el && el.getAttribute("data-ha-tip");
+  if (!text) { tip.hidden = true; return; }
+  tip.textContent = text;
+  tip.hidden = false;
+  const r = el.getBoundingClientRect();
+  const b = tip.getBoundingClientRect();
+  let left = r.left + r.width / 2 - b.width / 2;
+  left = Math.max(8, Math.min(left, innerWidth - b.width - 8));
+  const above = r.top - b.height - 6;
+  tip.style.left = `${left}px`;
+  tip.style.top = `${above >= 8 ? above : r.bottom + 6}px`;
+});
+document.addEventListener("mouseout", (e) => {
+  const t = e.target;
+  const el = t && typeof t.closest === "function" ? t.closest("[data-ha-tip]") : null;
+  if (!el) return;
+  if (e.relatedTarget && el.contains(e.relatedTarget)) return; // 在自身子节点间移动不隐藏
+  tip.hidden = true;
+});
+document.addEventListener("mousedown", () => { tip.hidden = true; });
+window.addEventListener("scroll", () => { tip.hidden = true; }, true);
 
 const statusEl = panel.querySelector("#ha-status");
 const statusTextEl = panel.querySelector("#ha-status-text");
@@ -590,7 +649,7 @@ async function refreshWorkspace() {
     bridgeWorkspace = workspace;
     const el = panel.querySelector("#ha-workspace");
     el.textContent = bridgeWorkspace;
-    el.title = bridgeWorkspace;
+    el.setAttribute("data-ha-tip", bridgeWorkspace);
   }
 }
 
@@ -635,7 +694,7 @@ function applySettingsToPanel() {
   panel.querySelector("#ha-speed").value = settings.speed;
   panel.querySelector("#ha-base-url").value = settings.baseUrl;
   panel.querySelector("#ha-untrusted-tier").value = settings.untrustedTier;
-  panel.querySelector("#ha-tier-warning").hidden = settings.untrustedTier !== "allow";
+  panel.querySelector("#ha-tier-warning").classList.toggle("ha-tier-off", settings.untrustedTier !== "allow");
   panel.querySelector("#ha-approval-timeout").value = settings.approvalTimeoutSec;
 }
 
@@ -1032,7 +1091,7 @@ function renderCandidates(list) {
   for (const c of list) {
     const row = document.createElement("label");
     row.className = "ha-cand-row";
-    row.title = `${c.tool} ${c.key}`;
+    row.setAttribute("data-ha-tip", `${c.tool} ${c.key}`);
     const input = document.createElement("input");
     input.type = "checkbox";
     input.dataset.tool = c.tool;
