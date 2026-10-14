@@ -241,6 +241,17 @@ async function postJson(port: number, path: string, body: unknown): Promise<Resp
   return { status: res.status, envelope: (await res.json()) as EnvelopeBody };
 }
 
+/** 轮询至连接拒绝（拆除完成）；期间有响应则继续等（close 含 50ms 延迟关服窗口）。capMs 内未拒绝返回 false。 */
+async function waitRefused(port: number, path: string, capMs: number): Promise<boolean> {
+  const deadline = Date.now() + capMs;
+  for (;;) {
+    const res = await fetch(`http://127.0.0.1:${port}${path}`).catch(() => null);
+    if (res === null) return true;
+    if (Date.now() >= deadline) return false;
+    await new Promise((resolve) => setTimeout(resolve, 20));
+  }
+}
+
 // ---------- 工具调用文本构造 ----------
 function callLines(tool: string, args: Record<string, unknown>, id: string): string[] {
   const lines = [`<::: TOOL_CALL[${id}]`, `tool: ${tool}`];
@@ -407,6 +418,15 @@ describe("createBridge 端点与统一信封", () => {
     expect(errorCode(res.envelope)).toBe("invalid-body");
   });
 
+  it("POST /task/reply 非法体（reply 缺失/非串/空串/超长）→ 400 invalid-body", async () => {
+    const { port } = await makeBridge();
+    for (const body of [{}, { reply: 123 }, { reply: "" }, { reply: "a".repeat(200_001) }]) {
+      const res = await postJson(port, "/task/reply", body);
+      expect(res.status).toBe(400);
+      expect(errorCode(res.envelope)).toBe("invalid-body");
+    }
+  });
+
   it("POST /task/approval 畸形 JSON → 400 invalid-body", async () => {
     const { port } = await makeBridge();
     const res = await postJson(port, "/task/approval", "{不是 JSON");
@@ -448,7 +468,8 @@ describe("createBridge 端点与统一信封", () => {
   it("空长轮询：裸 204（无信封；close 释放路径）", async () => {
     const { bridge, port } = await makeBridge();
     const poll = fetch(`http://127.0.0.1:${port}/task`);
-    await new Promise((resolve) => setTimeout(resolve, 100)); // 确保请求已达服务端并注册 waiter
+    // 余量加宽抗 CI 负载：请求落于 close 前（释放路径）或延迟关服窗口内（closed→null 路径）皆回裸 204
+    await new Promise((resolve) => setTimeout(resolve, 200));
     bridge.close();
     const res = await poll;
     expect(res.status).toBe(204);
@@ -462,16 +483,13 @@ describe("createBridge 端点与统一信封", () => {
     await expect(poll).resolves.toBeNull();
   });
 
-  it("close 后端点不可达（连接拒绝）或 204", async () => {
+  it("close 后端点最终不可达（轮询等待，50ms 延迟关服窗口不构成 flake）", async () => {
     const { bridge, port } = await makeBridge();
     const before = await getEnvelope(port, "/agent/info");
     expect(before.status).toBe(200);
     bridge.close();
-    await new Promise((resolve) => setTimeout(resolve, 80));
-    const info = await fetch(`http://127.0.0.1:${port}/agent/info`).catch(() => null);
-    if (info !== null) expect(info.status).toBe(204);
-    const candidates = await fetch(`http://127.0.0.1:${port}/permission/candidates`).catch(() => null);
-    if (candidates !== null) expect(candidates.status).toBe(204);
+    expect(await waitRefused(port, "/agent/info", 2000)).toBe(true);
+    expect(await waitRefused(port, "/permission/candidates", 2000)).toBe(true);
   });
 
   it("close 中止在途批执行：级联 AbortSignal 到双手，且不再产生超时回填", async () => {
@@ -1130,6 +1148,20 @@ describe("白名单与候选端点（审批回显 / 批量入库 / 查看 / 撤�
     const res = await postJson(port, "/permission/whitelist", { items: [], scope: "self" });
     expect(res.status).toBe(400);
     expect(errorCode(res.envelope)).toBe("invalid-body");
+  });
+
+  it("POST /permission/whitelist 非路径工具 + subtree → 400（message 指明，全批不落盘）", async () => {
+    const { port, whitelistFile } = await makeBridge();
+    const res = await postJson(port, "/permission/whitelist", {
+      items: [{ tool: "command_run", key: "git status" }],
+      scope: "subtree",
+    });
+    expect(res.status).toBe(400);
+    expect(errorCode(res.envelope)).toBe("invalid-body");
+    if (res.envelope.status === "error") {
+      expect(res.envelope.error.message).toContain("非路径工具不支持子树粒度");
+    }
+    expect(whitelistEntries(whitelistFile).some((e) => e.tool === "command_run")).toBe(false);
   });
 
   it("POST /permission/candidates/dismiss：清除所选（不写白名单）", async () => {

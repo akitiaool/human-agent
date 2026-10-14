@@ -1,4 +1,4 @@
-import { mkdirSync, mkdtempSync, readFileSync, realpathSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, realpathSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, it } from "vitest";
@@ -23,8 +23,10 @@ describe("permission 门面", () => {
     const file = join(tmp, "whitelist.json");
     createPermission({ workspace: wsReal, whitelistFile: file, candidatesFile: join(tmp, "candidates.json") });
     const p2 = createPermission({ workspace: wsReal, whitelistFile: file, candidatesFile: join(tmp, "candidates.json") });
-    expect(p2.whitelist.list()).toHaveLength(1);
-    expect(p2.whitelist.list()[0]).toMatchObject({ tool: "file_write", scope: "subtree" });
+    // 注册条目键 = normalizeMatchKey(工作区) + "/"（工作区原大小写在此归一为匹配键形态）
+    expect(p2.whitelist.list()).toEqual([
+      { tool: "file_write", key: `${normalizeMatchKey(wsReal)}/`, scope: "subtree" },
+    ]);
     const raw = JSON.parse(readFileSync(file, "utf8")) as { version: number };
     expect(raw.version).toBe(1);
   });
@@ -48,6 +50,11 @@ describe("permission 门面", () => {
     const nonexist = permission.workspace.resolve(join(a, "nope"), undefined, process.cwd());
     expect(nonexist.status).toBe("error");
     if (nonexist.status === "error") expect(nonexist.error.code).toBe("workspace-invalid");
+    const notDir = join(a, "file.txt"); // 存在但不是目录 → realpath 通过、statSync 分支拒绝
+    writeFileSync(notDir, "x", "utf8");
+    const asFile = permission.workspace.resolve(notDir, undefined, process.cwd());
+    expect(asFile.status).toBe("error");
+    if (asFile.status === "error") expect(asFile.error.code).toBe("workspace-invalid");
   });
 
   it("空串按缺省处理（空 cli/空环境变量不生效）", () => {

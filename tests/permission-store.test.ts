@@ -46,6 +46,15 @@ describe("permission/store", () => {
     expect(loadContainer(file, parseItem)).toEqual({ version: 1, workspaces: { "/ws": [{ id: "a" }] } });
   });
 
+  it("workspaces 为 null / 数组 → 整档空", () => {
+    const nullWs = join(dir(), "null-ws.json");
+    writeFileSync(nullWs, JSON.stringify({ version: 1, workspaces: null }), "utf8");
+    expect(loadContainer(nullWs, parseItem)).toEqual(emptyContainer<Item>());
+    const arrWs = join(dir(), "arr-ws.json");
+    writeFileSync(arrWs, JSON.stringify({ version: 1, workspaces: [] }), "utf8");
+    expect(loadContainer(arrWs, parseItem)).toEqual(emptyContainer<Item>());
+  });
+
   it("save 失败返回 false 不抛错（目标路径被文件占位）", () => {
     const d = dir();
     const blocker = join(d, "blocker");

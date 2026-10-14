@@ -40,6 +40,8 @@ describe("tool 域", () => {
     const readSub: TrustEntry = { tool: "file_read", key: "/ws/src/", scope: "subtree" };
     expect(covers(readSub, { name: "file_write", key: "/ws/src/x.ts" })).toBe(false); // 读不覆盖写
     expect(covers(readSub, { name: "file_read", key: "/ws/src/x.ts" })).toBe(true);
+    expect(covers(readSub, { name: "dir_list", key: "/ws/src/lib" })).toBe(true);    // 读→读跨工具（同 target 读调用）
+    expect(covers(readSub, { name: "page_fetch", key: "/ws/src/x" })).toBe(false);   // 读→读跨 target 不覆盖（target 必须同）
     const cmd: TrustEntry = { tool: "command_run", key: "git status", scope: "self" };
     expect(covers(cmd, { name: "command_run", key: "git status" })).toBe(true);
     expect(covers(cmd, { name: "command_run", key: "git push" })).toBe(false);

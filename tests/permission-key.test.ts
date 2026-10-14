@@ -77,10 +77,15 @@ describe("路径管道（移植 resolveWorkspacePath 用例 → of/execPath）",
 });
 
 describe("条目归一（移植 normalizePath/normalizeCommand 用例 → key.normalize）", () => {
-  it("路径：反斜杠转正斜杠 + 空白折叠 + win32 小写 + 段级解析", () => {
+  it("路径：反斜杠转正斜杠 + 段级解析（跨平台）", () => {
+    const key = createKey({ workspace: wsReal });
+    expect(key.normalize({ tool: "file_write", key: "src\\nested\\utils.ts" })).toBe("src/nested/utils.ts");
+    expect(key.normalize({ tool: "file_write", key: "src//utils.ts" })).toBe("src/utils.ts");
+  });
+
+  it.runIf(process.platform === "win32")("路径：win32 小写", () => {
     const key = createKey({ workspace: wsReal });
     expect(key.normalize({ tool: "file_write", key: "C:\\Windows\\System32" })).toBe("c:/windows/system32");
-    expect(key.normalize({ tool: "file_write", key: "src//utils.ts" })).toBe("src/utils.ts");
   });
 
   it("命令：空白折叠 + 反斜杠转正斜杠", () => {
@@ -210,9 +215,11 @@ describe("permission/key 新增语义", () => {
     expect(key.normalize({ tool: "page_fetch", key: " https://api.example.com//x " })).toBe("https://api.example.com//x");
   });
 
-  it("normalize：目录条目尾 / 保留；command_run 走命令归一", () => {
+  it("normalize：目录条目尾 / 保留（含根形态原样）；command_run 走命令归一", () => {
     const key = createKey({ workspace: wsReal });
     expect(key.normalize({ tool: "file_write", key: "src\\" })).toMatch(/\/$/);
+    expect(key.normalize({ tool: "file_write", key: "c:/" })).toBe("c:/"); // 盘符根段级解析后尾 / 保回
+    expect(key.normalize({ tool: "file_write", key: "/" })).toBe("/");     // 根形态原样
     expect(key.normalize({ tool: "command_run", key: "git   status " })).toBe("git status");
   });
 

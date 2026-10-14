@@ -73,8 +73,10 @@ describe("permission/whitelist grant", () => {
     wl.grant({ tool: "file_write", key: join(wsReal, "src/a.ts"), scope: "self" });
     wl.grant({ tool: "file_read", key: join(wsReal, "src/b.ts"), scope: "self" });
     wl.grant({ tool: "file_read", key: `${join(wsReal, "src")}/`, scope: "subtree" }); // 读父：只吃读子
-    expect(wl.list().map((e) => `${e.tool}:${e.scope}`)).toContain("file_write:self"); // 写子存活
-    expect(wl.list().find((e) => e.tool === "file_read" && e.scope === "self")).toBeUndefined(); // 读子被吃
+    expect(wl.list()).toEqual([
+      { tool: "file_write", key: nk(join(wsReal, "src/a.ts")), scope: "self" },    // 写子存活
+      { tool: "file_read", key: nk(`${join(wsReal, "src")}/`), scope: "subtree" }, // 读父入库，读子被吃
+    ]);
   });
 
   it("落盘失败 → logger 报告且内存条目仍生效（added）", () => {
