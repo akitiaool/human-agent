@@ -15,7 +15,7 @@ export function createReflection(options: { permission: Permission }): {
       const blocked: BlockedCall[] = [];
       for (const call of calls) {
         const verdict = permission.verdict.decide(call);
-        if (verdict.status === "blacklist") {
+        if (verdict.status === "blacklisted") {
           blocked.push({ call, result: fail("blacklist", `黑名单命中：${verdict.key ?? call.name}`) });
           continue;
         }
@@ -31,7 +31,7 @@ export function createReflection(options: { permission: Permission }): {
           });
           continue;
         }
-        if (verdict.status === "allowed") {
+        if (verdict.status === "whitelisted") {
           allowed.push(call);
           continue;
         }

@@ -132,7 +132,7 @@ permission.workspace.resolve(cliValue?: string, envValue?: string, cwd: string, 
 - **`key.entryFor(tool, key, scope)`**：`self` → `{tool, key, scope:"self"}`；`subtree` → 子树根 = 读目录类（dir_list / code_search）目标自身 + `/`、其余父目录 + `/`；根级/盘符根降级为 `self`；非路径类 + `subtree` → `null`；空键 → `null`。**读目录类「此目录」= 目标自身 + `/` 的语义就此成文**（清 2026-10-11 spec 遗留注记）。
 - **`key.optionsFor(call)`**：键缺失 → `[]`；路径类 → `[self, subtree?]`（subtree 可用且不与 self 重合时第二项）；command/url → `[self]`。顺序即展示顺序。
 - **`key.execPath`**：与 `of` 同一管道；它专门服务执行落点（执行落点 = 判定落点的既有不变量由此保持）。
-- **`verdict.decide`**：黑名单 → 白名单 → 未列；写形态黑名单对调用的命中条件为 `meta.target==="path" && meta.access==="write"`（等价原 WRITE_TOOLS 行为）。返回 `{ status: "allowed" | "blacklist" | "unlisted", key? }`（`PermissionVerdict`）。
+- **`verdict.decide`**：黑名单 → 白名单 → 未列；写形态黑名单对调用的命中条件为 `meta.target==="path" && meta.access==="write"`（等价原 WRITE_TOOLS 行为）。返回 `{ status: "blacklisted" | "whitelisted" | "unlisted", key? }`（`PermissionVerdict`；2026-10-14 更名：恢复名单根、三值同为过去分词）。
 - **行为不变量**（保持不变）：裁决顺序（黑名单 → 未知工具 → 非法参数 → 白名单放行 → pending，顺序与判定归 reflection 层）；写信任蕴含读；目录条目 `w/` 覆盖 `w`；白名单冗余清理方向语义（加父去子、子被父盖跳过）；候选容量帽 200 条 / 30 天；候选不入档三情形（黑名单命中、白名单命中、close 释放）；落盘失败不崩溃。
 
 ### 3.3 grant 面（⑯ 结构修复）
@@ -257,7 +257,7 @@ GET  /agent/info              → 200 data:{workspace}  ← 原 /info
 | 词表 | 值 |
 |---|---|
 | 信封 status | ok / error |
-| 裁决（PermissionVerdict） | allowed / blacklist / unlisted |
+| 裁决（PermissionVerdict） | blacklisted / whitelisted / unlisted |
 | 反思（ReflectionVerdict） | allowed / pending / blocked |
 | 拦截原因（blocked.reason） | blacklist / unknown-tool / invalid-args |
 | 入库（AddResult） | added / duplicate / covered / rejected |

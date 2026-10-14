@@ -5,7 +5,7 @@ import { commandPatterns, writePathPatterns } from "./blacklist.js";
 import type { KeyService } from "./key.js";
 
 export interface PermissionVerdict {
-  status: "allowed" | "blacklist" | "unlisted";
+  status: "blacklisted" | "whitelisted" | "unlisted";
   key?: string;
 }
 
@@ -18,17 +18,17 @@ export function createVerdict(options: {
     decide(call) {
       const matchKey = key.of(call);
       if (matchKey === undefined) return { status: "unlisted" };
-      if (commandPatterns.some((pattern) => pattern.test(matchKey))) return { status: "blacklist", key: matchKey };
+      if (commandPatterns.some((pattern) => pattern.test(matchKey))) return { status: "blacklisted", key: matchKey };
       if (
         isToolName(call.name) &&
         meta[call.name].target === "path" &&
         meta[call.name].access === "write" &&
         writePathPatterns.some((pattern) => pattern.test(matchKey))
       ) {
-        return { status: "blacklist", key: matchKey };
+        return { status: "blacklisted", key: matchKey };
       }
       for (const entry of entries()) {
-        if (covers(entry, { name: call.name, key: matchKey })) return { status: "allowed", key: matchKey };
+        if (covers(entry, { name: call.name, key: matchKey })) return { status: "whitelisted", key: matchKey };
       }
       return { status: "unlisted", key: matchKey };
     },
