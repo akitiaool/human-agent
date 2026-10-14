@@ -123,7 +123,7 @@ panel.innerHTML = `
 #ha-panel {
   position: fixed; right: 16px; bottom: 16px; z-index: 2147483647;
   width: 364px; max-width: calc(100vw - 32px); /* 固定宽度：容纳候选操作行（全选/粒度/入库/清除）的最小值 */
-  height: 784px; max-height: min(784px, calc(100vh - 32px)); /* 固定高度：候选区展开 + 重试按钮出现的完整态也不挤（含数像素余量） */
+  height: 794px; max-height: min(794px, calc(100vh - 32px)); /* 固定高度：卡展开 + 重试按钮 + 档位警示的最坏态也不挤（含数像素余量） */
   padding: 10px 12px; border-radius: 10px;
   background: #1f1f1f; color: #e8e8e8; font: 12px/1.6 system-ui, sans-serif;
   border: 1px solid #4b5563; user-select: none;
@@ -281,21 +281,24 @@ panel.innerHTML = `
 .ha-tier-warning.ha-tier-off { visibility: hidden; } /* 非默认允许档：占位不显示——三档下拉宽度恒定 */
 .ha-value { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; direction: rtl; text-align: left; contain: inline-size; }
 #ha-workspace { direction: rtl; }
-.ha-cand { border: 1px solid #374151; border-radius: 6px; margin-top: 6px; }
-.ha-cand-head { display: flex; width: 100%; align-items: center; gap: 6px; background: none; border: none; color: #e8e8e8; font: inherit; padding: 5px 8px; cursor: pointer; }
-.ha-cand-count { color: #9ca3af; }
-.ha-cand-arrow { margin-left: auto; }
-.ha-cand-ops { display: flex; align-items: center; gap: 6px; padding: 4px 8px; flex-wrap: wrap; }
-.ha-cand-list { max-height: 80px; overflow-y: auto; padding: 0 8px 6px; contain: inline-size; }
-.ha-cand-row { display: flex; align-items: center; gap: 6px; white-space: nowrap; overflow: hidden; font-size: 12px; }
+.ha-fold { border: 1px solid #374151; border-radius: 6px; margin-top: 6px; }
+.ha-fold-head { display: flex; width: 100%; align-items: center; gap: 6px; background: none; border: none; color: #e8e8e8; font: inherit; padding: 5px 8px; cursor: pointer; }
+.ha-fold-count { color: #9ca3af; }
+.ha-fold-arrow { margin-left: auto; }
+.ha-fold-ops { display: flex; align-items: center; gap: 6px; padding: 4px 8px; flex-wrap: wrap; }
+.ha-fold-list { max-height: 60px; overflow-y: auto; padding: 0 8px 6px; contain: inline-size; } /* 两卡同帽：最坏态（卡展开+重试+警示）零溢出 */
+.ha-fold-row { display: flex; align-items: center; gap: 6px; white-space: nowrap; overflow: hidden; font-size: 12px; }
 .ha-cand-tool { color: #93c5fd; flex: none; }
 .ha-cand-key { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; }
 .ha-cand-counts { color: #9ca3af; flex: none; }
-/* 候选操作按钮：入库=蓝（主操作）、清除=红（破坏性），与既有按钮色调词汇一致 */
+.ha-wl-scope { color: #9ca3af; flex: none; font-size: 11px; border: 1px solid #374151; border-radius: 3px; padding: 0 4px; }
+/* 折叠卡操作按钮：入库=蓝（主操作）、清除/撤销=红（破坏性），与既有按钮色调词汇一致 */
 #ha-panel #ha-cand-add { color: #93c5fd; border-color: #1d4ed8; }
 #ha-panel #ha-cand-add:hover { border-color: #2563eb; color: #bfdbfe; }
 #ha-panel #ha-cand-dismiss { color: #fca5a5; border-color: #7f1d1d; }
 #ha-panel #ha-cand-dismiss:hover { border-color: #b91c1c; color: #fecaca; }
+#ha-panel #ha-wl-revoke { color: #fca5a5; border-color: #7f1d1d; }
+#ha-panel #ha-wl-revoke:hover { border-color: #b91c1c; color: #fecaca; }
 /* 统一悬浮气泡：data-ha-tip 承载文本，深色主题与面板一致（替代原生白底 title） */
 .ha-tip {
   position: fixed; z-index: 2147483647; max-width: 280px;
@@ -374,12 +377,12 @@ panel.innerHTML = `
   <span id="ha-workspace" class="ha-value" data-ha-tip="">（未获取）</span>
 </div>
 <button id="ha-inject-protocol" data-ha-tip="手动把工具协议（规则）文本填入输入框（自动提交开=填好后自动提交）">填入规则文本</button>
-<div class="ha-cand">
-  <button id="ha-cand-toggle" class="ha-cand-head" data-ha-tip="白名单外裁决的持久记录：默认拒绝档=补种清单，默认允许档=放行审计">
-    信任候选 <span id="ha-cand-count" class="ha-cand-count">(0)</span><span class="ha-cand-arrow">▸</span>
+<div class="ha-fold">
+  <button id="ha-cand-toggle" class="ha-fold-head" data-ha-tip="白名单外裁决的持久记录：默认拒绝档=补种清单，默认允许档=放行审计">
+    信任候选 <span id="ha-cand-count" class="ha-fold-count">(0)</span><span class="ha-fold-arrow">▸</span>
   </button>
-  <div class="ha-cand-body" id="ha-cand-body" hidden>
-    <div class="ha-cand-ops">
+  <div class="ha-fold-body" id="ha-cand-body" hidden>
+    <div class="ha-fold-ops">
       <button id="ha-cand-all">全选</button>
       <span>粒度</span>
       <select id="ha-cand-gran" data-ha-tip="入库粒度：此路径=仅目标自身（self）/ 此目录=目标所在子树（subtree）；桥服务按工具类型校验并物化条目">
@@ -389,7 +392,19 @@ panel.innerHTML = `
       <button id="ha-cand-add">入库所选 (0)</button>
       <button id="ha-cand-dismiss">清除所选</button>
     </div>
-    <div class="ha-cand-list" id="ha-cand-list"></div>
+    <div class="ha-fold-list" id="ha-cand-list"></div>
+  </div>
+</div>
+<div class="ha-fold">
+  <button id="ha-wl-toggle" class="ha-fold-head" data-ha-tip="当前工作区已信任条目；撤销立即生效（工作区条目会在桥服务重启时重建）">
+    白名单 <span id="ha-wl-count" class="ha-fold-count">(0)</span><span class="ha-fold-arrow">▸</span>
+  </button>
+  <div class="ha-fold-body" id="ha-wl-body" hidden>
+    <div class="ha-fold-ops">
+      <button id="ha-wl-all">全选</button>
+      <button id="ha-wl-revoke">撤销所选 (0)</button>
+    </div>
+    <div class="ha-fold-list" id="ha-wl-list"></div>
   </div>
 </div>
 <div class="ha-status" id="ha-status"><span id="ha-status-text">待命</span><span class="ha-status-dot" data-ha-tip="状态指示灯"></span></div>
@@ -814,16 +829,22 @@ function setupPanelEvents() {
     log(`桥服务地址：${settings.baseUrl}`);
   });
   panel.querySelector("#ha-cand-toggle").addEventListener("click", () => {
-    const body = panel.querySelector("#ha-cand-body");
-    body.hidden = !body.hidden;
-    panel.querySelector(".ha-cand-arrow").textContent = body.hidden ? "▸" : "▾";
-    if (!body.hidden) void refreshCandidates(); // 展开时刷新
+    toggleFold(0, refreshCandidates); // 展开时刷新
+  });
+  panel.querySelector("#ha-wl-toggle").addEventListener("click", () => {
+    toggleFold(1, refreshWhitelist); // 展开时刷新
   });
   panel.querySelector("#ha-cand-all").addEventListener("click", () => {
     const boxes = [...panel.querySelectorAll("#ha-cand-list input[type=checkbox]")];
     const target = boxes.some((b) => !b.checked);
     for (const b of boxes) b.checked = target;
     updateAddButton();
+  });
+  panel.querySelector("#ha-wl-all").addEventListener("click", () => {
+    const boxes = [...panel.querySelectorAll("#ha-wl-list input[type=checkbox]")];
+    const target = boxes.some((b) => !b.checked);
+    for (const b of boxes) b.checked = target;
+    updateRevokeButton();
   });
   panel.querySelector("#ha-cand-add").addEventListener("click", async () => {
     const rows = checkedCandidateRows();
@@ -851,6 +872,7 @@ function setupPanelEvents() {
           `已被覆盖 ${counts.covered} / 被拒 ${counts.rejected}`,
       );
       void refreshCandidates();
+      void refreshWhitelist(); // 新增条目同步到白名单卡（计数徽标即时更新）
     } else if (resp?.error?.code === "bridge-unreachable") {
       noteBridgeFailure(resp.error.message);
     } else {
@@ -878,6 +900,44 @@ function setupPanelEvents() {
       log(`信任候选清除失败：${resp?.error?.message ?? "未知错误"}`);
     }
   });
+  panel.querySelector("#ha-wl-revoke").addEventListener("click", async () => {
+    const items = checkedWlRows();
+    if (items.length === 0) {
+      log("白名单：未选择任何行");
+      return;
+    }
+    let resp;
+    try {
+      resp = await chrome.runtime.sendMessage({ type: "whitelist-revoke", items, baseUrl: settings.baseUrl });
+    } catch (err) {
+      resp = { status: "error", error: { code: "bridge-unreachable", message: err instanceof Error ? err.message : String(err) } };
+    }
+    if (resp?.status === "ok") {
+      const revoked = Array.isArray(resp.data?.revoked) ? resp.data.revoked.length : 0;
+      log(`白名单：已撤销 ${revoked} 条`);
+      void refreshWhitelist();
+    } else if (resp?.error?.code === "bridge-unreachable") {
+      noteBridgeFailure(resp.error.message);
+    } else {
+      log(`白名单撤销失败：${resp?.error?.message ?? "未知错误"}`);
+    }
+  });
+}
+
+// 折叠卡手风琴：同时只展开一张（打开一张自动收起另一张；箭头随开合翻转）
+const foldCards = [
+  { body: "#ha-cand-body", arrow: "#ha-cand-toggle .ha-fold-arrow" },
+  { body: "#ha-wl-body", arrow: "#ha-wl-toggle .ha-fold-arrow" },
+];
+
+function toggleFold(index, onExpand) {
+  const willOpen = panel.querySelector(foldCards[index].body).hidden;
+  foldCards.forEach((card, i) => {
+    const open = i === index && willOpen;
+    panel.querySelector(card.body).hidden = !open;
+    panel.querySelector(card.arrow).textContent = open ? "▾" : "▸";
+  });
+  if (willOpen) void onExpand(); // 展开时刷新
 }
 
 // ---------- AI Studio DOM 操作（每次现查，禁止缓存跨轮复用） ----------
@@ -1067,6 +1127,7 @@ async function handleApproval(item) {
   setStatus("待命");
   log(`[信任候选] +${item.calls.length - wl.length}（默认弹窗）`);
   void refreshCandidates();
+  if (wl.length > 0) void refreshWhitelist(); // 弹窗内加白的条目同步到白名单卡
 }
 
 let candRows = []; // 最近一次拉取的候选列表
@@ -1090,7 +1151,7 @@ function renderCandidates(list) {
   host.textContent = "";
   for (const c of list) {
     const row = document.createElement("label");
-    row.className = "ha-cand-row";
+    row.className = "ha-fold-row";
     row.setAttribute("data-ha-tip", `${c.tool} ${c.key}`);
     const input = document.createElement("input");
     input.type = "checkbox";
@@ -1132,6 +1193,80 @@ async function refreshCandidates() {
     log(`信任候选拉取失败：${error.message}（桥服务可能为旧版本，请重启加载新代码）`);
   } else {
     log(`信任候选拉取失败：${error.message}`);
+  }
+}
+
+// ---------- 白名单卡（查看 + 撤销；条目三字段原样回显，扩展不感知工具语义） ----------
+
+let wlRows = []; // 最近一次拉取的白名单条目
+
+function checkedWlRows() {
+  return [...panel.querySelectorAll("#ha-wl-list input[type=checkbox]:checked")].map((el) => ({
+    tool: el.dataset.tool,
+    key: el.dataset.key,
+    scope: el.dataset.scope,
+  }));
+}
+
+function updateRevokeButton() {
+  const n = checkedWlRows().length;
+  panel.querySelector("#ha-wl-revoke").textContent = `撤销所选 (${n})`;
+}
+
+function renderWhitelist(list) {
+  wlRows = list;
+  panel.querySelector("#ha-wl-count").textContent = `(${list.length})`;
+  const host = panel.querySelector("#ha-wl-list");
+  host.textContent = "";
+  for (const entry of list) {
+    const row = document.createElement("label");
+    row.className = "ha-fold-row";
+    row.setAttribute("data-ha-tip", `${entry.tool} ${entry.key}`);
+    const input = document.createElement("input");
+    input.type = "checkbox";
+    input.dataset.tool = entry.tool;
+    input.dataset.key = entry.key;
+    input.dataset.scope = entry.scope;
+    input.addEventListener("change", updateRevokeButton);
+    const tool = document.createElement("span");
+    tool.className = "ha-cand-tool";
+    tool.textContent = entry.tool;
+    const key = document.createElement("span");
+    key.className = "ha-cand-key";
+    key.textContent = entry.key;
+    row.append(input, tool, key);
+    if (entry.scope === "subtree") {
+      const tag = document.createElement("span");
+      tag.className = "ha-wl-scope";
+      tag.textContent = "目录";
+      tag.setAttribute("data-ha-tip", "子树条目：覆盖该目录下全部路径");
+      row.append(tag);
+    }
+    host.appendChild(row);
+  }
+  updateRevokeButton();
+}
+
+// 拉取方语义：展开时 + 入库/撤销/审批加白后刷新；桥不推送（未展开时也顺带更新计数徽标）
+async function refreshWhitelist() {
+  let resp;
+  try {
+    resp = await chrome.runtime.sendMessage({ type: "get-whitelist", baseUrl: settings.baseUrl });
+  } catch (err) {
+    resp = { status: "error", error: { code: "bridge-unreachable", message: err instanceof Error ? err.message : String(err) } };
+  }
+  if (resp?.status === "ok") {
+    renderWhitelist(Array.isArray(resp.data?.entries) ? resp.data.entries : []);
+    return;
+  }
+  const error = resp?.error;
+  if (!error) return;
+  if (error.code === "bridge-unreachable") {
+    noteBridgeFailure(error.message);
+  } else if (error.code === "unknown-endpoint") {
+    log(`白名单拉取失败：${error.message}（桥服务可能为旧版本，请重启加载新代码）`);
+  } else {
+    log(`白名单拉取失败：${error.message}`);
   }
 }
 
@@ -1603,6 +1738,7 @@ async function init() {
     `gemini-bridge v0.4 已就绪：桥服务 ${settings.baseUrl}，自动提交 ${settings.autoMode ? "开" : "关"}，新对话自动注入 ${settings.autoInject ? "开" : "关"}`,
   );
   void refreshWorkspace(); // 启动即拉一次工作区（桥未就绪时静默失败，连接成功后补拉）
+  void refreshWhitelist(); // 启动即拉一次白名单（计数徽标；折叠态不出列表）
   setupCaptureListener(); // 网络捕获接入：等 MAIN world 捕获消息（document_start 已发 hello，此处补 ping）
   deliveryLoop(); // 投递循环：长轮询取回填消息
 }

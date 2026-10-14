@@ -76,7 +76,7 @@ describe("permission 门面", () => {
     expect(Object.keys(p).sort()).toEqual(["blacklist", "candidates", "key", "verdict", "whitelist", "workspace"]);
     expect(Object.keys(p.key).sort()).toEqual(["entryFor", "execPath", "normalize", "of", "optionsFor"]);
     expect(Object.keys(p.verdict)).toEqual(["decide"]);
-    expect(Object.keys(p.whitelist).sort()).toEqual(["grant", "list"]);
+    expect(Object.keys(p.whitelist).sort()).toEqual(["grant", "list", "revoke"]);
     expect(Object.keys(p.blacklist)).toEqual(["list"]);
     expect(Object.keys(p.workspace)).toEqual(["constraint"]);
     expect(Object.keys(p.candidates).sort()).toEqual(["drop", "dropCoveredBy", "list", "record"]);

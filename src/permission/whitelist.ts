@@ -31,6 +31,7 @@ export interface GrantResult {
 export interface WhitelistService {
   grant(entry: TrustEntry): GrantResult;
   list(): TrustEntry[];
+  revoke(entry: TrustEntry): boolean;
 }
 
 export function createWhitelist(options: {
@@ -66,6 +67,17 @@ export function createWhitelist(options: {
       container.workspaces[workspaceKey] = [...kept, normalized];
       save();
       return { entry: normalized, add: { status: "added" }, retired: retire(normalized) };
+    },
+    revoke(entry) {
+      // 精确匹配存储形态（调用方持有 list() 原样条目）；不归一，避免幽灵删除
+      const current = list();
+      const next = current.filter(
+        (e) => !(e.tool === entry.tool && e.scope === entry.scope && e.key === entry.key),
+      );
+      if (next.length === current.length) return false;
+      container.workspaces[workspaceKey] = next;
+      save();
+      return true;
     },
   };
 }

@@ -860,7 +860,7 @@ describe("执行流与审批（旧桥用例逐条移植）", () => {
   });
 });
 
-describe("白名单与候选端点（审批回显 / 批量入库 / 清除）", () => {
+describe("白名单与候选端点（审批回显 / 批量入库 / 查看 / 撤销 / 清除）", () => {
   it("审批带回 whitelist 条目 → 回显校验通过 → v1 落盘后生效", async () => {
     const { port, whitelistFile } = await makeBridge();
     await postReply(port, toolCall("command_run", { command: "ls -la" }));
@@ -1089,5 +1089,93 @@ describe("白名单与候选端点（审批回显 / 批量入库 / 清除）", (
     await postReply(port, toolCall("file_read", { path: outPath("read-out.txt") }));
     const again = await getMessageText(port);
     expect(again).toContain("内容:");
+  });
+
+  it("GET /permission/whitelist：startup 后含自动注册的工作区条目", async () => {
+    const { port } = await makeBridge();
+    const res = await getEnvelope(port, "/permission/whitelist");
+    expect(res.status).toBe(200);
+    expect(res.envelope).toEqual({
+      status: "ok",
+      data: { entries: [{ tool: "file_write", key: `${wsKey}/`, scope: "subtree" }] },
+    });
+  });
+
+  it("GET /permission/whitelist：seed 条目与工作区条目同列", async () => {
+    const { port } = await makeBridge({ seed: [{ tool: "command_run", key: "ls -la", scope: "self" }] });
+    const res = await getEnvelope(port, "/permission/whitelist");
+    const entries = okData<{ entries: TrustEntry[] }>(res.envelope).entries;
+    expect(entries).toContainEqual({ tool: "command_run", key: "ls -la", scope: "self" });
+    expect(entries).toContainEqual({ tool: "file_write", key: `${wsKey}/`, scope: "subtree" });
+  });
+
+  it("POST /permission/whitelist/revoke：命中移除 + 落盘 + 复跑回 pending（撤销立即生效）", async () => {
+    const { port, whitelistFile } = await makeBridge({
+      seed: [{ tool: "command_run", key: "ls -la", scope: "self" }],
+      approvalTimeoutMs: 5000,
+    });
+    // 预验证：白名单内静默执行
+    await postReply(port, toolCall("command_run", { command: "ls -la" }));
+    expect(await getMessageText(port)).toContain("成功");
+    const entry: TrustEntry = { tool: "command_run", key: "ls -la", scope: "self" };
+    const res = await postJson(port, "/permission/whitelist/revoke", { items: [entry] });
+    expect(res.status).toBe(200);
+    expect(res.envelope).toEqual({ status: "ok", data: { revoked: [entry] } });
+    expect(whitelistEntries(whitelistFile)).not.toContainEqual(entry);
+    const list = await getEnvelope(port, "/permission/whitelist");
+    expect(okData<{ entries: TrustEntry[] }>(list.envelope).entries).not.toContainEqual(entry);
+    // 复跑：回 pending（审批下发而非执行）
+    await postReply(port, toolCall("command_run", { command: "ls -la" }));
+    const body = await getMessage(port);
+    expect(body?.type).toBe("approval");
+  });
+
+  it("POST /permission/whitelist/revoke 全量原子：非法条目 → 400 且合法项未被单独撤销", async () => {
+    const { port, whitelistFile } = await makeBridge({
+      seed: [{ tool: "command_run", key: "ls -la", scope: "self" }],
+    });
+    const before = whitelistEntries(whitelistFile);
+    const res = await postJson(port, "/permission/whitelist/revoke", {
+      items: [
+        { tool: "command_run", key: "ls -la", scope: "self" },
+        { tool: "command_run", key: "x", scope: "weird" },
+      ],
+    });
+    expect(res.status).toBe(400);
+    expect(errorCode(res.envelope)).toBe("invalid-body");
+    expect(whitelistEntries(whitelistFile)).toEqual(before);
+  });
+
+  it("POST /permission/whitelist/revoke：非匹配条目跳过（revoked 仅实录命中项）；items 非数组 → 400", async () => {
+    const { port } = await makeBridge({ seed: [{ tool: "command_run", key: "ls -la", scope: "self" }] });
+    const res = await postJson(port, "/permission/whitelist/revoke", {
+      items: [
+        { tool: "command_run", key: "ls -la", scope: "self" },
+        { tool: "command_run", key: "ghost", scope: "self" },
+      ],
+    });
+    expect(res.status).toBe(200);
+    expect(okData<{ revoked: TrustEntry[] }>(res.envelope).revoked).toEqual([
+      { tool: "command_run", key: "ls -la", scope: "self" },
+    ]);
+    const bad = await postJson(port, "/permission/whitelist/revoke", { items: "x" });
+    expect(bad.status).toBe(400);
+    expect(errorCode(bad.envelope)).toBe("invalid-body");
+  });
+
+  it("工作区自动条目可撤销（立即生效；重启重建属启动语义）", async () => {
+    const { port, whitelistFile } = await makeBridge();
+    const entry: TrustEntry = { tool: "file_write", key: `${wsKey}/`, scope: "subtree" };
+    const res = await postJson(port, "/permission/whitelist/revoke", { items: [entry] });
+    expect(res.status).toBe(200);
+    expect(okData<{ revoked: TrustEntry[] }>(res.envelope).revoked).toEqual([entry]);
+    expect(whitelistEntries(whitelistFile)).toEqual([]);
+  });
+
+  it("GET /permission/whitelist/revoke → 405 method-not-allowed", async () => {
+    const { port } = await makeBridge();
+    const res = await getEnvelope(port, "/permission/whitelist/revoke");
+    expect(res.status).toBe(405);
+    expect(errorCode(res.envelope)).toBe("method-not-allowed");
   });
 });

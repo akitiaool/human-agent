@@ -1,7 +1,7 @@
 // gemini-bridge v0.4 background service worker。
-// HTTP 中转（八路，统一信封收口）：GET /task 长轮询（30s 超时）、POST /task/reply、POST /task/approval、
-// POST /permission/whitelist、GET /permission/candidates、POST /permission/candidates/dismiss、
-// GET /agent/protocol、GET /agent/info。
+// HTTP 中转（十路，统一信封收口）：GET /task 长轮询（30s 超时）、POST /task/reply、POST /task/approval、
+// POST /permission/whitelist、GET /permission/whitelist（查看）、POST /permission/whitelist/revoke（撤销）、
+// GET /permission/candidates、POST /permission/candidates/dismiss、GET /agent/protocol、GET /agent/info。
 // 约定：桥服务的统一信封 {status:"ok", data?} | {status:"error", error:{code, message}} 原样透传 content.js；
 // GET /task 30s 超时或 204 → {status:"ok", data:null}（空轮询）；网络错误/超时（未拿到响应）→ 扩展本地伪码
 // {status:"error", error:{code:"bridge-unreachable", message:"桥未连接或请求超时"}}（非桥面词表，README 说明）。
@@ -108,6 +108,14 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
         return;
       }
 
+      if (message.type === "get-whitelist") {
+        const result = await request(base, "/permission/whitelist", { method: "GET", timeoutMs: SHORT_TIMEOUT_MS });
+        sendResponse(
+          result.kind === "response" ? result.envelope : relayFailure(result, "GET /permission/whitelist"),
+        );
+        return;
+      }
+
       if (message.type === "submit-result") {
         const reply = message?.reply;
         if (typeof reply !== "string" || reply.trim() === "") {
@@ -151,6 +159,23 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
           timeoutMs: SHORT_TIMEOUT_MS,
         });
         sendResponse(result.kind === "response" ? result.envelope : relayFailure(result, "POST /permission/whitelist"));
+        return;
+      }
+
+      if (message.type === "whitelist-revoke") {
+        const items = Array.isArray(message?.items) ? message.items : [];
+        if (items.length === 0) {
+          sendResponse(errorEnvelope("invalid-body", "items 不能为空"));
+          return;
+        }
+        const result = await request(base, "/permission/whitelist/revoke", {
+          method: "POST",
+          body: { items },
+          timeoutMs: SHORT_TIMEOUT_MS,
+        });
+        sendResponse(
+          result.kind === "response" ? result.envelope : relayFailure(result, "POST /permission/whitelist/revoke"),
+        );
         return;
       }
 

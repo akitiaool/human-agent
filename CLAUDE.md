@@ -54,11 +54,11 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 - `src/mouth/ask-user.ts`：新增 `askApproval(prompt)` 三选审批——`[y] 允许 [n] 拒绝 [w] 加入白名单`，写类另有 `[d] 白名单(此目录)`（父目录段级前缀条目），无效输入循环追问；`MouthContract`/`ApprovalPrompt`/`ApprovalChoice` 契约（types/organ.ts）
 - 接入：loop `#execute` pending 走嘴巴三选；桥 pending 批量审批 + `POST /approval` 可选 `whitelist` 字段（校验：条目必须对应本批 allowed=true 的调用——exact 与匹配键一致、path 为「此路径」文件条目或「此目录」目录条目（读目录类 = 自身 + `/`、其余 = 父目录 + `/`），不合法 400）；扩展弹窗白名单按钮（内容见阶段五 extensions 条目）；`src/agent.ts` `HumanAgent`/`buildBridgeService` 透传 `whitelistFile`；CLI 启动 system 消息注入 `workspaceConstraint()`（agent.run 装配）
 
-阶段七（API 重设计）已完成（TDD，333 tests）：三域三根（TS：`tool`/`permission`/`bridge`；wire：`task`/`permission`/`agent`）与统一词形规则见「API 词根表」。
+阶段七（API 重设计）已完成（TDD，343 tests）：三域三根（TS：`tool`/`permission`/`bridge`；wire：`task`/`permission`/`agent`）与统一词形规则见「API 词根表」。
 - `src/tool/`（工具域）：工具知识唯一来源——`schemas.ts`（schema + 描述 + meta，`ToolName = keyof typeof schemas` 编译期穷尽）、`protocol.ts`（协议文本模板）、`index.ts`（组装面 `tool`：names/meta/schemas/infos/covers/protocol；`covers` 唯一覆盖判定取代旧 toolMatches/keyMatches）；工具 8 个（旧 → 新名对照见词根表）
-- `src/permission/`（权限域）：`createPermission` 门面（构造绑定工作区与文件、自动注册工作区写白名单；成员 `workspace`/`key`/`verdict`/`whitelist`/`blacklist`/`candidates`）+ 模块级 `permission.workspace.resolve`（三级决议）；布局：`store.ts`（白名单与候选同容器 `{version:1, workspaces}`，单一读写/校验）、`key.ts`（规范匹配键管道 + 唯一归一器 + entryFor/optionsFor/execPath）、`verdict.ts`（黑名单 → 白名单 → 未列）、`whitelist.ts`（grant/list；AddResult added/duplicate/covered/rejected）、`candidates.ts`、`blacklist.ts`；**文件格式 v1、无迁移**（旧格式/旧工具名条目整档作废属预期）
-- `src/bridge/`（桥域）：`createBridge`（组合 permission + `createReflection({permission})` + 共享执行器，内嵌 HTTP 服务 127.0.0.1）、`envelope.ts`（统一信封 `{status:"ok",data?} | {status:"error",error:{code,message}}`；传输错误码 closed；裸 204 仅空长轮询）、`pipeline.ts`（旧桥状态机移植：严格解析、无调用 processed:false 自终止、pending 批量审批（options 预构造）、候选两钩子）
-- 集成与退役：`ActionResult` 判别联合（`success` 布尔退役、错误码全面 kebab）；loop options 收 `permission`（与 brain 共持同一实例）、executor context `{permission}`（执行落点 = 判定落点）；CLI 桥模式直接 `createBridge`；扩展 v0.4.0 零手抄（审批按钮按载荷 options 渲染、候选入库 `{items, scope}`）；旧模块 7 个全数删除、无别名 shim
+- `src/permission/`（权限域）：`createPermission` 门面（构造绑定工作区与文件、自动注册工作区写白名单；成员 `workspace`/`key`/`verdict`/`whitelist`/`blacklist`/`candidates`）+ 模块级 `permission.workspace.resolve`（三级决议）；布局：`store.ts`（白名单与候选同容器 `{version:1, workspaces}`，单一读写/校验）、`key.ts`（规范匹配键管道 + 唯一归一器 + entryFor/optionsFor/execPath）、`verdict.ts`（黑名单 → 白名单 → 未列）、`whitelist.ts`（grant/list/revoke；AddResult added/duplicate/covered/rejected）、`candidates.ts`、`blacklist.ts`；**文件格式 v1、无迁移**（旧格式/旧工具名条目整档作废属预期）
+- `src/bridge/`（桥域）：`createBridge`（组合 permission + `createReflection({permission})` + 共享执行器，内嵌 HTTP 服务 127.0.0.1）、`envelope.ts`（统一信封 `{status:"ok",data?} | {status:"error",error:{code,message}}`；传输错误码 closed；裸 204 仅空长轮询）、`pipeline.ts`（旧桥状态机移植：严格解析、无调用 processed:false 自终止、pending 批量审批（options 预构造）、候选两钩子、白名单查看/撤销 `entries`/`revoke`）
+- 集成与退役：`ActionResult` 判别联合（`success` 布尔退役、错误码全面 kebab）；loop options 收 `permission`（与 brain 共持同一实例）、executor context `{permission}`（执行落点 = 判定落点）；CLI 桥模式直接 `createBridge`；扩展 v0.4.0 零手抄（审批按钮按载荷 options 渲染、候选入库 `{items, scope}`、白名单卡查看/撤销 `GET /permission/whitelist` + `POST /permission/whitelist/revoke`——条目三字段原样回显，候选/白名单两折叠卡手风琴互斥）；旧模块 7 个全数删除、无别名 shim
 
 **尚未开始**：voice/image/browser 等预留器官（`eyes/image-viewer.ts`、`ears/voice-input.ts`、`mouth/voice-output.ts`、`hands/browser-action.ts`）。
 
@@ -107,7 +107,7 @@ export type ActionResult<T = unknown> =
 | TS | `permission` | 权限域：键、工作区、裁决、白名单、黑名单、候选 |
 | TS | `bridge` | 桥管道域：HTTP 服务与流水线 |
 | wire | `task` | 管道面（长轮询取件 / 回填 / 审批回执） |
-| wire | `permission` | 权限面（候选 / 入库 / 清除；查看与撤销预留） |
+| wire | `permission` | 权限面（候选 / 入库 / 查看 / 撤销 / 清除） |
 | wire | `agent` | 宿主信息面（协议 / 信息；状态流预留） |
 
 **词形规则**（全局单一）：

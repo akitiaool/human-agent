@@ -34,7 +34,9 @@ export interface Pipeline {
     { ok: true } | { ok: false; code: "unknown-approval" | "invalid-body"; message: string }
   >;
   candidates(): CandidateRecord[];
+  entries(): TrustEntry[];
   grant(items: unknown, scope: unknown): { ok: true; grants: GrantResult[] } | { ok: false; message: string };
+  revoke(items: unknown): { ok: true; revoked: TrustEntry[] } | { ok: false; message: string };
   dismiss(items: unknown): { ok: true; dropped: number } | { ok: false; message: string };
   protocolText(): string;
   close(): void;
@@ -402,6 +404,31 @@ export function createPipeline(options: PipelineOptions): Pipeline {
     return { ok: true, grants };
   }
 
+  /** 查看当前工作区白名单（存储形态原样返回）。 */
+  function entries(): TrustEntry[] {
+    return permission.whitelist.list();
+  }
+
+  /** 撤销所选白名单条目：全量原子校验（任一不合法整批 400）；三字段精确匹配命中才删，未命中跳过。 */
+  function revoke(items: unknown): { ok: true; revoked: TrustEntry[] } | { ok: false; message: string } {
+    if (!Array.isArray(items)) {
+      return { ok: false, message: "items 必须为数组" };
+    }
+    const parsed: TrustEntry[] = [];
+    for (let i = 0; i < items.length; i++) {
+      const result = trustEntrySchema.safeParse(items[i]);
+      if (!result.success) {
+        return { ok: false, message: `items[${i}] 条目不合法` };
+      }
+      parsed.push(result.data);
+    }
+    const revoked: TrustEntry[] = [];
+    for (const entry of parsed) {
+      if (permission.whitelist.revoke(entry)) revoked.push(entry);
+    }
+    return { ok: true, revoked };
+  }
+
   /** 清除所选候选（持久化删除，不写白名单）。 */
   function dismiss(items: unknown): { ok: true; dropped: number } | { ok: false; message: string } {
     if (!Array.isArray(items)) {
@@ -440,7 +467,7 @@ export function createPipeline(options: PipelineOptions): Pipeline {
     waiters.length = 0;
   }
 
-  return { takeTask, submitReply, submitApproval, candidates, grant, dismiss, protocolText, close };
+  return { takeTask, submitReply, submitApproval, candidates, entries, grant, revoke, dismiss, protocolText, close };
 }
 
 /** 批 signal 中止即拒绝。 */

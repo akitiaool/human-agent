@@ -29,7 +29,8 @@ const ROUTES: Record<string, readonly string[]> = {
   "/task": ["GET"],
   "/task/reply": ["POST"],
   "/task/approval": ["POST"],
-  "/permission/whitelist": ["POST"],
+  "/permission/whitelist": ["POST", "GET"],
+  "/permission/whitelist/revoke": ["POST"],
   "/permission/candidates": ["GET"],
   "/permission/candidates/dismiss": ["POST"],
   "/agent/protocol": ["GET"],
@@ -119,10 +120,17 @@ async function handle(
       send(200, okEnvelope()); return;
     }
     if (pathname === "/permission/whitelist") {
+      if (method === "GET") { send(200, okEnvelope({ entries: pipeline.entries() })); return; }
       const record = (body ?? {}) as { items?: unknown; scope?: unknown };
       const result = pipeline.grant(record.items, record.scope);
       if (!result.ok) { send(400, errorEnvelope("invalid-body", result.message)); return; }
       send(200, okEnvelope({ grants: result.grants })); return;
+    }
+    if (pathname === "/permission/whitelist/revoke") {
+      const record = (body ?? {}) as { items?: unknown };
+      const result = pipeline.revoke(record.items);
+      if (!result.ok) { send(400, errorEnvelope("invalid-body", result.message)); return; }
+      send(200, okEnvelope({ revoked: result.revoked })); return;
     }
     if (pathname === "/permission/candidates/dismiss") {
       const record = (body ?? {}) as { items?: unknown };

@@ -3,7 +3,7 @@
 //  条目 {tool,key,kind}→{tool,key,scope}（kind:"path"→scope:"subtree"、kind:"exact"→scope:"self"）；
 //  addEntry 布尔 → GrantResult.add 判别联合；entries()→list()；平面 JSON → v1 容器格式）。
 // 另含 4 个 grant 面新用例（AddResult 四状态 + ⑯ 核销只在 added + 落盘失败 logger）。
-import { mkdtempSync, realpathSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterAll, beforeEach, describe, expect, it, vi } from "vitest";
@@ -87,6 +87,34 @@ describe("permission/whitelist grant", () => {
     expect(r.add.status).toBe("added");
     expect(wl.list()).toHaveLength(1);
     expect(logger).toHaveBeenCalledWith(expect.stringContaining("白名单落盘失败"));
+  });
+});
+
+describe("permission/whitelist revoke", () => {
+  it("命中：移除并持久化（重构造后仍不在）", () => {
+    const wl = mk();
+    wl.grant({ tool: "command_run", key: "git status", scope: "self" });
+    wl.grant({ tool: "file_write", key: join(wsReal, "src/a.ts"), scope: "self" });
+    expect(wl.revoke({ tool: "command_run", key: "git status", scope: "self" })).toBe(true);
+    expect(wl.list()).toEqual([{ tool: "file_write", key: nk(join(wsReal, "src/a.ts")), scope: "self" }]);
+    expect(mk().list()).toEqual([{ tool: "file_write", key: nk(join(wsReal, "src/a.ts")), scope: "self" }]);
+  });
+
+  it("三字段精确匹配：任一字段不同即不删（scope/key 分例）", () => {
+    const wl = mk();
+    wl.grant({ tool: "command_run", key: "git status", scope: "self" });
+    expect(wl.revoke({ tool: "command_run", key: "git status", scope: "subtree" })).toBe(false);
+    expect(wl.revoke({ tool: "command_run", key: "git status --short", scope: "self" })).toBe(false);
+    expect(wl.list()).toEqual([{ tool: "command_run", key: "git status", scope: "self" }]);
+    expect(wl.revoke({ tool: "command_run", key: "git status", scope: "self" })).toBe(true);
+    expect(wl.list()).toEqual([]);
+  });
+
+  it("不存在：返回 false 且不落盘（文件保持未创建）", () => {
+    const wl = mk();
+    expect(wl.revoke({ tool: "command_run", key: "nope", scope: "self" })).toBe(false);
+    expect(wl.list()).toEqual([]);
+    expect(existsSync(file)).toBe(false);
   });
 });
 
